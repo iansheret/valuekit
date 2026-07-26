@@ -1,0 +1,1483 @@
+"""valuekit test suite.
+
+Focus: the correctness edges — staleness, granularity, arg binding,
+atomic store behaviour — rather than demos.
+"""
+
+import json
+import os
+import warnings
+
+import numpy as np
+import pytest
+
+import valuekit as vk
+from valuekit import ImmutableMap, pure, freeze, content_hash
+from valuekit.codehash import function_fingerprint
+from valuekit.store import LocalStore, CacheMiss, SerializationError
+from valuekit.values import encode_key, decode_key
+from valuekit import pure as _pure_mod  # module alias for store poking
+from valuekit import debughook
+
+
+@pytest.fixture()
+def cache(tmp_path):
+    vk.set_cache_dir(tmp_path / "cache")
+    yield tmp_path / "cache"
+    vk.set_cache_dir(None)
+
+
+@pytest.fixture(autouse=True)
+def _no_cache_by_default():
+    vk.set_cache_dir(None)
+    yield
+    vk.set_cache_dir(None)
+
+
+# ===========================================================================
+# ImmutableMap fundamentals (behaviour of the original class preserved)
+# ===========================================================================
+
+
+class TestImmutableMap:
+    def test_basic_roundtrip(self):
+        m = ImmutableMap({"a": 1, "b": "x"})
+        assert m["a"] == 1 and m["b"] == "x" and len(m) == 2
+
+    def test_merge_derivation(self):
+        m1 = ImmutableMap({"a": 1})
+        m2 = m1 | {"b": 2}
+        m3 = m2 | {"a": 99}
+        assert dict(m1) == {"a": 1}
+        assert dict(m2) == {"a": 1, "b": 2}
+        assert m3["a"] == 99 and m2["a"] == 1
+
+    def test_dissoc_assoc(self):
+        m = ImmutableMap({"a": 1, "b": 2}).dissoc("a").assoc("c", 3)
+        assert dict(m) == {"b": 2, "c": 3}
+
+    def test_arrays_frozen_and_copied(self):
+        a = np.arange(5.0)
+        m = ImmutableMap({"x": a})
+        assert not m["x"].flags.writeable
+        a[0] = 99  # caller's copy stays writeable; map unaffected
+        assert m["x"][0] == 0.0
+
+    def test_prefrozen_array_shared(self):
+        a = np.arange(5.0)
+        a.flags.writeable = False
+        m = ImmutableMap({"x": a})
+        assert m["x"] is a
+
+    def test_rejects_unknown_mutable(self):
+        with pytest.raises(TypeError):
+            ImmutableMap({"x": [1, 2, 3]})
+
+    def test_no_attribute_mutation(self):
+        m = ImmutableMap({"a": 1})
+        with pytest.raises(AttributeError):
+            m._d = {}
+        with pytest.raises(TypeError):
+            m["b"] = 2  # type: ignore[index]
+
+    def test_equality_with_arrays(self):
+        m1 = ImmutableMap({"x": np.arange(3)})
+        m2 = ImmutableMap({"x": np.arange(3)})
+        assert m1 == m2
+        assert m1 != m2 | {"y": 1}
+
+    def test_nested_dict_becomes_map(self):
+        m = ImmutableMap({"cfg": {"a": 1}})
+        assert isinstance(m["cfg"], ImmutableMap)
+
+
+# ===========================================================================
+# content hashing
+# ===========================================================================
+
+
+class TestHashing:
+    def test_stability_and_type_separation(self):
+        assert content_hash(1) == content_hash(1)
+        assert content_hash(1) != content_hash(1.0)
+        assert content_hash(True) != content_hash(1)  # bool is not int here
+        assert content_hash("1") != content_hash(1)
+        assert content_hash(b"a") != content_hash("a")
+
+    def test_framing_prevents_concat_ambiguity(self):
+        assert content_hash(("ab", "c")) != content_hash(("a", "bc"))
+        assert content_hash((1, (2, 3))) != content_hash((1, 2, 3))
+
+    def test_array_hash_layout_independent(self):
+        a = np.arange(6.0).reshape(2, 3)
+        b = np.asfortranarray(a)
+        assert content_hash(a) == content_hash(b)
+        assert content_hash(a) != content_hash(a.astype(np.float32))
+        assert content_hash(a) != content_hash(a.reshape(3, 2))
+
+    def test_map_hash_order_independent_and_cached(self):
+        m1 = ImmutableMap({"a": 1, "b": np.arange(4)})
+        m2 = ImmutableMap({"b": np.arange(4), "a": 1})
+        assert content_hash(m1) == content_hash(m2)
+        assert m1._digest is not None  # cached after first computation
+
+    def test_derived_map_hash_differs(self):
+        m = ImmutableMap({"a": 1})
+        assert content_hash(m) != content_hash(m | {"b": 2})
+
+    def test_frozenset_order_independent(self):
+        assert content_hash(frozenset({1, 2, 3})) == content_hash(
+            frozenset({3, 1, 2})
+        )
+
+    def test_plain_dict_hashes_like_frozen(self):
+        assert content_hash({"a": 1}) == content_hash(ImmutableMap({"a": 1}))
+
+    def test_lambda_hash_covers_closure_and_defaults(self):
+        k = 3
+        f1 = lambda x, m=2: x * m + k  # noqa: E731
+        h1 = content_hash(f1)
+        k2 = 4
+        f2 = lambda x, m=2: x * m + k2  # noqa: E731  (same bytecode, diff cell)
+        # identical source apart from captured value name; force same code:
+        def make(kk):
+            return lambda x, m=2: x * m + kk
+
+        assert content_hash(make(3)) == content_hash(make(3))
+        assert content_hash(make(3)) != content_hash(make(4))  # closure differs
+        g1 = lambda x, m=5: x * m  # noqa: E731
+        g2 = lambda x, m=6: x * m  # noqa: E731
+        assert content_hash(g1) != content_hash(g2)  # defaults differ
+        assert isinstance(h1, str)
+
+    def test_key_codec_roundtrip(self):
+        for k in [None, True, False, 0, -17, 3.5, 1 + 2j, "héllo", b"\x00\xff",
+                  range(1, 10, 2), ("a", (1, 2.0)), frozenset({"x", "y"})]:
+            assert decode_key(encode_key(k)) == k
+
+
+# ===========================================================================
+# code hashing / invalidation semantics
+# ===========================================================================
+
+
+def _fp(fn, **kw):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return function_fingerprint(fn, **kw)[0]
+
+
+class TestCodeHash:
+    def test_body_change_changes_hash(self):
+        def f(x):
+            return x + 1
+
+        def g(x):
+            return x + 2
+
+        assert _fp(f) != _fp(g)
+
+    def test_rename_preserves_hash(self):
+        def f(x):
+            return x + 1
+
+        def a_totally_different_name(x):
+            return x + 1
+
+        assert _fp(f) == _fp(a_totally_different_name)
+
+    def test_helper_change_invalidates(self):
+        # The joblib bug this project exists to fix.
+        ns1 = {}
+        exec("def helper(x):\n    return x * 2\ndef step(x):\n    return helper(x) + 1", ns1)
+        ns2 = {}
+        exec("def helper(x):\n    return x * 3\ndef step(x):\n    return helper(x) + 1", ns2)
+        assert _fp(ns1["step"]) != _fp(ns2["step"])
+
+    def test_module_level_constant_captured(self):
+        ns1, ns2 = {}, {}
+        exec("K = 10\ndef f(x):\n    return x + K", ns1)
+        exec("K = 11\ndef f(x):\n    return x + K", ns2)
+        assert _fp(ns1["f"]) != _fp(ns2["f"])
+
+    def test_nested_lambda_captured(self):
+        def f1(xs):
+            return sorted(xs, key=lambda v: v * 2)
+
+        def f2(xs):
+            return sorted(xs, key=lambda v: v * 3)
+
+        assert _fp(f1) != _fp(f2)
+
+    def test_package_boundary_stops_walk(self):
+        def f(x):
+            return np.fft.fft(x)
+
+        h = _fp(f)  # should not attempt to hash numpy internals; just work
+        assert isinstance(h, str) and len(h) == 40
+
+
+    def test_constants_never_warn(self):
+        # SPEED_OF_LIGHT-style module constants — of every common shape —
+        # must decorate in total silence, tracked or not.
+        src = (
+            "C = 299792458.0\n"
+            "NAME = 'L-band'\n"
+            "CHANNELS = ['ch1', 'ch2']\n"
+            "EDGES = {'L': [1.0, 2.0], 'S': [2.0, 4.0]}\n"
+            "STATIONS = {'EL-1', 'EL-2'}\n"
+            "GRID = np.linspace(0, 1, 5)\n"
+            "def f(x):\n"
+            "    return x * C, NAME, CHANNELS[0], EDGES['L'][1], "
+            "len(STATIONS), GRID[0]\n"
+        )
+        ns = {"np": np}
+        exec(src, ns)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # ANY warning → test failure
+            function_fingerprint(ns["f"])
+
+    def test_immutable_constants_invalidate(self):
+        def build(c):
+            ns = {}
+            exec(f"C = {c!r}\ndef f(x):\n    return x * C", ns)
+            return ns["f"]
+
+        assert _fp(build(299792458.0)) == _fp(build(299792458.0))
+        assert _fp(build(299792458.0)) != _fp(build(299792459.0))
+        assert _fp(build((1, 2))) != _fp(build((1, 3)))
+
+    def test_readonly_array_constant_tracked_writeable_not(self):
+        def build(vals, readonly):
+            a = np.array(vals)
+            if readonly:
+                a.flags.writeable = False
+            ns = {"GRID": a}
+            exec("def f(x):\n    return x + GRID[0]", ns)
+            return ns["f"]
+
+        # Read-only array: a true constant — tracked, edits invalidate.
+        assert _fp(build([1.0], True)) != _fp(build([2.0], True))
+        # Writeable array: mutable → untracked by design, hash is stable.
+        assert _fp(build([1.0], False)) == _fp(build([2.0], False))
+
+    def test_mutable_globals_untracked_stable_and_silent(self):
+        def build(channels):
+            ns = {}
+            exec(
+                f"CHANNELS = {channels!r}\ndef f(x):\n    return (x, CHANNELS[0])",
+                ns,
+            )
+            return ns["f"]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            fp1 = function_fingerprint(build(["ch1", "ch2"]))[0]
+            fp2 = function_fingerprint(build(["completely", "different"]))[0]
+        assert fp1 == fp2  # not our problem, by explicit design
+
+    def test_opaque_globals_silent_and_stable(self):
+        def build():
+            ns = {"HANDLE": object(), "BUF": bytearray(b"x")}
+            exec("def f(x):\n    return x if HANDLE and BUF else x", ns)
+            return ns["f"]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            fp1 = function_fingerprint(build())[0]
+            fp2 = function_fingerprint(build())[0]
+        assert fp1 == fp2  # distinct opaque objects: untracked, stable
+
+
+# ===========================================================================
+# store
+# ===========================================================================
+
+
+class TestStore:
+    def test_roundtrip_all_types(self, tmp_path):
+        s = LocalStore(tmp_path)
+        vals = [
+            None, True, 42, 3.14, 2 - 3j, "héllo", b"\x00\x01", range(5),
+            np.float64(1.5), np.int32(7),
+            (1, "two", (3.0,)),
+            frozenset({1, 2}),
+            ImmutableMap({"a": 1, "sub": {"b": np.arange(3)}}),
+            np.arange(10.0).reshape(2, 5),
+        ]
+        for v in vals:
+            fv = freeze(v)
+            h = s.put_value(fv)
+            back = s.get_value(h)
+            assert content_hash(back) == content_hash(fv) == h
+
+    def test_arrays_reload_readonly(self, tmp_path):
+        s = LocalStore(tmp_path)
+        h = s.put_value(freeze(np.arange(100.0)))
+        arr = s.get_value(h)
+        assert not arr.flags.writeable
+        assert freeze(arr) is arr  # zero-copy share on re-freeze
+
+    def test_dedup(self, tmp_path):
+        s = LocalStore(tmp_path)
+        a = freeze(np.arange(1000.0))
+        h1 = s.put_value(freeze((a, 1)))
+        h2 = s.put_value(freeze((a, 2)))
+        npys = list((tmp_path / "objects").rglob("*.npy"))
+        assert len(npys) == 1  # array shared between the two tuples
+        assert h1 != h2
+
+    def test_missing_and_corrupt_are_misses(self, tmp_path):
+        s = LocalStore(tmp_path)
+        with pytest.raises(CacheMiss):
+            s.get_value("0" * 40)
+        h = s.put_value(freeze((1, 2)))
+        path = next((tmp_path / "objects").rglob(f"{h}.bin"))
+        path.write_bytes(b"garbage")
+        with pytest.raises(CacheMiss):
+            s.get_value(h)
+
+    def test_unstorable_rejected(self, tmp_path):
+        s = LocalStore(tmp_path)
+        with pytest.raises(SerializationError):
+            s.put_value(freeze(lambda x: x))
+
+    def test_format_version_guard(self, tmp_path):
+        LocalStore(tmp_path)
+        (tmp_path / "format").write_text("999\n")
+        with pytest.raises(RuntimeError):
+            LocalStore(tmp_path)
+
+    def test_trace_dedup(self, tmp_path):
+        s = LocalStore(tmp_path)
+        t = {"fn": "f", "deps": {}, "result": "0" * 40}
+        s.put_trace("k", t)
+        s.put_trace("k", dict(t))
+        assert len(s.get_traces("k")) == 1
+
+    def test_concurrent_trace_appends_are_not_lost(self, tmp_path):
+        # The failure mode of a read-modify-write trace file: parallel
+        # writers dropping each other's traces. Appends must all survive.
+        from concurrent.futures import ThreadPoolExecutor
+
+        stores = [LocalStore(tmp_path) for _ in range(4)]
+
+        def write(i):
+            stores[i % 4].put_trace(
+                "k", {"fn": "f", "deps": {"x": {"kind": "value", "hash": str(i)}},
+                      "result": "0" * 40}
+            )
+
+        with ThreadPoolExecutor(8) as ex:
+            list(ex.map(write, range(32)))
+        assert len(LocalStore(tmp_path).get_traces("k")) == 32
+
+    def test_torn_trace_line_skipped(self, tmp_path):
+        s = LocalStore(tmp_path)
+        t = {"fn": "f", "deps": {}, "result": "0" * 40}
+        s.put_trace("k", t)
+        with open(s._trace_path("k"), "a") as f:
+            f.write('{"fn": "g", "trunc')  # simulates a crash mid-append
+        assert s.get_traces("k") == [t]
+
+    def test_immutable_map_pickles(self, tmp_path):
+        import pickle
+
+        m = ImmutableMap({"x": np.arange(3.0), "sub": {"k": 1}})
+        m2 = pickle.loads(pickle.dumps(m))
+        assert m2 == m
+        assert not m2["x"].flags.writeable  # re-frozen on arrival
+        assert isinstance(m2["sub"], ImmutableMap)
+
+
+# ===========================================================================
+# custom-type store codec (reduce/rebuild)
+# ===========================================================================
+
+
+class _Vec:
+    """A tiny immutable custom type for codec tests: one read-only array."""
+
+    def __init__(self, arr):
+        arr = np.asarray(arr, dtype=float)
+        arr.flags.writeable = False
+        self.arr = arr
+
+    def __eq__(self, other):
+        return isinstance(other, _Vec) and np.array_equal(self.arr, other.arr)
+
+
+vk.register_type(
+    _Vec,
+    freeze_fn=lambda v: v,
+    hash_fn=lambda v, h: h.update(v.arr.tobytes()),
+    reduce_fn=lambda v: v.arr,
+    rebuild_fn=lambda arr: _Vec(arr),
+)
+
+
+class TestCustomTypeCodec:
+    def test_store_roundtrip_preserves_type_and_content(self, tmp_path):
+        s = LocalStore(tmp_path)
+        v = freeze(_Vec([1.0, 2.0, 3.0]))
+        h = s.put_value(v)
+        back = s.get_value(h)
+        assert isinstance(back, _Vec)
+        assert back == v
+        assert content_hash(back) == h
+
+    def test_roundtrips_as_a_pure_return(self, cache):
+        calls = []
+
+        @pure
+        def make(n):
+            calls.append(n)
+            return {"v": _Vec(np.arange(n))}
+
+        make(4)
+        second = make(4)
+        assert calls == [4]  # the second call was a cache hit
+        assert isinstance(second["v"], _Vec)
+        assert second["v"] == _Vec(np.arange(4))
+
+    def test_requires_both_reduce_and_rebuild(self):
+        class _Half:
+            pass
+
+        with pytest.raises(TypeError):
+            vk.register_type(
+                _Half,
+                freeze_fn=lambda v: v,
+                hash_fn=lambda v, h: h.update(b"x"),
+                reduce_fn=lambda v: 0,  # rebuild_fn missing
+            )
+
+    def test_codecless_custom_type_is_still_unstorable(self, tmp_path):
+        class _NoCodec:
+            pass
+
+        vk.register_type(
+            _NoCodec, freeze_fn=lambda v: v, hash_fn=lambda v, h: h.update(b"n")
+        )
+        s = LocalStore(tmp_path)
+        with pytest.raises(SerializationError):
+            s.put_value(freeze(_NoCodec()))
+
+
+# ===========================================================================
+# @pure end-to-end
+# ===========================================================================
+
+
+class TestPure:
+    def test_hit_skips_execution(self, cache):
+        calls = []
+
+        @pure
+        def double(x):
+            calls.append(1)
+            return x * 2
+
+        assert double(21) == 42
+        assert double(21) == 42
+        assert len(calls) == 1
+        assert double(10) == 20
+        assert len(calls) == 2
+
+    def test_persists_across_decorations(self, cache):
+        calls = []
+
+        def make():
+            @pure
+            def step(x):
+                calls.append(1)
+                return x + 1
+
+            return step
+
+        assert make()(1) == 2
+        assert make()(1) == 2  # fresh decoration, same code → same key
+        assert len(calls) == 1
+
+    def test_unrelated_key_does_not_invalidate(self, cache):
+        calls = []
+
+        @pure
+        def geometry(obs):
+            calls.append(1)
+            return {"out": obs["ra"] + obs["dec"]}
+
+        obs = ImmutableMap({"ra": 1.0, "dec": 2.0})
+        r1 = geometry(obs)
+        r2 = geometry(obs | {"notes": "run 3", "extra": np.arange(5)})
+        assert len(calls) == 1
+        assert r1["out"] == r2["out"] == 3.0
+
+    def test_read_value_change_invalidates(self, cache):
+        calls = []
+
+        @pure
+        def geometry(obs):
+            calls.append(1)
+            return {"out": obs["ra"] * 2}
+
+        geometry(ImmutableMap({"ra": 1.0}))
+        geometry(ImmutableMap({"ra": 5.0}))
+        assert len(calls) == 2
+
+    def test_config_granularity_nested(self, cache):
+        calls = []
+
+        @pure
+        def filt(x, config):
+            calls.append(1)
+            return x * config["filter"]["order"]
+
+        cfg = ImmutableMap({"filter": {"order": 4, "ripple": 0.1}, "plot": {"dpi": 100}})
+        assert filt(2.0, cfg) == 8.0
+        # change an unread nested key, and an entirely unread subtree:
+        cfg2 = cfg | {"filter": {"order": 4, "ripple": 0.9}, "plot": {"dpi": 300}}
+        assert filt(2.0, cfg2) == 8.0
+        assert len(calls) == 1
+        # change the read leaf:
+        cfg3 = cfg | {"filter": {"order": 5, "ripple": 0.1}}
+        assert filt(2.0, cfg3) == 10.0
+        assert len(calls) == 2
+
+    def test_plain_dict_gets_granularity(self, cache):
+        calls = []
+
+        @pure
+        def f(config):
+            calls.append(1)
+            return config["a"]
+
+        assert f({"a": 1, "b": 2}) == 1
+        assert f({"a": 1, "b": 999}) == 1
+        assert len(calls) == 1
+
+    def test_absence_is_a_dependency(self, cache):
+        calls = []
+
+        @pure
+        def f(cfg):
+            calls.append(1)
+            return cfg.get("detrend", 0)
+
+        m = ImmutableMap({"other": 1})
+        assert f(m) == 0
+        assert f(m | {"unrelated": 5}) == 0
+        assert len(calls) == 1
+        assert f(m | {"detrend": 7}) == 7  # the probed key appearing invalidates
+        assert len(calls) == 2
+
+    def test_contains_presence_dependency(self, cache):
+        calls = []
+
+        @pure
+        def f(cfg):
+            calls.append(1)
+            return 1 if "mode" in cfg else 0
+
+        assert f(ImmutableMap({"mode": "a"})) == 1
+        assert f(ImmutableMap({"mode": "b"})) == 1  # presence only; value unread
+        assert len(calls) == 1
+        assert f(ImmutableMap({})) == 0
+        assert len(calls) == 2
+
+    def test_iteration_reads_everything(self, cache):
+        calls = []
+
+        @pure
+        def f(m):
+            calls.append(1)
+            return sum(m[k] for k in m)
+
+        assert f(ImmutableMap({"a": 1, "b": 2})) == 3
+        assert f(ImmutableMap({"a": 1, "b": 2})) == 3
+        assert len(calls) == 1
+        assert f(ImmutableMap({"a": 1, "b": 2, "c": 3})) == 6  # any change invalidates
+        assert len(calls) == 2
+
+    def test_conditional_reads_get_separate_traces(self, cache):
+        calls = []
+
+        @pure
+        def f(cfg):
+            calls.append(1)
+            if cfg["mode"] == "a":
+                return cfg["x"]
+            return cfg["y"]
+
+        m = ImmutableMap({"mode": "a", "x": 1, "y": 2})
+        assert f(m) == 1
+        assert f(m | {"mode": "b"}) == 2
+        assert len(calls) == 2
+        # branch "a" must not be invalidated by a change to y (unread there):
+        assert f(m | {"y": 99}) == 1
+        assert len(calls) == 2
+
+    def test_argument_binding_normalized(self, cache):
+        calls = []
+
+        @pure
+        def f(a, b=10):
+            calls.append(1)
+            return a + b
+
+        assert f(1, 2) == 3
+        assert f(a=1, b=2) == 3
+        assert f(b=2, a=1) == 3
+        assert len(calls) == 1
+        assert f(1) == 11  # default applied → distinct key
+        assert f(1, 10) == 11  # explicit == default → same key
+        assert len(calls) == 2
+
+    def test_array_argument_content_keyed(self, cache):
+        calls = []
+
+        @pure
+        def total(x):
+            calls.append(1)
+            return float(np.sum(x))
+
+        a = np.arange(5.0)
+        assert total(a) == 10.0
+        assert total(np.arange(5.0)) == 10.0  # different object, same content
+        assert len(calls) == 1
+        # boundary freeze: mutating the caller's array cannot poison the key
+        a[0] = 100.0
+        assert total(a) == 110.0
+        assert len(calls) == 2
+
+    def test_returned_dict_merges(self, cache):
+        @pure
+        def geom(obs):
+            return {"sum": obs["a"] + obs["b"]}
+
+        obs = ImmutableMap({"a": 1, "b": 2})
+        obs = obs | geom(obs)
+        assert obs["sum"] == 3
+        obs2 = obs | geom(obs)  # hit; loaded value merges identically
+        assert obs2["sum"] == 3
+
+    def test_arrays_in_results_roundtrip(self, cache):
+        calls = []
+
+        @pure
+        def make(n):
+            calls.append(1)
+            return {"arr": np.arange(float(n))}
+
+        r1 = make(5)
+        r2 = make(5)
+        assert len(calls) == 1
+        assert np.array_equal(r1["arr"], r2["arr"])
+        assert not r2["arr"].flags.writeable
+
+    def test_exceptions_not_cached(self, cache):
+        calls = []
+
+        @pure
+        def flaky(x):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("boom")
+            return x
+
+        with pytest.raises(ValueError):
+            flaky(1)
+        assert flaky(1) == 1  # re-executes; the failure wrote nothing
+        assert len(calls) == 2
+
+    def test_code_change_invalidates_but_rename_does_not(self, cache):
+        calls = []
+        ns = {"calls": calls, "pure": pure}
+        exec("@pure\ndef f(x):\n    calls.append(1)\n    return x + 1", ns)
+        assert ns["f"](1) == 2
+        exec("@pure\ndef renamed(x):\n    calls.append(1)\n    return x + 1", ns)
+        assert ns["renamed"](1) == 2  # same code → hit despite the rename
+        assert len(calls) == 1
+        exec("@pure\ndef f(x):\n    calls.append(1)\n    return x + 2", ns)
+        assert ns["f"](1) == 3  # body changed → miss
+        assert len(calls) == 2
+
+    def test_targeted_clear(self, cache):
+        calls = []
+
+        @pure
+        def f(x):
+            calls.append("f")
+            return x + 1
+
+        @pure
+        def g(x):
+            calls.append("g")
+            return x + 2
+
+        assert f(1) == 2 and g(1) == 3
+        vk.clear_cache(f)
+        assert f(1) == 2 and g(1) == 3
+        # f forgot and recomputed; unrelated g's cache was untouched:
+        assert calls == ["f", "g", "f"]
+
+    def test_clear_reaches_callers_transitively(self, cache):
+        calls = []
+
+        @pure
+        def leaf(x):
+            calls.append("c")
+            return x + 1
+
+        @pure
+        def mid(x):
+            calls.append("b")
+            return leaf(x) * 2
+
+        @pure
+        def top(x):
+            calls.append("a")
+            return mid(x) + 3
+
+        @pure
+        def bystander(x):
+            calls.append("z")
+            return x * 10
+
+        assert top(1) == 7 and bystander(1) == 10
+        calls.clear()
+
+        vk.clear_cache(leaf)  # "leaf has changed"
+        assert top(1) == 7
+        assert bystander(1) == 10
+        # The whole chain through leaf recomputed; the bystander hit:
+        assert calls == ["a", "b", "c"]
+
+    def test_clear_reaches_argument_uses(self, cache):
+        calls = []
+
+        @pure
+        def double(x):
+            return x * 2
+
+        @pure
+        def apply(x, fn):
+            calls.append(1)
+            return fn(x)
+
+        assert apply(3, double) == 6
+        assert apply(3, double) == 6
+        assert len(calls) == 1
+        vk.clear_cache(double)  # traces keyed on double-as-argument must go
+        assert apply(3, double) == 6
+        assert len(calls) == 2
+
+    def test_clear_reaches_module_attribute_callers(self, cache, tmp_path):
+        import importlib.util
+        import sys as _sys
+
+        modfile = tmp_path / "vk_steps_mod.py"
+        modfile.write_text(
+            "from valuekit import pure\n"
+            "CALLS = []\n"
+            "@pure\n"
+            "def step(x):\n"
+            "    CALLS.append(1)\n"
+            "    return x + 5\n"
+        )
+        spec = importlib.util.spec_from_file_location("vk_steps_mod", modfile)
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules["vk_steps_mod"] = mod
+        spec.loader.exec_module(mod)
+        try:
+            outer_calls = []
+            ns = {"pure": pure, "steps": mod, "outer_calls": outer_calls}
+            exec(
+                "@pure\n"
+                "def outer(x):\n"
+                "    outer_calls.append(1)\n"
+                "    return steps.step(x) * 2\n",
+                ns,
+            )
+            outer = ns["outer"]
+            assert outer(1) == 12 and outer(1) == 12
+            assert outer_calls == [1]
+            vk.clear_cache(mod.step)
+            assert outer(1) == 12
+            # outer reached step only through the module: still cleared
+            assert outer_calls == [1, 1]
+        finally:
+            del _sys.modules["vk_steps_mod"]
+
+    
+    def test_targeted_clear_rejects_undecorated(self, cache):
+        with pytest.raises(TypeError):
+            vk.clear_cache(lambda x: x)
+
+
+    def test_deleting_cache_is_always_safe(self, cache):
+        calls = []
+
+        @pure
+        def f(x):
+            calls.append(1)
+            return {"y": np.arange(x)}
+
+        f(4)
+        vk.clear_cache()
+        r = f(4)
+        assert len(calls) == 2 and len(r["y"]) == 4
+
+    def test_corrupt_result_file_recomputes(self, cache):
+        calls = []
+
+        @pure
+        def f(x):
+            calls.append(1)
+            return (x, x + 1)
+
+        f(3)
+        for p in (cache / "objects").rglob("*.bin"):
+            p.write_bytes(b"junk")
+        assert f(3) == (3, 4)
+        assert len(calls) == 2
+
+    def test_no_store_degrades_to_plain_call(self):
+        calls = []
+
+        @pure
+        def f(x):
+            calls.append(1)
+            return x
+
+        f(1)
+        f(1)
+        assert len(calls) == 2  # no caching configured
+
+    def test_uncached_escape_hatch(self, cache):
+        calls = []
+
+        @pure
+        def f(x):
+            calls.append(1)
+            return x
+
+        f(1)
+        f.uncached(1)
+        f.uncached(1)
+        assert len(calls) == 3
+
+    def test_rejects_var_args_and_methods(self):
+        with pytest.raises(TypeError):
+
+            @pure
+            def f(*args):
+                return args
+
+        with pytest.raises(TypeError):
+
+            class C:
+                @pure
+                def m(self, x):
+                    return x
+
+    def test_unregistered_argument_type_rejected(self, cache):
+        @pure
+        def f(x):
+            return 1
+
+        class Weird:
+            pass
+
+        with pytest.raises(TypeError):
+            f(Weird())
+
+    def test_unstorable_result_rejected(self, cache):
+        @pure
+        def f(x):
+            return lambda: x
+
+        with pytest.raises(SerializationError):
+            f(1)
+
+    def test_lambda_argument_is_part_of_key(self, cache):
+        calls = []
+
+        @pure
+        def apply(x, fn):
+            calls.append(1)
+            return fn(x)
+
+        assert apply(3, lambda v: v * 2) == 6
+        assert apply(3, lambda v: v * 2) == 6
+        assert len(calls) == 1
+        assert apply(3, lambda v: v * 10) == 30
+        assert len(calls) == 2
+
+
+# ===========================================================================
+# nested @pure
+# ===========================================================================
+
+
+class TestNestedPure:
+    def test_inner_edit_invalidates_outer(self, cache):
+        def build(inner_body):
+            ns = {"pure": pure, "calls": []}
+            exec(
+                f"def inner(x):\n    calls.append('i')\n    return {inner_body}\n"
+                "inner = pure(inner)\n"
+                "def outer(x):\n    calls.append('o')\n    return inner(x) + 1\n"
+                "outer = pure(outer)",
+                ns,
+            )
+            return ns["outer"], ns["calls"]
+
+        outer1, calls1 = build("x * 2")
+        assert outer1(3) == 7
+        assert calls1 == ["o", "i"]
+
+        # Identical code, fresh decoration: outer hits, inner never even called.
+        outer1b, calls1b = build("x * 2")
+        assert outer1b(3) == 7
+        assert calls1b == []
+
+        # Edit ONLY the inner function: outer must recompute.
+        outer2, calls2 = build("x * 3")
+        assert outer2(3) == 10
+        assert "o" in calls2
+
+    def test_outer_spans_include_inner(self, cache):
+        @pure
+        def inner(x):
+            return x * 2
+
+        @pure
+        def outer(x):
+            return inner(x) + 1
+
+        inner_spans = inner._valuekit_identity()[1]
+        outer_spans = set(map(tuple, outer._valuekit_identity()[1]))
+        inner_files = {f for f, _, _ in inner_spans}
+        assert any(
+            f in inner_files and lo <= inner_spans[0][1] <= hi
+            for f, lo, hi in outer_spans
+        )
+
+    def test_breakpoint_in_inner_forces_whole_chain(self, cache, monkeypatch):
+        import bdb
+
+        calls = []
+
+        @pure
+        def inner(x):
+            calls.append("i")
+            return x * 2
+
+        @pure
+        def outer(x):
+            calls.append("o")
+            return inner(x) + 1
+
+        # Warm both caches first.
+        assert outer(3) == 7
+        assert calls == ["o", "i"]
+
+        # Breakpoint in *inner* only: a warm outer must NOT shortcut past it.
+        fname, lo, _ = inner._valuekit_identity()[1][0]
+        dbg = bdb.Bdb()
+        dbg.set_break(fname, lo + 1)
+        monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
+
+        assert outer(3) == 7
+        assert calls == ["o", "i", "o", "i"]  # both executed for real
+
+        # And those forced runs persisted nothing new:
+        dbg.clear_all_breaks()
+        assert outer(3) == 7
+        assert calls == ["o", "i", "o", "i"]  # original trace still hits
+
+    def test_midrun_force_taints_enclosing_recording(self, cache, monkeypatch):
+        import bdb
+
+        calls = []
+        dbg = bdb.Bdb()
+        monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
+
+        @pure
+        def inner(x):
+            calls.append("i")
+            return x * 2
+
+        fname, lo, _ = inner._valuekit_identity()[1][0]
+        armed = [True]
+
+        @pure
+        def outer(x):
+            calls.append("o")
+            if armed[0]:
+                # Simulates the user adding a breakpoint while paused mid-run,
+                # after outer's own entry check already passed:
+                armed[0] = False
+                dbg.set_break(fname, lo + 1)
+            return inner(x) + 1
+
+        assert outer(3) == 7  # inner was forced inside outer's recording
+        dbg.clear_all_breaks()
+        assert outer(3) == 7
+        # outer's first recording was tainted and discarded, so this second
+        # call had to execute again (and could then record cleanly):
+        assert calls.count("o") == 2
+        assert outer(3) == 7
+        assert calls.count("o") == 2  # third call hits the clean recording
+
+    def test_breakpoint_in_one_stage_keeps_sibling_caches(self, cache, monkeypatch):
+        import bdb
+
+        calls = []
+
+        @pure
+        def stage_a(x):
+            calls.append("a")
+            return x + 1
+
+        @pure
+        def stage_b(x):
+            calls.append("b")
+            return x + 2
+
+        @pure
+        def stage_c(x):
+            calls.append("c")
+            return x + 3
+
+        @pure
+        def process_batch(x):
+            calls.append("p")
+            return stage_a(x) + stage_b(x) + stage_c(x)
+
+        assert process_batch(1) == 9  # warm everything, cleanly
+        assert calls == ["p", "a", "b", "c"]
+
+        fname, lo, _ = stage_c._valuekit_identity()[1][0]
+        dbg = bdb.Bdb()
+        dbg.set_break(fname, lo + 1)
+        monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
+
+        # Only the root-to-breakpoint path is forced; siblings hit.
+        calls.clear()
+        assert process_batch(1) == 9
+        assert calls == ["p", "c"]
+
+        # Sibling caches also POPULATE during the debug session:
+        calls.clear()
+        assert process_batch(2) == 12
+        assert calls == ["p", "a", "b", "c"]  # new input: everything misses once
+        calls.clear()
+        assert process_batch(2) == 12
+        assert calls == ["p", "c"]  # a(2), b(2) recorded despite forced parent
+
+        dbg.clear_all_breaks()
+
+        # The pre-debug recording of process_batch(1) survived untouched:
+        calls.clear()
+        assert process_batch(1) == 9
+        assert calls == []
+
+        # process_batch(2)/stage_c(2) only ever ran forced → record cleanly now:
+        calls.clear()
+        assert process_batch(2) == 12
+        assert calls == ["p", "c"]
+        calls.clear()
+        assert process_batch(2) == 12
+        assert calls == []
+
+    def test_forward_references_tracked(self, cache):
+        # Names are resolved at first call, so constants and helpers defined
+        # BELOW the @pure function are still part of its identity.
+        def build(mult):
+            ns = {"pure": pure, "calls": []}
+            exec(
+                "@pure\n"
+                "def f(x):\n"
+                "    calls.append(1)\n"
+                "    return helper(x)\n"
+                f"MULT = {mult}\n"          # defined after decoration
+                "def helper(x):\n"           # so is the helper
+                "    return x * MULT\n",
+                ns,
+            )
+            return ns["f"], ns["calls"]
+
+        f1, c1 = build(2)
+        assert f1(3) == 6
+        f1b, c1b = build(2)
+        assert f1b(3) == 6 and c1b == []   # identical late defs → hit
+        f2, c2 = build(5)
+        assert f2(3) == 15 and c2 == [1]   # late-defined constant edit → miss
+
+    def test_mutual_recursion(self, cache):
+        calls = []
+        ns = {"pure": pure, "calls": calls}
+        exec(
+            "@pure\n"
+            "def even(n):\n"
+            "    calls.append('e')\n"
+            "    return True if n == 0 else odd(n - 1)\n"
+            "@pure\n"
+            "def odd(n):\n"
+            "    calls.append('o')\n"
+            "    return False if n == 0 else even(n - 1)\n",
+            ns,
+        )
+        assert ns["even"](4) is True
+        n_first = len(calls)
+        assert ns["even"](4) is True
+        assert len(calls) == n_first  # full hit; identities were computable
+
+    def test_pure_function_as_argument_unwrapped(self, cache):
+        calls = []
+
+        @pure
+        def double(x):
+            return x * 2
+
+        @pure
+        def apply(x, fn):
+            calls.append(1)
+            return fn(x)
+
+        assert apply(3, double) == 6
+        assert apply(3, double) == 6
+        assert len(calls) == 1
+
+
+
+
+
+class TestDebugHook:
+    def test_no_debugger_no_forcing(self):
+        assert debughook.breakpoints_force([("/x.py", 1, 10)]) is False
+
+    def test_always_run_env(self, monkeypatch):
+        monkeypatch.setenv("VALUEKIT_ALWAYS_RUN", "1")
+        assert debughook.breakpoints_force([]) is True
+
+    def test_bdb_breakpoint_intersection(self, cache, tmp_path, monkeypatch):
+        import bdb
+
+        calls = []
+
+        @pure
+        def f(x):
+            calls.append(1)
+            return x
+
+        fname, lo, hi = f._valuekit_identity()[1][0]
+
+        dbg = bdb.Bdb()
+        dbg.set_break(fname, lo)
+        monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
+
+        f(1)
+        f(1)  # breakpoint in span → forced execution, no cache write
+        assert len(calls) == 2
+
+        dbg.clear_all_breaks()
+        dbg.set_break(fname, hi + 500)  # elsewhere in the file
+        f(1)  # miss (nothing was written while forced) → runs and records
+        f(1)  # now hits
+        assert len(calls) == 3
+
+    def test_forced_runs_write_nothing(self, cache, monkeypatch):
+        calls = []
+
+        @pure
+        def f(x):
+            calls.append(1)
+            return x
+
+        monkeypatch.setenv("VALUEKIT_ALWAYS_RUN", "1")
+        f(1)
+        f(1)
+        monkeypatch.delenv("VALUEKIT_ALWAYS_RUN")
+        f(1)  # nothing was recorded during forced runs
+        f(1)
+        assert len(calls) == 3
+
+    def test_unknown_tracer_does_not_force(self, monkeypatch):
+        monkeypatch.setattr("sys.gettrace", lambda: (lambda *a: None))
+        assert debughook.breakpoints_force([("/x.py", 1, 10)]) is False
+
+
+# ===========================================================================
+# concurrency-ish / atomicity smoke test
+# ===========================================================================
+
+
+def test_two_stores_share_directory(tmp_path):
+    s1 = LocalStore(tmp_path)
+    s2 = LocalStore(tmp_path)
+    h = s1.put_value(freeze((1, 2, 3)))
+    assert s2.get_value(h) == (1, 2, 3)
+    s2.put_value(freeze((1, 2, 3)))  # idempotent
+    t = {"fn": "f", "deps": {}, "result": h}
+    s1.put_trace("k", t)
+    s2.put_trace("k", t)
+    assert len(s1.get_traces("k")) == 1
+
+
+# ===========================================================================
+# run_all: parallel execution with sequential replay
+# ===========================================================================
+
+
+def _write_batch_module(tmp_path):
+    """A scenario module written to disk so that spawn workers can import
+    the functions by reference. Execution counts go to an append-only log
+    (atomic across processes)."""
+    log = tmp_path / "runs.log"
+    mod = tmp_path / "vk_batch_mod.py"
+    mod.write_text(
+        "from valuekit import pure\n"
+        f"LOG = {str(log)!r}\n"
+        "def _note(tag):\n"
+        "    with open(LOG, 'a') as f:\n"
+        "        f.write(tag + '\\n')\n"
+        "@pure\n"
+        "def load(sid):\n"
+        "    _note(f'L{sid}')\n"
+        "    return sid * 10\n"
+        "@pure\n"
+        "def analyse(sid, x):\n"
+        "    _note(f'A{sid}')\n"
+        "    if sid == 3:\n"
+        "        raise ValueError('bad calibration in scenario 3')\n"
+        "    return x + 1\n"
+        "def process(sid):\n"
+        "    return analyse(sid, load(sid))\n"
+        "def flaky(x):\n"
+        "    import multiprocessing\n"
+        "    if multiprocessing.parent_process() is not None:\n"
+        "        raise OSError('only fails in workers')\n"
+        "    return x\n"
+        "def fail_or_sleep(sid):\n"
+        "    import time\n"
+        "    if sid == 3:\n"
+        "        raise ValueError('bad calibration in scenario 3')\n"
+        "    _note(f'S{sid}')\n"
+        "    time.sleep(30)\n"
+        "    _note(f'F{sid}')\n"
+        "    return sid\n"
+        "def hard_death(x):\n"
+        "    import os\n"
+        "    if x == 1:\n"
+        "        os._exit(1)\n"
+        "    return x * 2\n"
+        "def quick_or_hang(sid):\n"
+        "    import time\n"
+        "    x = load(sid)\n"
+        "    if sid == 9:\n"
+        "        _note('H9')\n"
+        "        time.sleep(60)\n"
+        "        _note('W9')\n"
+        "    return x\n"
+    )
+    import importlib.util
+    import sys as _sys
+
+    spec = importlib.util.spec_from_file_location("vk_batch_mod", mod)
+    m = importlib.util.module_from_spec(spec)
+    _sys.modules["vk_batch_mod"] = m
+    _sys.path.insert(0, str(tmp_path))  # spawn children inherit sys.path
+    spec.loader.exec_module(m)
+
+    def counts():
+        try:
+            lines = log.read_text().splitlines()
+        except OSError:
+            lines = []
+        return lines
+
+    return m, counts
+
+
+@pytest.fixture
+def debugger_attached(monkeypatch):
+    """Simulate an attached debugger with no breakpoints set (bdb-based)."""
+    import bdb
+
+    dbg = bdb.Bdb()
+    monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
+    return dbg
+
+
+class TestRunAll:
+    # ---- both modes -------------------------------------------------------
+
+    def test_results_in_order_and_workers_cache(self, cache, tmp_path):
+        # The cache is configured only via set_cache_dir in this process
+        # (the fixture); under spawn, workers see it only through run_all's
+        # initialiser. A fully cached second round proves the propagation.
+        m, counts = _write_batch_module(tmp_path)
+        ids = [7, 5, 6]
+        r1 = vk.run_all(m.process, ids, max_workers=2)
+        assert r1.values == [71, 51, 61]  # input order preserved
+        assert [o.input for o in r1] == ids
+        assert r1.failures == []
+        n = len(counts())
+        assert n == 6  # 3 loads + 3 analyses, all in workers
+        r2 = vk.run_all(m.process, ids, max_workers=2)
+        assert r2.values == r1.values
+        assert len(counts()) == n  # second round: all hits, zero executions
+
+    def test_spontaneous_worker_death_isolated_and_recorded(self, cache, tmp_path):
+        # A segfault-like death loses exactly its own input; siblings and
+        # the rest of the batch are unaffected, in both modes.
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.hard_death, [1, 2, 3], max_workers=2)
+        assert isinstance(r, vk.BatchResult)
+        assert r[1].result() == 4 and r[2].result() == 6  # isolation
+        [(x, exc)] = r.failures
+        assert x == 1
+        assert "died without raising" in str(exc) and "exit code" in str(exc)
+
+
+    # ---- collect mode (no debugger) ----------------------------------------
+
+    def test_collect_mode_processes_everything(self, cache, tmp_path):
+        m, counts = _write_batch_module(tmp_path)
+        r = vk.run_all(m.process, [1, 2, 3, 4], max_workers=1)
+        # scenario 3 failed, but 4 was still processed afterwards:
+        c = counts()
+        assert "L4" in c and "A4" in c
+        assert isinstance(r, vk.BatchResult)
+        assert len(r) == 4
+        assert [(x, type(e).__name__) for x, e in r.failures] == [(3, "ValueError")]
+        assert r[2].input == 3
+        assert isinstance(r[2].exception(), ValueError)
+        with pytest.raises(ValueError, match="scenario 3"):
+            r[2].result()
+        assert r[0].result() == 11
+
+    def test_collect_mode_values_raises_exception_group(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.process, [1, 3], max_workers=1)
+        with pytest.raises(ExceptionGroup, match="1 of 2 inputs failed") as ei:
+            r.values
+        (sub,) = ei.value.exceptions
+        assert isinstance(sub, ValueError)
+        assert "input: 3" in getattr(sub, "__notes__", [])
+        with pytest.raises(ExceptionGroup):
+            r.values  # a second access must not duplicate the note
+        assert getattr(sub, "__notes__", []).count("input: 3") == 1
+
+    # ---- timeout (both modes) ------------------------------------------------
+
+    def test_timeout_is_per_input_and_prompt(self, cache, tmp_path):
+        import time
+
+        m, counts = _write_batch_module(tmp_path)
+        t0 = time.monotonic()
+        r = vk.run_all(m.quick_or_hang, [7, 9, 8], max_workers=3, timeout=1.5)
+        assert time.monotonic() - t0 < 20  # the hang did not stall the batch
+        # the healthy inputs completed normally:
+        assert r[0].result() == 70 and r[2].result() == 80
+        [(x, exc)] = r.failures
+        assert x == 9 and isinstance(exc, TimeoutError)
+        time.sleep(0.5)
+        assert "W9" not in counts()  # the hung process was killed, not finished
+
+    def test_timeout_in_debug_mode_recorded_not_replayed(
+        self, cache, tmp_path, debugger_attached
+    ):
+        m, counts = _write_batch_module(tmp_path)
+        r = vk.run_all(m.quick_or_hang, [9], max_workers=1, timeout=1.5)
+        # a timeout is never a fail-fast trigger and never replayed:
+        assert counts().count("H9") == 1
+        [(x, exc)] = r.failures
+        assert x == 9 and isinstance(exc, TimeoutError)
+
+
+    def test_capacity_not_degraded_by_timeout(self, cache, tmp_path):
+        # After a kill, queued inputs still start: worker capacity is
+        # replaced, not consumed, by a timed-out input.
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.quick_or_hang, [9, 1, 2, 3], max_workers=2, timeout=1.5)
+        assert len(r) == 4
+        assert [x for x, _ in r.failures] == [9]
+        assert [o.result() for o in r if o.input != 9] == [10, 20, 30]
+
+    def test_timeout_unbreached_collects_normally(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.process, [1, 2, 3], max_workers=2, timeout=60)
+        assert [x for x, _ in r.failures] == [3]
+        assert r[0].result() == 11
+
+    # ---- debug mode (debugger attached, no breakpoints) ---------------------
+
+    def test_debug_failure_replays_inline_with_cached_prefix(
+        self, cache, tmp_path, debugger_attached
+    ):
+        m, counts = _write_batch_module(tmp_path)
+        with pytest.raises(ValueError, match="scenario 3"):
+            vk.run_all(m.process, [1, 2, 3, 4], max_workers=2)
+        c = counts()
+        # load(3) ran once, in a worker; the inline replay served it from
+        # the cache and re-executed only the failing step:
+        assert c.count("L3") == 1
+        assert c.count("A3") == 2  # worker attempt + inline replay
+
+    def test_debug_failure_kills_running_workers(
+        self, cache, tmp_path, debugger_attached
+    ):
+        import time
+
+        m, counts = _write_batch_module(tmp_path)
+        t0 = time.monotonic()
+        with pytest.raises(ValueError, match="scenario 3"):
+            # One worker fails at once; the other starts a 30 s sleep.
+            vk.run_all(m.fail_or_sleep, [4, 3], max_workers=2)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 15  # did not wait for the sleeper
+        time.sleep(0.5)
+        assert "F4" not in counts()  # the sleeper was killed, not finished
+
+    def test_debug_nondeterministic_failure_guard(
+        self, cache, tmp_path, debugger_attached
+    ):
+        m, _ = _write_batch_module(tmp_path)
+        with pytest.raises(RuntimeError, match="nondeterministic") as ei:
+            vk.run_all(m.flaky, [1, 2], max_workers=2)
+        assert isinstance(ei.value.__cause__, OSError)
+
+    def test_debug_success_same_shape_as_collect(
+        self, cache, tmp_path, debugger_attached
+    ):
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.process, [1, 2], max_workers=2)
+        assert isinstance(r, vk.BatchResult)
+        assert r.values == [11, 21]
+
+    # ---- sequential mode (breakpoints) ---------------------------------------
+
+    def test_breakpoint_forces_sequential(self, cache, monkeypatch):
+        import bdb
+
+        calls = []
+
+        @pure
+        def step(x):
+            calls.append(x)  # visible only if executed in THIS process
+            return x + 1
+
+        def batch(x):
+            return step(x)
+
+        fname, lo, _ = step._valuekit_identity()[1][0]
+        dbg = bdb.Bdb()
+        dbg.set_break(fname, lo + 1)
+        monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
+
+        assert vk.run_all(batch, [1, 2, 3]).values == [2, 3, 4]
+        assert calls == [1, 2, 3]  # sequential, in-process: breakpoints fire

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "valuekit"
+version = "0.1.0"
+description = "An immutable map for pipeline data, plus disk memoisation for pure functions."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.24"]
+keywords = ["immutable", "memoization", "caching", "pipeline", "pure-function", "content-addressed"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["valuekit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
