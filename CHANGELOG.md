@@ -16,7 +16,7 @@ First public release.
   read rather than per argument.
 - `register_type`: extend the frozen/hashable type set, optionally with a store
   codec so custom types can appear in cached return values.
-- `run_all`: parallel batch execution with per-input isolation, timeouts, and
-  fail-fast replay under a debugger.
+- `run_all`: parallel batch execution with per-input isolation, timeouts that
+  kill, and every failure recorded against the input that caused it.
 - Debugger integration: a live breakpoint anywhere in a `@pure` function's
   dependency closure forces execution, and forced runs never write to the store.
