@@ -26,7 +26,7 @@ import os
 import sys
 from typing import Iterable
 
-__all__ = ["breakpoints_force", "debugger_attached", "EVERYWHERE"]
+__all__ = ["breakpoints_force", "EVERYWHERE"]
 
 # Sentinel: "assume a breakpoint on every line".
 EVERYWHERE = object()
@@ -79,13 +79,6 @@ def _bdb_breakpoints():
         }
     except Exception:
         return EVERYWHERE
-
-
-def debugger_attached() -> bool:
-    """True when a known debugger (pydevd or anything bdb-based) is
-    attached, whether or not any breakpoints are set.  Coverage tools and
-    profilers are not debuggers and return False."""
-    return _pydevd_breakpoints() is not None or _bdb_breakpoints() is not None
 
 
 def _merge(a, b):
