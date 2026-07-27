@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.11"
+          - os: macos-latest
+            python-version: "3.14"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Show environment
+        run: python -c "import sys, numpy; print(sys.version); print('numpy', numpy.__version__)"
+
+      - name: Run tests
+        run: python -m pytest -ra --durations=10
+
+  # Informational only. Windows behaviour is genuinely unverified: store.py
+  # reloads arrays as memmaps and Windows locks mapped files, so os.replace
+  # over a live memmap and rmtree of a cache directory may fail; parallel.py
+  # also formats proc.kill() exit codes that differ from POSIX. Gather data
+  # without gating the release.
+  test-windows:
+    name: windows-latest / py${{ matrix.python-version }} (informational)
+    runs-on: windows-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - run: python -m pytest -ra --durations=10
+
+  build-check:
+    name: Build & metadata check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install --upgrade build twine
+
+      - run: python -m build
+
+      - run: python -m twine check --strict dist/*
+
+      - name: Assert PEP 639 metadata and py.typed
+        run: |
+          python - <<'PY'
+          import glob, tarfile, zipfile
+
+          whl = glob.glob("dist/*.whl")[0]
+          z = zipfile.ZipFile(whl)
+          names = z.namelist()
+          assert "valuekit/py.typed" in names, names
+          assert not any(n.startswith("tests/") for n in names), names
+
+          meta = next(n for n in names if n.endswith(".dist-info/METADATA"))
+          text = z.read(meta).decode()
+          for needle in (
+              "Metadata-Version: 2.4",
+              "License-Expression: MIT",
+              "License-File: LICENSE",
+              "Requires-Dist: numpy>=1.24",
+              "Requires-Python: >=3.11",
+          ):
+              assert needle in text, f"missing {needle!r}\n{text[:600]}"
+          assert "Classifier: License ::" not in text, "PEP 639 conflict"
+
+          sdist = glob.glob("dist/*.tar.gz")[0]
+          entries = tarfile.open(sdist).getnames()
+          for suffix in ("/LICENSE", "/README.md", "/valuekit/py.typed",
+                         "/tests/test_valuekit.py"):
+              assert any(e.endswith(suffix) for e in entries), f"missing {suffix}"
+
+          print("metadata OK")
+          PY

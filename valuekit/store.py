@@ -33,6 +33,7 @@ import json
 import os
 import struct
 import tempfile
+from collections.abc import Sequence
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol
@@ -72,7 +73,9 @@ class CacheStore(Protocol):
     """
 
     def get_traces(self, fn_key: str) -> list[dict]: ...
-    def put_trace(self, fn_key: str, trace: dict) -> None: ...
+    def put_trace(
+        self, fn_key: str, trace: dict, units: Sequence[str] = ()
+    ) -> None: ...
     def get_value(self, h: str) -> Any: ...
     def put_value(self, v: Any) -> str: ...
 
@@ -233,7 +236,7 @@ class LocalStore:
                 out.append(t)
         return out
 
-    def put_trace(self, fn_key: str, trace: dict, units: list[str] = ()) -> None:
+    def put_trace(self, fn_key: str, trace: dict, units: Sequence[str] = ()) -> None:
         deps = self.traces / f"{fn_key}.deps"
         if units and not deps.exists():
             _atomic_write(deps, "\n".join(units).encode())

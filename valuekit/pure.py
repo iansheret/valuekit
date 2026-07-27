@@ -34,7 +34,6 @@ import os
 import sys
 from typing import Any, Callable
 
-from ._version import __version__ as _vk_version
 from .codehash import _module_unit, _unit_digest, function_fingerprint
 from .debughook import breakpoints_force
 from .map import ImmutableMap, map_digest
@@ -68,8 +67,11 @@ def _current_store() -> "CacheStore | None":
 def set_cache_dir(path: str | os.PathLike | None) -> None:
     """Configure the cache directory (or None to disable caching).
 
-    May also be set with the VALUEKIT_CACHE environment variable, which is
-    read once at import; an explicit call here takes precedence.
+    Nothing is configured until this is called, so importing valuekit never
+    enables disk caching by itself.  To drive it from the environment, read
+    the variable explicitly::
+
+        set_cache_dir(os.environ.get("VALUEKIT_CACHE"))
     """
     global _store
     _store = None if path is None else LocalStore(path)
@@ -113,8 +115,18 @@ def clear_cache(fn: Callable | None = None) -> None:
         value_hash = None
     _store.drop_dependents(units, value_hash)
 
+
+# Every stored entry is salted with this, so bumping it invalidates every
+# cache everywhere.  Bump it when a release changes what a fingerprint or a
+# trace means; releases that do not are then free to leave caches intact.
+CACHE_EPOCH = 1
+
+
 def _salt() -> str:
-    return f"valuekit-{_vk_version}|py{sys.version_info.major}.{sys.version_info.minor}"
+    return (
+        f"valuekit-epoch{CACHE_EPOCH}"
+        f"|py{sys.version_info.major}.{sys.version_info.minor}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ Memoised pipelines: declare functions pure and set a cache directory::
 
     from valuekit import ImmutableMap, pure, set_cache_dir
 
-    set_cache_dir("~/.cache/mypipeline")             # or $VALUEKIT_CACHE
+    set_cache_dir("~/.cache/mypipeline")             # nothing caches until this
 
     @pure
     def calculate_geometry(obs, config):
@@ -35,8 +35,6 @@ contents are not reachable by name; @pure is the user's promise that they
 never change or never matter.  Better, pass them as arguments, where they
 are always tracked.
 """
-
-import os as _os
 
 from ._version import __version__
 from .values import freeze, content_hash, register_type
@@ -58,8 +56,3 @@ __all__ = [
     "SerializationError",
     "__version__",
 ]
-
-# Environment configuration (an explicit set_cache_dir() call overrides).
-_env = _os.environ.get("VALUEKIT_CACHE")
-if _env:
-    set_cache_dir(_env)

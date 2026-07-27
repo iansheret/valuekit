@@ -379,7 +379,7 @@ def _decode_one(data: bytes, pos: int) -> tuple[Any, int]:
         return frozenset(items), pos
     if tag == b"g":
         p = 0
-        stag, sbody, p = _read_blob(body, p)
+        _, sbody, p = _read_blob(body, p)
         dt = np.dtype(sbody.decode("ascii"))
         return np.frombuffer(body[p:], dtype=dt)[0], pos
     raise ValueError(f"unknown key tag {tag!r}")

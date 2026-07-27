@@ -34,7 +34,7 @@ configuration.
 ```python
 from valuekit import ImmutableMap, pure, set_cache_dir
 
-set_cache_dir("~/.cache/mypipeline")     # or export VALUEKIT_CACHE=...
+set_cache_dir("~/.cache/mypipeline")     # nothing is cached until this is called
 
 @pure
 def calculate_geometry(obs, config):
@@ -206,16 +206,18 @@ Exceptions raised by ``fn`` itself depend on whether a debugger is
 attached. The mode never changes any result — purity means each input
 produces the same value or the same exception either way.
 
-Without a debugger, every input is processed and failures are collected::
+Without a debugger, every input is processed and failures are collected:
 
-    result = run_all(process_scenario, session_ids)
+```python
+result = run_all(process_scenario, session_ids)
 
-    result.values                 # plain list of results; raises an
-                                  # ExceptionGroup if any input failed
-    for sid, exc in result.failures:
-        ...                       # explicit handling; the batch completed
-    result[i].input               # the input that produced outcome i
-    result[i].result()            # the value, or re-raises the exception
+result.values                 # plain list of results; raises an
+                              # ExceptionGroup if any input failed
+for sid, exc in result.failures:
+    ...                       # explicit handling; the batch completed
+result[i].input               # the input that produced outcome i
+result[i].result()            # the value, or re-raises the exception
+```
 
 ``.values`` is the accessor to reach for by default: it is the plain list
 of results when everything succeeded, and it raises when something
@@ -245,10 +247,21 @@ Two rules for using other pools (joblib, dask, a bare executor) around
 ``@pure`` code: parallelise in the driver, between ``@pure`` calls, never
 inside a ``@pure`` function's body (reads performed in worker processes are
 not recorded, which produces traces with missing dependencies and therefore
-stale results); and configure the cache with the ``VALUEKIT_CACHE``
-environment variable or a top-level ``set_cache_dir`` call, since a call
+stale results); and call ``set_cache_dir`` at module top level, since a call
 inside an ``if __name__ == "__main__":`` block, or in a notebook, does not
-reach spawn-based workers.
+reach spawn-based workers. (``run_all`` is exempt: it passes the cache
+directory to each worker explicitly.) To drive the location from the
+environment, read the variable yourself, at top level:
+
+```python
+import os
+from valuekit import set_cache_dir
+
+set_cache_dir(os.environ.get("VALUEKIT_CACHE"))   # None disables caching
+```
+
+Nothing is cached until `set_cache_dir` is called: importing valuekit has no
+effect on its own.
 
 ## Install
 

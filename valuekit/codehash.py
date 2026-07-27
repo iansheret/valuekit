@@ -261,7 +261,7 @@ class _Walker:
             else:
                 self._mark(f"fn:{name}:{marker}")
         elif isinstance(obj, (types.BuiltinFunctionType, types.BuiltinMethodType)):
-            kind, marker = _classify(getattr(obj, "__module__", None), None)
+            _, marker = _classify(getattr(obj, "__module__", None), None)
             self._mark(f"cfn:{name}:{marker}")
         elif isinstance(obj, types.ModuleType):
             kind, marker = _classify(obj.__name__, getattr(obj, "__file__", None))
@@ -355,5 +355,5 @@ def _h_function(v: types.FunctionType, h: Any) -> None:
 
 @hash_update.register
 def _h_builtin_function(v: types.BuiltinFunctionType, h: Any) -> None:
-    kind, marker = _classify(getattr(v, "__module__", None), None)
+    _, marker = _classify(getattr(v, "__module__", None), None)
     _frame(h, b"L", f"{marker}:{v.__qualname__}".encode())
