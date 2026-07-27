@@ -193,20 +193,13 @@ directory and share the cache: value writes are idempotent and trace
 writes are atomic appends, so concurrent writers cannot drop each other's
 results.
 
-Timeouts and worker deaths are per-input failures in every mode, recorded
-with the input that caused them. ``timeout=`` limits the seconds each
+Every input is processed, and every failure is recorded against the input
+that caused it. An exception raised by ``fn`` carries the string-form
+traceback captured in the worker. ``timeout=`` limits the seconds each
 input may spend running; a breach kills that input's process promptly and
 records a ``TimeoutError``. A process that dies without raising (a
 segfault or an out-of-memory kill) records a ``RuntimeError`` naming the
-input and the exit code. Neither is replayed: replaying a deterministic
-hang would hang this process, and replaying a crash would reproduce it
-here (to debug either, call ``fn(x)`` yourself under the debugger).
-
-Exceptions raised by ``fn`` itself depend on whether a debugger is
-attached. The mode never changes any result — purity means each input
-produces the same value or the same exception either way.
-
-Without a debugger, every input is processed and failures are collected:
+input and the exit code.
 
 ```python
 result = run_all(process_scenario, session_ids)
@@ -222,26 +215,26 @@ result[i].result()            # the value, or re-raises the exception
 ``.values`` is the accessor to reach for by default: it is the plain list
 of results when everything succeeded, and it raises when something
 failed, so failures cannot be dropped by accident. ``.failures`` is for
-callers that handle failures explicitly and continue. Collected
-exceptions carry the string-form traceback captured in the worker; for
-live frames, rerun the failing input under the debugger
-(``process_scenario(sid)``), which replays the cached prefix and
-re-raises at the failing step.
+callers that handle failures explicitly and continue.
 
-With a debugger attached, ``run_all`` fails fast on the first exception
-from ``fn`` instead: the remaining processes are killed (cheap, because
-every ``@pure`` step persists when it completes, so at most one in-flight
-step per process is discarded) and the failing input is rerun
-sequentially in this process. Cached steps replay in milliseconds; the
-failing step executes and raises here, with a live stack and a working
-REPL. If the inline rerun does not raise, the original failure was
-nondeterministic, which violates the ``@pure`` contract; ``run_all``
-raises a ``RuntimeError`` chaining the worker's exception rather than
-absorbing this silently. If a live breakpoint intersects anything
-reachable by name from ``fn``, the whole batch instead runs sequentially
-in this process, where breakpoints fire and the usual debugger rules
-apply (breakpoints do not reach worker processes; the sequential fallback
-does not enforce the timeout).
+Nothing is replayed automatically. To debug a failure, call the function
+on that one input yourself:
+
+```python
+process_scenario(sid)         # the cached prefix replays in milliseconds;
+                              # the failing step executes and raises here
+```
+
+with a live stack and a working REPL. Picking the input is the point:
+which scenario fails first in a parallel batch is a race, so an automatic
+replay would drop you into whichever one happened to lose it.
+
+One debugger accommodation remains, because breakpoints do not reach
+worker processes. If a live breakpoint intersects anything reachable by
+name from ``fn``, the whole batch runs sequentially in this process, where
+breakpoints fire and the usual debugger rules apply. The sequential
+fallback does not enforce the timeout. Merely having a debugger attached
+changes nothing on its own.
 
 Two rules for using other pools (joblib, dask, a bare executor) around
 ``@pure`` code: parallelise in the driver, between ``@pure`` calls, never

@@ -12,42 +12,31 @@ input, roughly 0.4 s including a numpy import; this overlaps across
 workers, and is noise for inputs that take seconds or more.  For very
 small inputs, batch them inside ``fn``.
 
-Timeouts and worker deaths are per-input failures in every mode, recorded
-on the BatchResult with the input that caused them:
+Every input is processed, and every failure is recorded against the input
+that caused it.  There are three kinds, treated alike:
 
-* ``timeout=`` limits the seconds each input may spend running.  A breach
-  kills that input's process promptly and records a TimeoutError; the rest
-  of the batch is unaffected.  There is no replay of a timeout, since
-  replaying a deterministic hang would hang this process (to debug one,
-  call ``fn(x)`` and pause the debugger).
-* A process that dies without raising (a segfault or an out-of-memory
-  kill) records a RuntimeError naming the input and the exit code, and is
-  deliberately not replayed: an automatic replay would reproduce the crash
-  in this process.
+* an exception raised by ``fn``, carrying the string-form traceback
+  captured in the worker;
+* a timeout.  ``timeout=`` limits the seconds each input may spend
+  running; a breach kills that input's process promptly and records a
+  TimeoutError;
+* a process that dies without raising (a segfault or an out-of-memory
+  kill), recorded as a RuntimeError naming the input and the exit code.
 
-Genuine exceptions raised by ``fn`` depend on whether a debugger is
-attached:
+``.values`` returns the plain list of results, raising an ExceptionGroup if
+any input failed, so failures cannot be dropped by accident; ``.failures``
+lists ``(input, exception)`` pairs for callers that handle them explicitly.
 
-* No debugger (a batch or production run): failures are collected.  Every
-  input is processed; ``.values`` returns the plain list of results,
-  raising an ExceptionGroup if any input failed, and ``.failures`` lists
-  ``(input, exception)`` pairs for explicit handling.  Collected
-  exceptions carry the string-form traceback captured in the worker.
-* Debugger attached: fail fast and replay.  On the first failure, the
-  remaining processes are killed (cheap: every @pure step persists when it
-  completes, so at most one in-flight step per process is discarded) and
-  the failing input is rerun sequentially in this process.  The cached
-  prefix replays without executing; the failing step executes and raises
-  here, with a live stack and a working REPL.
-* Debugger attached, with a live breakpoint intersecting anything
-  reachable by name from ``fn``: the batch runs sequentially in this
-  process, where breakpoints fire and the usual debugger rules apply
-  (breakpoints do not reach worker processes; the sequential fallback does
-  not enforce the timeout).
+Nothing is replayed automatically.  To debug one input, call ``fn(x)`` on
+it: the cached prefix replays without executing and the failing step runs
+inline, in this process, with a live stack — and you choose which input you
+land in, rather than whichever one happened to fail first.
 
-A fully successful batch returns the same BatchResult in every mode, and
-the mode never changes any result: purity means each input produces the
-same value or the same exception either way.
+One debugger accommodation remains, because breakpoints do not reach
+spawned workers: if a live breakpoint intersects anything reachable by name
+from ``fn``, the whole batch runs sequentially in this process, where
+breakpoints fire and the usual debugger rules apply.  The sequential
+fallback does not enforce the timeout.
 
 Workers are configured automatically (each process applies the parent's
 cache directory before running) and share the cache: value writes are
@@ -70,7 +59,7 @@ from multiprocessing import connection as _mp_connection
 from typing import Any, Callable, Iterable, Iterator
 
 from .codehash import function_fingerprint
-from .debughook import breakpoints_force, debugger_attached
+from .debughook import breakpoints_force
 from .store import LocalStore
 
 __all__ = ["run_all", "BatchResult", "Outcome"]
@@ -220,10 +209,8 @@ class _Task:
         self.timed_out = False
 
 
-def _harvest(t: _Task, msg, name: str, timeout) -> tuple[Outcome, bool]:
-    """Turn a finished task into an Outcome. Returns (outcome, genuine):
-    *genuine* is True only for an exception raised by fn itself — the only
-    kind that debug mode fails fast on and replays."""
+def _harvest(t: _Task, msg, name: str, timeout) -> Outcome:
+    """Turn a finished task into an Outcome."""
     if msg is None:
         if t.timed_out:
             exc: BaseException = TimeoutError(
@@ -236,22 +223,21 @@ def _harvest(t: _Task, msg, name: str, timeout) -> tuple[Outcome, bool]:
             exc = RuntimeError(
                 f"a worker died without raising while processing "
                 f"{name}({t.x!r}) (exit code {t.proc.exitcode}; a segfault "
-                f"or an out-of-memory kill?). Not replaying automatically: "
-                f"a replay would reproduce the crash in this process. Call "
-                f"{name}({t.x!r}) yourself to debug it."
+                f"or an out-of-memory kill?). Completed steps are cached; "
+                f"call {name}({t.x!r}) yourself to debug it."
             )
-        return Outcome(t.x, exc=exc), False
+        return Outcome(t.x, exc=exc)
     kind = msg[0]
     if kind == "ok":
-        return Outcome(t.x, value=msg[1]), False
+        return Outcome(t.x, value=msg[1])
     if kind == "err":
         exc = msg[1]
         exc.__cause__ = _RemoteTraceback(f"\n{msg[2]}")
-        return Outcome(t.x, exc=exc), True
+        return Outcome(t.x, exc=exc)
     # "err_str": the worker's exception was not picklable
     exc = RuntimeError(f"{msg[1]}: {msg[2]}")
     exc.__cause__ = _RemoteTraceback(f"\n{msg[3]}")
-    return Outcome(t.x, exc=exc), True
+    return Outcome(t.x, exc=exc)
 
 
 def run_all(
@@ -270,14 +256,10 @@ def run_all(
     records a TimeoutError on its outcome, leaving the rest of the batch
     unaffected.  Worker deaths are likewise recorded per input.
 
-    Without a debugger, every input is processed and failures are
-    collected on the BatchResult.  With a debugger attached, the first
-    exception raised by ``fn`` kills the remaining processes and reruns
-    the failing input sequentially in this process, where it raises with a
-    live stack; if the rerun does not raise, the original failure was
-    nondeterministic, which violates the @pure contract, and a
-    RuntimeError chaining the worker's exception is raised so that this is
-    not silently absorbed.
+    Every input is processed and failures are collected on the
+    BatchResult: ``.values`` raises an ExceptionGroup if any input failed,
+    and ``.failures`` gives the ``(input, exception)`` pairs.  Nothing is
+    replayed automatically; to debug one input, call ``fn(x)`` on it.
     """
     inputs = list(inputs)
 
@@ -291,8 +273,6 @@ def run_all(
     if breakpoints_force(spans):
         return BatchResult(Outcome(x, value=fn(x)) for x in inputs)
 
-    debug = debugger_attached()
-
     from .pure import _current_store
 
     store = _current_store()
@@ -305,7 +285,6 @@ def run_all(
     outcomes: list[Outcome | None] = [None] * len(inputs)
     queue = deque(enumerate(inputs))
     running: list[_Task] = []
-    genuine: tuple[Any, BaseException] | None = None
 
     def _start(idx: int, x: Any) -> None:
         recv_end, send_end = ctx.Pipe(duplex=False)
@@ -319,7 +298,7 @@ def run_all(
 
     try:
         while queue or running:
-            while queue and len(running) < workers and genuine is None:
+            while queue and len(running) < workers:
                 _start(*queue.popleft())
             if not running:
                 break
@@ -349,29 +328,9 @@ def run_all(
                 running.remove(t)
                 t.proc.join()
                 t.conn.close()
-                outcome, is_genuine = _harvest(t, msg, name, timeout)
-                outcomes[t.idx] = outcome
-                if debug and is_genuine and genuine is None:
-                    genuine = (t.x, outcome._exc)
-            if genuine is not None:
-                break
-
-        if genuine is not None:
-            for t in running:
-                t.proc.kill()
-            for t in running:
-                t.proc.join()
-                t.conn.close()
-            running.clear()
-            x, exc = genuine
-            fn(x)  # replays the cached prefix, then raises inline
-            raise RuntimeError(
-                f"{name}({x!r}) failed in a worker but succeeded on "
-                f"sequential replay: the failure is nondeterministic, which "
-                f"violates the @pure contract."
-            ) from exc
+                outcomes[t.idx] = _harvest(t, msg, name, timeout)
     finally:
-        # Covers KeyboardInterrupt and the replay raise: no orphans.
+        # Covers KeyboardInterrupt: no orphans.
         for t in running:
             try:
                 t.proc.kill()

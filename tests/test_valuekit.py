@@ -1228,7 +1228,7 @@ def test_two_stores_share_directory(tmp_path):
 
 
 # ===========================================================================
-# run_all: parallel execution with sequential replay
+# run_all: parallel execution
 # ===========================================================================
 
 
@@ -1256,19 +1256,6 @@ def _write_batch_module(tmp_path):
         "    return x + 1\n"
         "def process(sid):\n"
         "    return analyse(sid, load(sid))\n"
-        "def flaky(x):\n"
-        "    import multiprocessing\n"
-        "    if multiprocessing.parent_process() is not None:\n"
-        "        raise OSError('only fails in workers')\n"
-        "    return x\n"
-        "def fail_or_sleep(sid):\n"
-        "    import time\n"
-        "    if sid == 3:\n"
-        "        raise ValueError('bad calibration in scenario 3')\n"
-        "    _note(f'S{sid}')\n"
-        "    time.sleep(30)\n"
-        "    _note(f'F{sid}')\n"
-        "    return sid\n"
         "def hard_death(x):\n"
         "    import os\n"
         "    if x == 1:\n"
@@ -1313,7 +1300,7 @@ def debugger_attached(monkeypatch):
 
 
 class TestRunAll:
-    # ---- both modes -------------------------------------------------------
+    # ---- basics -----------------------------------------------------------
 
     def test_results_in_order_and_workers_cache(self, cache, tmp_path):
         # The cache is configured only via set_cache_dir in this process
@@ -1333,7 +1320,7 @@ class TestRunAll:
 
     def test_spontaneous_worker_death_isolated_and_recorded(self, cache, tmp_path):
         # A segfault-like death loses exactly its own input; siblings and
-        # the rest of the batch are unaffected, in both modes.
+        # the rest of the batch are unaffected.
         m, _ = _write_batch_module(tmp_path)
         r = vk.run_all(m.hard_death, [1, 2, 3], max_workers=2)
         assert isinstance(r, vk.BatchResult)
@@ -1342,8 +1329,7 @@ class TestRunAll:
         assert x == 1
         assert "died without raising" in str(exc) and "exit code" in str(exc)
 
-
-    # ---- collect mode (no debugger) ----------------------------------------
+    # ---- failure collection --------------------------------------------------
 
     def test_collect_mode_processes_everything(self, cache, tmp_path):
         m, counts = _write_batch_module(tmp_path)
@@ -1372,7 +1358,7 @@ class TestRunAll:
             r.values  # a second access must not duplicate the note
         assert getattr(sub, "__notes__", []).count("input: 3") == 1
 
-    # ---- timeout (both modes) ------------------------------------------------
+    # ---- timeout -------------------------------------------------------------
 
     def test_timeout_is_per_input_and_prompt(self, cache, tmp_path):
         import time
@@ -1387,17 +1373,6 @@ class TestRunAll:
         assert x == 9 and isinstance(exc, TimeoutError)
         time.sleep(0.5)
         assert "W9" not in counts()  # the hung process was killed, not finished
-
-    def test_timeout_in_debug_mode_recorded_not_replayed(
-        self, cache, tmp_path, debugger_attached
-    ):
-        m, counts = _write_batch_module(tmp_path)
-        r = vk.run_all(m.quick_or_hang, [9], max_workers=1, timeout=1.5)
-        # a timeout is never a fail-fast trigger and never replayed:
-        assert counts().count("H9") == 1
-        [(x, exc)] = r.failures
-        assert x == 9 and isinstance(exc, TimeoutError)
-
 
     def test_capacity_not_degraded_by_timeout(self, cache, tmp_path):
         # After a kill, queued inputs still start: worker capacity is
@@ -1414,50 +1389,23 @@ class TestRunAll:
         assert [x for x, _ in r.failures] == [3]
         assert r[0].result() == 11
 
-    # ---- debug mode (debugger attached, no breakpoints) ---------------------
+    # ---- an attached debugger is not, by itself, a mode -----------------------
 
-    def test_debug_failure_replays_inline_with_cached_prefix(
+    def test_debugger_attached_changes_nothing(
         self, cache, tmp_path, debugger_attached
     ):
+        # Only a *breakpoint* changes how a batch runs. Merely having a
+        # debugger attached must not: failures are collected exactly as
+        # they are without one, and every input is still processed.
         m, counts = _write_batch_module(tmp_path)
-        with pytest.raises(ValueError, match="scenario 3"):
-            vk.run_all(m.process, [1, 2, 3, 4], max_workers=2)
-        c = counts()
-        # load(3) ran once, in a worker; the inline replay served it from
-        # the cache and re-executed only the failing step:
-        assert c.count("L3") == 1
-        assert c.count("A3") == 2  # worker attempt + inline replay
-
-    def test_debug_failure_kills_running_workers(
-        self, cache, tmp_path, debugger_attached
-    ):
-        import time
-
-        m, counts = _write_batch_module(tmp_path)
-        t0 = time.monotonic()
-        with pytest.raises(ValueError, match="scenario 3"):
-            # One worker fails at once; the other starts a 30 s sleep.
-            vk.run_all(m.fail_or_sleep, [4, 3], max_workers=2)
-        elapsed = time.monotonic() - t0
-        assert elapsed < 15  # did not wait for the sleeper
-        time.sleep(0.5)
-        assert "F4" not in counts()  # the sleeper was killed, not finished
-
-    def test_debug_nondeterministic_failure_guard(
-        self, cache, tmp_path, debugger_attached
-    ):
-        m, _ = _write_batch_module(tmp_path)
-        with pytest.raises(RuntimeError, match="nondeterministic") as ei:
-            vk.run_all(m.flaky, [1, 2], max_workers=2)
-        assert isinstance(ei.value.__cause__, OSError)
-
-    def test_debug_success_same_shape_as_collect(
-        self, cache, tmp_path, debugger_attached
-    ):
-        m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.process, [1, 2], max_workers=2)
+        r = vk.run_all(m.process, [1, 2, 3, 4], max_workers=2)
         assert isinstance(r, vk.BatchResult)
-        assert r.values == [11, 21]
+        assert len(r) == 4
+        assert [(x, type(e).__name__) for x, e in r.failures] == [(3, "ValueError")]
+        assert r[0].result() == 11
+        c = counts()
+        assert "L4" in c and "A4" in c  # input 4 ran despite 3 failing
+        assert c.count("A3") == 1  # the failure was not replayed
 
     # ---- sequential mode (breakpoints) ---------------------------------------
 
