@@ -6,20 +6,27 @@ semantic effect: a missing or corrupt entry is treated as a miss.
 Layout::
 
     <root>/format            # store format version; mismatch → refuse
-    <root>/objects/ab/<hash>.npy   # a single ndarray (reloaded mmap, read-only)
+    <root>/objects/ab/<hash>.npy   # a read-only ndarray (reloaded mmap)
+    <root>/objects/ab/<hash>.npyw  # a writeable ndarray (reloaded in full)
     <root>/objects/ab/<hash>.bin   # any other value
     <root>/traces/<fnkey>.jsonl    # traces for one function, one per line
 
-Values are stored structurally: composite values (tuples, frozensets, maps)
-store the content hashes of their children, each of which is its own object.
-This deduplicates large arrays across traces and lets arrays reload as
-read-only memory maps, which ``freeze`` then shares without copying.
+Values are stored structurally: composite values (tuples, lists, sets,
+frozensets, maps) store the content hashes of their children, each of which
+is its own object.  This deduplicates large arrays across traces and lets
+read-only arrays reload as memory maps, which ``freeze`` then shares without
+copying.
+
+A stored value round-trips to an equal value of the same type, which is why
+writeability splits the two array extensions and why lists, dicts and sets
+keep their order: a hit must be indistinguishable from the miss that
+recorded it.  Content-addressing makes this work only because the content
+hash identifies a value exactly (see :mod:`valuekit.values`).
 
 There is no pickle anywhere.  Storable types are a fixed set: None, bool,
 int, float, complex, str, bytes, range, numpy scalars, numpy arrays, tuples,
-frozensets, and ImmutableMaps (recursively of the same).  Anything else
-raises :class:`SerializationError`, matching the closed-set behaviour of
-``freeze``.
+lists, sets, frozensets, dicts and ImmutableMaps (recursively of the same).
+Anything else raises :class:`SerializationError`.
 
 Writes are atomic: values go through a temp file and ``os.replace``, and
 traces are appended with a single ``O_APPEND`` write, so any number of
@@ -33,7 +40,7 @@ import json
 import os
 import struct
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol
@@ -53,7 +60,7 @@ from .values import (
 
 __all__ = ["CacheMiss", "SerializationError", "CacheStore", "LocalStore"]
 
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 
 
 class CacheMiss(Exception):
@@ -126,7 +133,7 @@ class LocalStore:
         return self.objects / h[:2] / f"{h}{ext}"
 
     def _find(self, h: str) -> Path | None:
-        for ext in (".npy", ".bin"):
+        for ext in (".npy", ".npyw", ".bin"):
             p = self._obj(h, ext)
             if p.exists():
                 return p
@@ -141,7 +148,10 @@ class LocalStore:
         if isinstance(v, np.ndarray):
             buf = BytesIO()
             np.save(buf, np.asarray(v), allow_pickle=False)
-            _atomic_write(self._obj(h, ".npy"), buf.getvalue())
+            # Writeability is in the content hash, so the two extensions are
+            # distinct objects and never race for the same name.
+            ext = ".npyw" if v.flags.writeable else ".npy"
+            _atomic_write(self._obj(h, ext), buf.getvalue())
             return h
         _atomic_write(self._obj(h, ".bin"), self._encode(v))
         return h
@@ -151,15 +161,29 @@ class LocalStore:
         if t is tuple:
             hs = [bytes.fromhex(self.put_value(x)) for x in v]
             return _blob(b"T", b"".join(hs))
+        if t is list:
+            hs = [bytes.fromhex(self.put_value(x)) for x in v]
+            return _blob(b"L", b"".join(hs))
         if t is frozenset:
             hs = sorted(bytes.fromhex(self.put_value(x)) for x in v)
             return _blob(b"F", b"".join(hs))
+        if t is set:
+            hs = sorted(bytes.fromhex(self.put_value(x)) for x in v)
+            return _blob(b"S", b"".join(hs))
         if isinstance(v, ImmutableMap):
             pairs = sorted(
                 (bytes.fromhex(self.put_value(k)), bytes.fromhex(self.put_value(val)))
                 for k, val in v.items()
             )
             return _blob(b"M", b"".join(k + val for k, val in pairs))
+        if isinstance(v, Mapping):
+            # Insertion order is preserved, matching how a plain mapping is
+            # hashed: it is observable, so it is part of the value.
+            pairs = [
+                (bytes.fromhex(self.put_value(k)), bytes.fromhex(self.put_value(val)))
+                for k, val in v.items()
+            ]
+            return _blob(b"D", b"".join(k + val for k, val in pairs))
         reduced = custom_reduce(v)
         if reduced is not None:
             name, red = reduced
@@ -171,9 +195,10 @@ class LocalStore:
             raise SerializationError(
                 f"Cannot cache a value of type {t.__name__!r}. Cached return "
                 "values are limited to: None, bool, int, float, complex, str, "
-                "bytes, range, numpy scalars/arrays, tuples, frozensets, and "
-                "(Immutable)Maps of the same -- or a type registered with a "
-                "reduce_fn/rebuild_fn via valuekit.register_type()."
+                "bytes, range, numpy scalars/arrays, tuples, lists, sets, "
+                "frozensets, dicts and ImmutableMaps of the same -- or a type "
+                "registered with a reduce_fn/rebuild_fn via "
+                "valuekit.register_type()."
             ) from None
 
     def get_value(self, h: str) -> Any:
@@ -184,6 +209,8 @@ class LocalStore:
             if path.suffix == ".npy":
                 arr = np.load(path, mmap_mode="r", allow_pickle=False)
                 return arr  # memmap 'r' → writeable=False → freeze shares it
+            if path.suffix == ".npyw":
+                return np.load(path, allow_pickle=False)  # writeable, as stored
             return self._decode(path.read_bytes())
         except CacheMiss:
             raise
@@ -204,13 +231,17 @@ class LocalStore:
         hs = [body[i : i + n].hex() for i in range(0, len(body), n)]
         if tag == b"T":
             return tuple(self.get_value(x) for x in hs)
+        if tag == b"L":
+            return [self.get_value(x) for x in hs]
         if tag == b"F":
             return frozenset(self.get_value(x) for x in hs)
-        if tag == b"M":
+        if tag == b"S":
+            return {self.get_value(x) for x in hs}
+        if tag in (b"M", b"D"):
             d = {}
             for i in range(0, len(hs), 2):
                 d[self.get_value(hs[i])] = self.get_value(hs[i + 1])
-            return ImmutableMap(d)
+            return ImmutableMap(d) if tag == b"M" else d
         raise ValueError(f"unknown value tag {tag!r}")
 
     # -- traces ---------------------------------------------------------------

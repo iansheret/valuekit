@@ -130,8 +130,23 @@ class TestHashing:
             frozenset({3, 1, 2})
         )
 
-    def test_plain_dict_hashes_like_frozen(self):
-        assert content_hash({"a": 1}) == content_hash(ImmutableMap({"a": 1}))
+    def test_hash_identifies_a_value_exactly(self):
+        # A dict is not an ImmutableMap, and nothing converts one to the
+        # other, so they are different values.
+        assert content_hash({"a": 1}) != content_hash(ImmutableMap({"a": 1}))
+        assert content_hash([1, 2]) != content_hash((1, 2))
+        assert content_hash({1, 2}) != content_hash(frozenset({1, 2}))
+        # Dict order is observable; ImmutableMap order is not.
+        assert content_hash({"a": 1, "b": 2}) != content_hash({"b": 2, "a": 1})
+        assert content_hash(ImmutableMap({"a": 1, "b": 2})) == content_hash(
+            ImmutableMap({"b": 2, "a": 1})
+        )
+
+    def test_array_hash_covers_writeability(self):
+        a = np.arange(4.0)
+        b = a.copy()
+        b.flags.writeable = False
+        assert content_hash(a) != content_hash(b)
 
     def test_lambda_hash_covers_closure_and_defaults(self):
         k = 3
@@ -310,6 +325,22 @@ class TestStore:
             h = s.put_value(fv)
             back = s.get_value(h)
             assert content_hash(back) == content_hash(fv) == h
+
+    def test_roundtrip_preserves_mutable_types(self, tmp_path):
+        s = LocalStore(tmp_path)
+        vals = [
+            [1, "two", [3.0]],
+            {"b": 1, "a": [2]},  # order is part of the value
+            {1, 2, 3},
+            {"nested": [{"deep": (1, {2})}]},
+        ]
+        for v in vals:
+            back = s.get_value(s.put_value(v))
+            assert back == v
+            assert type(back) is type(v)
+            assert content_hash(back) == content_hash(v)
+        assert list(s.get_value(s.put_value({"b": 1, "a": 2}))) == ["b", "a"]
+        assert s.get_value(s.put_value(np.arange(4.0))).flags.writeable
 
     def test_arrays_reload_readonly(self, tmp_path):
         s = LocalStore(tmp_path)
@@ -544,7 +575,22 @@ class TestPure:
         assert filt(2.0, cfg3) == 10.0
         assert len(calls) == 2
 
-    def test_plain_dict_gets_granularity(self, cache):
+    def test_plain_dict_is_depended_on_whole(self, cache):
+        calls = []
+
+        @pure
+        def f(config):
+            calls.append(1)
+            assert type(config) is dict  # passed through untouched
+            return config["a"]
+
+        assert f({"a": 1, "b": 2}) == 1
+        assert f({"a": 1, "b": 2}) == 1
+        assert len(calls) == 1
+        assert f({"a": 1, "b": 999}) == 1  # unread key, but nothing observed
+        assert len(calls) == 2
+
+    def test_immutable_map_opts_into_granularity(self, cache):
         calls = []
 
         @pure
@@ -552,8 +598,8 @@ class TestPure:
             calls.append(1)
             return config["a"]
 
-        assert f({"a": 1, "b": 2}) == 1
-        assert f({"a": 1, "b": 999}) == 1
+        assert f(ImmutableMap({"a": 1, "b": 2})) == 1
+        assert f(ImmutableMap({"a": 1, "b": 999})) == 1  # "b" was never read
         assert len(calls) == 1
 
     def test_derivation_works_inside_a_recorded_call(self, cache):
@@ -726,7 +772,19 @@ class TestPure:
         r2 = make(5)
         assert len(calls) == 1
         assert np.array_equal(r1["arr"], r2["arr"])
-        assert not r2["arr"].flags.writeable
+        # The function built a writeable array, so the hit yields one too.
+        assert r1["arr"].flags.writeable
+        assert r2["arr"].flags.writeable
+
+    def test_readonly_arrays_in_results_stay_readonly(self, cache):
+        @pure
+        def make(n):
+            arr = np.arange(float(n))
+            arr.flags.writeable = False
+            return {"arr": arr}
+
+        assert not make(5)["arr"].flags.writeable
+        assert not make(5)["arr"].flags.writeable  # hit: memory-mapped
 
     def test_exceptions_not_cached(self, cache):
         calls = []
@@ -969,11 +1027,221 @@ class TestPure:
 
 
 # ===========================================================================
+# transparency: @pure caches, and does not convert
+# ===========================================================================
+
+
+class TestTransparency:
+    """@pure must be invisible apart from the skipped execution: same types
+    in, same types out, and the same behaviour whether or not a cache is
+    configured."""
+
+    def test_argument_objects_are_passed_through(self, cache):
+        seen = []
+
+        @pure
+        def f(d, items, tags, arr):
+            seen.append((d, items, tags, arr))
+            return len(d) + len(items) + len(tags) + len(arr)
+
+        d, items, tags = {"a": 1}, [1, 2], {"x"}
+        arr = np.arange(3.0)
+        assert f(d, items, tags, arr) == 7
+        got_d, got_items, got_tags, got_arr = seen[0]
+        assert got_d is d and got_items is items and got_tags is tags
+        assert got_arr is arr and got_arr.flags.writeable
+
+    def test_mutable_containers_round_trip_as_themselves(self, cache):
+        calls = []
+
+        @pure
+        def build(n):
+            calls.append(1)
+            return {"items": [n, n + 1], "tags": {"a"}, "pair": (n, n)}
+
+        miss = build(1)
+        hit = build(1)
+        assert len(calls) == 1
+        assert miss == hit
+        assert type(hit["items"]) is list
+        assert type(hit["tags"]) is set
+        assert type(hit["pair"]) is tuple
+        assert type(hit) is dict
+
+    def test_dict_result_keeps_its_order(self, cache):
+        @pure
+        def build(n):
+            return {"b": n, "a": n}
+
+        assert list(build(1)) == ["b", "a"]
+        assert list(build(1)) == ["b", "a"]  # hit
+
+    def test_uncached_and_cached_agree(self, tmp_path):
+        @pure
+        def f(d, items):
+            return type(d).__name__, type(items).__name__, d["a"] + sum(items)
+
+        vk.set_cache_dir(None)
+        uncached = f({"a": 1}, [2, 3])
+        vk.set_cache_dir(tmp_path / "cache")
+        try:
+            assert f({"a": 1}, [2, 3]) == uncached  # miss
+            assert f({"a": 1}, [2, 3]) == uncached  # hit
+        finally:
+            vk.set_cache_dir(None)
+
+    def test_recorded_map_is_an_immutable_map(self, cache):
+        @pure
+        def f(ctx):
+            return (
+                isinstance(ctx, ImmutableMap),
+                repr(ctx),
+                ctx == ImmutableMap({"a": 1}),
+            )
+
+        is_map, text, eq = f(ImmutableMap({"a": 1}))
+        assert is_map
+        assert text == "ImmutableMap({'a': 1})"  # the proxy does not show
+        assert eq
+
+    def test_returned_argument_map_is_plain(self, cache):
+        from valuekit.recording import RecordingMap
+
+        @pure
+        def identity(ctx):
+            return ctx
+
+        out = identity(ImmutableMap({"a": 1}))
+        assert not isinstance(out, RecordingMap)
+        assert out == ImmutableMap({"a": 1})
+        assert identity(ImmutableMap({"a": 1})) == out  # hit agrees
+
+    def test_proxy_nested_in_a_result_does_not_escape(self, cache):
+        from valuekit.recording import RecordingMap
+
+        @pure
+        def wrap(ctx):
+            return {"ctx": ctx, "pair": [ctx, 1]}
+
+        miss = wrap(ImmutableMap({"a": 1}))
+        hit = wrap(ImmutableMap({"a": 1}))
+        for out in (miss, hit):
+            assert type(out["ctx"]) is ImmutableMap
+            assert type(out["pair"][0]) is ImmutableMap
+            assert not isinstance(out["ctx"], RecordingMap)
+        assert miss == hit
+
+    def test_returning_a_map_depends_on_all_of_it(self, cache):
+        calls = []
+
+        @pure
+        def wrap(ctx):
+            calls.append(1)
+            return {"ctx": ctx}
+
+        assert wrap(ImmutableMap({"a": 1}))["ctx"] == ImmutableMap({"a": 1})
+        assert len(calls) == 1
+        # No key was read, but the whole map was returned, so any change to
+        # it must invalidate.
+        assert wrap(ImmutableMap({"a": 1, "b": 2}))["ctx"] == ImmutableMap(
+            {"a": 1, "b": 2}
+        )
+        assert len(calls) == 2
+
+    def test_trace_records_arguments_as_passed(self, cache):
+        # Mutating an argument breaks the purity contract, but the trace is
+        # still keyed on what was handed in, so the call is reusable.
+        calls = []
+
+        @pure
+        def bad(items):
+            calls.append(1)
+            items.append(99)
+            return sum(items)
+
+        assert bad([1, 2]) == 102
+        xs = [1, 2]
+        assert bad(xs) == 102
+        assert len(calls) == 1
+        assert xs == [1, 2]  # the hit did not run the body
+
+    def test_hash_only_registration_allows_arguments(self, cache):
+        class Tag:
+            def __init__(self, name):
+                self.name = name
+
+        vk.register_type(Tag, hash_fn=lambda v, h: h.update(v.name.encode()))
+        calls = []
+
+        @pure
+        def f(tag):
+            calls.append(1)
+            return tag.name.upper()
+
+        assert f(Tag("a")) == "A"
+        assert f(Tag("a")) == "A"
+        assert len(calls) == 1
+        assert f(Tag("b")) == "B"
+        assert len(calls) == 2
+        # No freeze strategy, so it still may not enter a map.
+        with pytest.raises(TypeError):
+            ImmutableMap({"tag": Tag("a")})
+
+
+# ===========================================================================
 # nested @pure
 # ===========================================================================
 
 
 class TestNestedPure:
+    def test_map_passed_inward_records_in_both_traces(self, cache):
+        calls = []
+
+        @pure
+        def inner(ctx):
+            calls.append("i")
+            return ctx["b"]
+
+        @pure
+        def outer(ctx):
+            calls.append("o")
+            return ctx["a"] + inner(ctx)
+
+        base = {"a": 1, "b": 10, "unread": 0}
+        assert outer(ImmutableMap(base)) == 11
+        assert calls == ["o", "i"]
+
+        # A key neither function read: both stay valid.
+        assert outer(ImmutableMap(base | {"unread": 99})) == 11
+        assert calls == ["o", "i"]
+
+        # A key only the *inner* function read: the outer must not shortcut
+        # past it, even though the outer never read "b" itself.
+        assert outer(ImmutableMap(base | {"b": 20})) == 21
+        assert calls == ["o", "i", "o", "i"]
+
+    def test_nested_map_reads_stay_fine_grained(self, cache):
+        calls = []
+
+        @pure
+        def inner(ctx):
+            calls.append("i")
+            return ctx["cfg"]["order"]
+
+        @pure
+        def outer(ctx):
+            calls.append("o")
+            return inner(ctx) * 2
+
+        base = {"cfg": {"order": 4, "dpi": 100}}
+        assert outer(ImmutableMap(base)) == 8
+        assert calls == ["o", "i"]
+        # A sibling key inside the sub-map, read by neither: still valid.
+        assert outer(ImmutableMap({"cfg": {"order": 4, "dpi": 300}})) == 8
+        assert calls == ["o", "i"]
+        assert outer(ImmutableMap({"cfg": {"order": 5, "dpi": 100}})) == 10
+        assert calls == ["o", "i", "o", "i"]
+
     def test_inner_edit_invalidates_outer(self, cache):
         def build(inner_body):
             ns = {"pure": pure, "calls": []}

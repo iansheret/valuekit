@@ -1,14 +1,23 @@
 """The unified type registry: freeze, content-hash, and inline key codec.
 
-Every type that participates in valuekit must be *frozen* (made immutable on
-entry) and *content-hashable* (a stable digest of its value, identical across
-processes and sessions).  The two capabilities are registered together:
-``register_type`` rejects partial registration, since a type that could be
-frozen but not hashed would enter maps and then fail later, inside a cache
-lookup, far from the registration that caused it.
+Content hashing is the primitive.  A content hash *identifies a value
+exactly*: two values hash the same only if no Python program could tell
+them apart.  So a list and a tuple of the same items hash differently, two
+dicts hash differently if their iteration order differs, and a writeable
+array differs from a read-only one.  This is what lets a content-addressed
+store hand back, on a hit, exactly what the miss produced.
 
-The Mapping handlers are registered in :mod:`valuekit.map` (they need the
-ImmutableMap class); the function handlers are registered in
+Freezing is separate, and narrower: it is what :class:`ImmutableMap` applies
+to values on entry.  ``@pure`` does not freeze anything, so a type needs a
+freeze strategy only if it is to be stored *in a map*.
+
+Hence the three tiers of :func:`register_type`: a hash strategy alone makes
+a type usable as a ``@pure`` argument; adding a freeze strategy lets it go
+into an ImmutableMap; adding a reduce/rebuild pair lets it come back out of
+a cached return value.
+
+The ImmutableMap handlers are registered in :mod:`valuekit.map` (they need
+the class itself); the function handlers are registered in
 :mod:`valuekit.codehash` (they need the code hasher).
 """
 
@@ -16,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
+from collections.abc import Mapping
 from functools import singledispatch
 from typing import Any, Callable
 
@@ -44,7 +54,7 @@ __all__ = [
 
 @singledispatch
 def freeze(v: Any) -> Any:
-    """Return an immutable form of *v*.
+    """Return an immutable form of *v*, for storing it in an ImmutableMap.
 
     * Already-immutable values (int, float, complex, bool, str, bytes, None,
       frozenset, range, numpy scalars) are returned unchanged.
@@ -53,6 +63,9 @@ def freeze(v: Any) -> Any:
       ImmutableMaps, and tuples have their contents frozen.
     * Anything else raises TypeError; register new types with
       :func:`register_type`.
+
+    Note that this is applied by ImmutableMap on entry, and nowhere else:
+    ``@pure`` hashes its arguments and returns without converting them.
     """
     raise TypeError(
         f"Cannot store a {type(v).__name__!r}: not known to be immutable. "
@@ -194,7 +207,11 @@ def _h_np_scalar(v: np.generic, h: Any) -> None:
 
 @hash_update.register
 def _h_ndarray(v: np.ndarray, h: Any) -> None:
-    meta = f"{v.dtype.str}|{v.shape}".encode("ascii")
+    # Writeability is part of the identity: a caller can tell a read-only
+    # array from a writeable one, so a cached return must come back as
+    # whichever it was, and the store keys the two separately.
+    flag = "w" if v.flags.writeable else "r"
+    meta = f"{v.dtype.str}|{v.shape}|{flag}".encode("ascii")
     # .tobytes() always serialises in C order, independent of memory layout,
     # so two arrays equal under np.array_equal hash identically.
     _frame(h, b"a", meta)
@@ -212,13 +229,42 @@ def _h_tuple(v: tuple, h: Any) -> None:
 
 
 @hash_update.register
+def _h_list(v: list, h: Any) -> None:
+    # Tagged apart from tuple: the two are distinguishable values, so
+    # f([1, 2]) and f((1, 2)) are distinct calls.
+    _frame(h, b"l", len(v).to_bytes(8, "little"))
+    for x in v:
+        hash_update(x, h)
+
+
+@hash_update.register
 def _h_frozenset(v: frozenset, h: Any) -> None:
     ds = sorted(digest(x) for x in v)
     _frame(h, b"F", len(v).to_bytes(8, "little") + b"".join(ds))
 
 
+@hash_update.register
+def _h_set(v: set, h: Any) -> None:
+    ds = sorted(digest(x) for x in v)
+    _frame(h, b"S", len(v).to_bytes(8, "little") + b"".join(ds))
+
+
+@hash_update.register(Mapping)
+def _h_mapping(v: Mapping, h: Any) -> None:
+    """Hash a plain mapping in iteration order.
+
+    A dict's order is observable, so two dicts differing only in it are
+    different values.  ImmutableMap is order-independent by definition and
+    registers its own handler in :mod:`valuekit.map`.
+    """
+    _frame(h, b"d", len(v).to_bytes(8, "little"))
+    for k, val in v.items():
+        hash_update(k, h)
+        hash_update(val, h)
+
+
 # ---------------------------------------------------------------------------
-# registration API — freeze and hash travel together
+# registration API — hash always, freeze and codec as needed
 # ---------------------------------------------------------------------------
 
 
@@ -229,40 +275,40 @@ _rebuild_by_name: dict[str, Callable[[Any], Any]] = {}
 def register_type(
     cls: type,
     *,
-    freeze_fn: Callable[[Any], Any],
     hash_fn: Callable[[Any, Any], None],
+    freeze_fn: Callable[[Any], Any] | None = None,
     reduce_fn: Callable[[Any], Any] | None = None,
     rebuild_fn: Callable[[Any], Any] | None = None,
     name: str | None = None,
 ) -> None:
-    """Register a new value type with a freeze and a hash strategy, and
-    optionally a store codec.
+    """Register a new value type, in as many of three tiers as it needs.
 
-    ``freeze_fn(v)`` must return an immutable form of *v*.
-    ``hash_fn(v, hasher)`` must feed a stable, content-based encoding of the
-    *frozen* form into *hasher* (use hashlib-style ``hasher.update``).
+    ``hash_fn(v, hasher)`` is always required: it must feed a stable,
+    content-based encoding of *v* into *hasher* (hashlib-style
+    ``hasher.update``), identifying the value exactly, and identically
+    across processes and machines. With it alone, values of the type can be
+    ``@pure`` arguments.
 
-    Both are required: a type that could be frozen but not hashed would
-    enter maps and then fail at the first cache lookup that reads it, so
-    partial registration is rejected.
+    ``freeze_fn(v)`` returns an immutable form of *v*, and is what lets the
+    type be stored *in an ImmutableMap*. Omit it for a type that is only
+    ever passed as an argument; a map will then reject it.
 
-    With only those two, values of the type can be @pure inputs (hashed for
-    the cache key) and map values, but not cached return values. To also let
-    them appear in a cached return, pass a ``reduce_fn`` / ``rebuild_fn``
-    pair: ``reduce_fn(v)`` returns a storable form (built from the fixed
-    storable set) and ``rebuild_fn(reduced)`` reconstructs the value, so the
-    store round-trips it. ``name`` identifies the type in stored entries
+    ``reduce_fn`` / ``rebuild_fn`` let the type appear in a cached *return*
+    value: ``reduce_fn(v)`` returns a storable form (built from the fixed
+    storable set) and ``rebuild_fn(reduced)`` reconstructs the value. Pass
+    both or neither. ``name`` identifies the type in stored entries
     (default ``"module:qualname"``); keep it stable, since entries reference
     it and a change reads as a miss.
     """
-    if freeze_fn is None or hash_fn is None:
-        raise TypeError("register_type requires BOTH freeze_fn and hash_fn")
+    if hash_fn is None:
+        raise TypeError("register_type requires a hash_fn")
     if (reduce_fn is None) != (rebuild_fn is None):
         raise TypeError(
             "register_type requires BOTH reduce_fn and rebuild_fn, or neither"
         )
-    freeze.register(cls, freeze_fn)
     hash_update.register(cls, hash_fn)
+    if freeze_fn is not None:
+        freeze.register(cls, freeze_fn)
     if reduce_fn is not None:
         codec_name = name or f"{cls.__module__}:{cls.__qualname__}"
         _reduce_by_type[cls] = (codec_name, reduce_fn)

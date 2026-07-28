@@ -4,18 +4,25 @@
 it reads from its inputs, and it has no observable effects.  Pure functions
 can be memoised, so valuekit memoises them.
 
-On a miss, every ImmutableMap argument (plain dicts are frozen into
-ImmutableMaps at the boundary) is wrapped in a recording proxy; the function
-runs; the observed reads, plus content hashes of all non-map arguments,
-become a *trace*, stored alongside the content hash of the frozen return
-value.
+Arguments are hashed, not converted: a dict stays a dict, a list stays a
+list, an array keeps its writeability.  A cache hit returns a value equal to
+what the call would have produced, of the same type — including on the miss
+that recorded it, where the function's own object is handed straight back.
+
+Fine-grained invalidation is opt-in, and the opt-in is passing an
+:class:`~valuekit.ImmutableMap`.  Such an argument is wrapped on a miss in a
+recording proxy (itself an ImmutableMap, so the function cannot tell); the
+function runs; the observed reads, plus whole-value content hashes of every
+other argument, become a *trace*, stored alongside the content hash of the
+return value.
 
 On a lookup, the stored traces for the function's fingerprint are scanned.
 If every recorded fact still holds against the current arguments (same
 values at the read paths, same absences, same whole-map hashes where the
 function observed everything), the stored result is returned without
 executing.  Keys the function never read are irrelevant, so unrelated
-additions to a data or config map do not invalidate.
+additions to a data or config map do not invalidate — whereas a plain dict
+argument is depended on whole, since nothing observed how it was used.
 
 Note that the function body does not run on a hit: logging, plotting, and
 any other side effect inside a @pure function is skipped.
@@ -37,9 +44,9 @@ from typing import Any, Callable
 from .codehash import _module_unit, _unit_digest, function_fingerprint
 from .debughook import breakpoints_force
 from .map import ImmutableMap, map_digest
-from .recording import Recorder, RecordingMap
+from .recording import Recorder, RecordingMap, unwrap_proxies
 from .store import CacheMiss, CacheStore, LocalStore
-from .values import content_hash, decode_key, digest, freeze
+from .values import content_hash, decode_key, digest
 
 __all__ = ["pure", "set_cache_dir", "clear_cache"]
 
@@ -119,7 +126,7 @@ def clear_cache(fn: Callable | None = None) -> None:
 # Every stored entry is salted with this, so bumping it invalidates every
 # cache everywhere.  Bump it when a release changes what a fingerprint or a
 # trace means; releases that do not are then free to leave caches intact.
-CACHE_EPOCH = 1
+CACHE_EPOCH = 2
 
 
 def _salt() -> str:
@@ -172,16 +179,18 @@ def _match_map(entries: list[dict], m: ImmutableMap) -> bool:
     return True
 
 
-def _match_trace(trace: dict, frozen_args: dict[str, Any]) -> bool:
+def _match_trace(
+    trace: dict, arguments: dict[str, Any], arg_hashes: dict[str, str]
+) -> bool:
     deps = trace.get("deps", {})
-    if set(deps) != set(frozen_args):
+    if set(deps) != set(arguments):
         return False
     for name, dep in deps.items():
-        arg = frozen_args[name]
+        arg = arguments[name]
         if dep["kind"] == "value":
             if isinstance(arg, ImmutableMap):
                 return False
-            if content_hash(arg) != dep["hash"]:
+            if arg_hashes[name] != dep["hash"]:
                 return False
         elif dep["kind"] == "map":
             if not isinstance(arg, ImmutableMap):
@@ -208,9 +217,17 @@ def pure(fn: Callable):
       2. No observable effects that matter: on a cache hit the body does
          not run, so prints, plots, and file writes inside it will not
          happen.
-      3. The result is reachable from the arguments plus the function's own
+      3. No mutation of the arguments. They are passed through as they
+         were given, so a function that writes to one is not pure and the
+         trace recorded against it will be wrong.
+      4. The result is reachable from the arguments plus the function's own
          definition (hashed: everything reachable by name through user
          code).
+
+    Arguments and results must be content-hashable, and results must also
+    be storable; both sets are extended with ``register_type``. Pass an
+    ImmutableMap to get key-level invalidation for that argument; any other
+    argument is depended on whole.
 
     Takes no options. If a dependency is not reachable by name, pass it as
     an argument; if something invisible changed anyway, call
@@ -267,49 +284,64 @@ def pure(fn: Callable):
 
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
-        frozen = {name: freeze(v) for name, v in bound.arguments.items()}
+        arguments = dict(bound.arguments)  # the caller's own objects
+
+        # Hash the non-map arguments once, before the call: the same hashes
+        # match every candidate trace and then go into the trace written for
+        # a miss, so what is recorded is the arguments as they were passed.
+        arg_hashes = {
+            name: content_hash(v)
+            for name, v in arguments.items()
+            if not isinstance(v, ImmutableMap)
+        }
 
         # -- lookup ---------------------------------------------------------
         for trace in store.get_traces(fn_key):
-            if _match_trace(trace, frozen):
+            if _match_trace(trace, arguments, arg_hashes):
                 try:
                     return store.get_value(trace["result"])
                 except CacheMiss:
                     continue  # value evicted/corrupt: try others, else rerun
 
-        # -- miss: execute under observation ---------------------------------
+        # Wrap ImmutableMap arguments so their reads are observed; everything
+        # else is passed through untouched and depended on whole.
         recorders: dict[str, Recorder] = {}
-        for name, v in frozen.items():
+        for name, v in arguments.items():
             if isinstance(v, ImmutableMap):
                 rec = Recorder()
                 recorders[name] = rec
                 bound.arguments[name] = RecordingMap(v, rec)
-            else:
-                bound.arguments[name] = v  # frozen (e.g. read-only array)
 
         epoch_before = _force_epoch
         result = fn(*bound.args, **bound.kwargs)  # exceptions: cache untouched
-        frozen_result = freeze(result)
+
+        # A proxy must not outlive the call it belongs to, wherever in the
+        # result it sits.
+        if recorders:
+            result = unwrap_proxies(result)
 
         if _force_epoch != epoch_before:
             # Something in this call's dynamic extent was debugger-forced
             # (a breakpoint appeared after our own entry check): this result
             # may reflect a debug session, so it must not be persisted.
-            return frozen_result
+            return result
 
-        result_hash = store.put_value(frozen_result)
+        # Store before finalising the recorders, so that a proxy reached only
+        # by the encoder (inside a custom reduced form, say) still records the
+        # whole-map dependency that returning it implies.
+        result_hash = store.put_value(result)
         deps: dict[str, dict] = {}
-        for name, v in frozen.items():
+        for name in arguments:
             if name in recorders:
                 deps[name] = {"kind": "map", "entries": recorders[name].finalize()}
             else:
-                deps[name] = {"kind": "value", "hash": content_hash(v)}
+                deps[name] = {"kind": "value", "hash": arg_hashes[name]}
         store.put_trace(
             fn_key,
             {"fn": qn, "deps": deps, "result": result_hash},
             units=units,
         )
-        return frozen_result
+        return result
 
     wrapper.uncached = fn  # override: call the raw function directly
     wrapper.__wrapped__ = fn

@@ -37,9 +37,15 @@ def calculate_geometry(obs, config):
 obs = obs | calculate_geometry(obs, config)
 ```
 
-`obs` and `config` are maps here; reads of map arguments are what the
-cache traces per key. Plain dicts work identically, frozen at the
-boundary, and `ImmutableMap` itself has its own section below.
+`obs` and `config` are `ImmutableMap`s here, and that is what buys the
+per-key tracing: reads of a map argument are recorded individually, so a
+change to a key the function never read does not invalidate it. Any other
+argument — including a plain `dict` — is hashed whole. `ImmutableMap` has
+its own section below.
+
+Nothing else about the call changes. Arguments arrive as the objects you
+passed, and the result is the object the function built, so a cache hit
+differs from a miss only in that the body did not run.
 
 `@pure` states a *contract*: the function's output depends only on what it
 reads from its arguments, and it has no effects that matter. valuekit does
@@ -106,11 +112,16 @@ decision.
 
 ## The immutable map
 
-`@pure` does not require the map: plain dict arguments get the same
-per-key treatment, and arrays and scalars are hashed whole. There are two
-places where the map is worth using anyway.
+`@pure` does not require the map — any hashable argument works — but the
+map is how a function opts an argument into per-key invalidation. There
+are three places it is worth using.
 
-The first is config. Tunables belong in a config passed as an argument,
+The first is granularity, and it is the reason the other two matter under
+`@pure`. A plain `dict` argument is a single opaque value: nothing observed
+which keys the function used, so any edit anywhere in it invalidates the
+result. The same dict as an `ImmutableMap` is traced key by key.
+
+The second is config. Tunables belong in a config passed as an argument,
 where every read is traced; the same tunables in a module-level dict are a
 mutable global, the first row of the stale-results table above. An
 `ImmutableMap` config removes that hazard, since nothing can edit it in
@@ -119,7 +130,7 @@ place, and it makes derivation the way to vary settings: an override is
 and each variant is a distinct value that recomputes only the steps that
 read the changed key.
 
-The second is the data flowing between steps. Frozen state means no step
+The third is the data flowing between steps. Frozen state means no step
 can mutate another's input, by design or by accident, and each step
 returns a derived map instead of editing a shared one:
 
@@ -142,6 +153,9 @@ stored, so nothing mutable gets in by accident. Deriving with `|` shares
 unchanged values by reference, so adding one key to a 2 GB context copies
 one dict, not 2 GB of data.
 
+Freezing is the map's behaviour, and only the map's: `@pure` never converts
+an argument or a result. Putting a value into a map is where you ask for it.
+
 Using the map activates nothing else: no cache, no decorator, no
 configuration.
 
@@ -162,12 +176,12 @@ configuration.
 - Conditional reads produce separate traces. A function that reads different
   keys on different branches accumulates one trace per observed read-set,
   each matched independently.
-- Plain dicts work. Arguments are frozen at the boundary, so a raw `dict`
-  gets the same per-key treatment as an `ImmutableMap`.
-- Non-map arguments (arrays, scalars, tuples, lambdas) key the cache by
-  content hash, whole.
-- A recorded map passed into a nested `@pure` call records a whole-map
-  dependency at that boundary.
+- Every other argument (plain dicts, lists, arrays, scalars, tuples,
+  lambdas) keys the cache by content hash, whole. Nothing observed how the
+  function used it, so any change to it invalidates.
+- A map passed from one `@pure` call into a nested one is traced in both:
+  the inner call gets its own per-key trace, and the outer stays valid only
+  for maps that would drive the inner the same way.
 
 ## Debugging
 
@@ -203,14 +217,21 @@ clear_cache()             # or delete the cache directory; always safe
 
 ## The store
 
-The cache directory holds content-addressed files: arrays as `.npy`,
-reloaded as read-only memory maps that `freeze` shares without copying (a
-hit on a function returning a 2 GB array copies nothing), and everything
-else in a small structural format in which composite values reference their
-children by hash, so an array shared by many results is stored once. There
-is no pickle anywhere. Cacheable return values are a fixed set: `None`,
-`bool`, `int`, `float`, `complex`, `str`, `bytes`, `range`, numpy scalars
-and arrays, tuples, frozensets, and (Immutable)Maps of the same.
+The cache directory holds content-addressed files: read-only arrays as
+`.npy`, reloaded as memory maps that `freeze` shares without copying (a hit
+on a function returning a 2 GB read-only array copies nothing), writeable
+arrays as `.npyw`, and everything else in a small structural format in which
+composite values reference their children by hash, so an array shared by
+many results is stored once. There is no pickle anywhere. Cacheable return
+values are a fixed set: `None`, `bool`, `int`, `float`, `complex`, `str`,
+`bytes`, `range`, numpy scalars and arrays, tuples, lists, sets, frozensets,
+dicts and `ImmutableMap`s of the same.
+
+A stored value reloads as an equal value of the same type, which is what
+lets a hit stand in for the call. That is also why the content hash
+distinguishes a list from a tuple, two dicts that differ only in order, and
+a writeable array from a read-only one: a hash has to identify a value
+exactly for a content-addressed store to be able to hand it back.
 
 Writes are atomic; directories can be shared between processes; a missing
 or corrupt entry is treated as a miss. Deleting the cache is always safe. A

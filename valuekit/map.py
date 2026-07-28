@@ -192,10 +192,7 @@ def map_digest(m: ImmutableMap) -> bytes:
 
 @hash_update.register
 def _h_immutable_map(v: ImmutableMap, h: Any) -> None:
+    # Order-independent, unlike the plain-Mapping handler in valuekit.values:
+    # an ImmutableMap is defined as an unordered value, so two with equal
+    # contents are the same value however they were built.
     _frame(h, b"M", map_digest(v))
-
-
-@hash_update.register(Mapping)
-def _h_mapping(v: Mapping, h: Any) -> None:
-    # A raw dict (or RecordingMap) hashes as its frozen equivalent.
-    hash_update(_freeze_mapping(v), h)
