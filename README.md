@@ -1,38 +1,30 @@
 # valuekit
 
-An immutable map for pipeline data, plus disk memoisation for pure
-functions. Both rest on the same idea: pipeline data as immutable *values*,
-identified by content. The two parts are independent; use either without the
-other.
+Disk memoisation for pure functions, plus an immutable map for the
+pipeline data they run over. Both apply the same idea: pipeline data as
+immutable *values*, identified by content. The two parts are independent;
+use either without the other.
 
-## The immutable map
+The usual ways of caching a pipeline fail in one of two directions. If the
+key is too coarse (a file path, a manual version tag), results go stale silently and hits stop
+being trusted; if it is too broad (whole-argument hashes), one config edit
+recomputes everything and hits stop happening. Either way the cache ends
+up cleared before every run that matters, at which point it saves nothing.
 
-```python
-from valuekit import ImmutableMap
-
-ctx = ImmutableMap({"raw": signal, "fs": 1000.0})
-
-ctx2 = ctx | {"scaled": ctx["raw"] * gain}   # derive; ctx is unchanged
-ctx3 = ctx2.assoc("window", "hann")          # single-key derivation
-ctx4 = ctx3.dissoc("tmp")                    # drop keys
-```
-
-Values are frozen on entry: numpy arrays become read-only (copied only if
-writeable; set `arr.flags.writeable = False` beforehand to share without a
-copy), sets become frozensets, nested dicts become ImmutableMaps, and
-unknown mutable types are rejected with a `TypeError`. The rejection is
-deliberate: a type must be registered (`register_type`) before it can be
-stored, so nothing mutable gets in by accident. Deriving with `|` shares
-unchanged values by reference, so adding one key to a 2 GB context copies
-one dict, not 2 GB of data.
-
-Using the map activates nothing else: no cache, no decorator, no
-configuration.
+valuekit is built so the cache can stay on. Invalidation follows what each
+call actually read (change one config key and only the steps that read it
+recompute) and what the code actually is (edit a helper and everything
+that depends on it recomputes). What the tracking cannot see is a short
+documented list, each entry with a remedy, and an uncertain match
+recomputes rather than risk a stale result. Caching stays on under a
+debugger too: the cached prefix replays in milliseconds, the step under
+the breakpoint executes and stops there, and nothing done while paused
+enters the cache.
 
 ## `@pure`
 
 ```python
-from valuekit import ImmutableMap, pure, set_cache_dir
+from valuekit import pure, set_cache_dir
 
 set_cache_dir("~/.cache/mypipeline")     # nothing is cached until this is called
 
@@ -44,6 +36,10 @@ def calculate_geometry(obs, config):
 
 obs = obs | calculate_geometry(obs, config)
 ```
+
+`obs` and `config` are maps here; reads of map arguments are what the
+cache traces per key. Plain dicts work identically, frozen at the
+boundary, and `ImmutableMap` itself has its own section below.
 
 `@pure` states a *contract*: the function's output depends only on what it
 reads from its arguments, and it has no effects that matter. valuekit does
@@ -108,14 +104,55 @@ progress bars, metrics) are permitted by the contract precisely because
 they will not happen on a hit; whether that is acceptable is the user's
 decision.
 
-### Granularity
+## The immutable map
+
+`@pure` does not require the map: plain dict arguments get the same
+per-key treatment, and arrays and scalars are hashed whole. There are two
+places where the map is worth using anyway.
+
+The first is config. Tunables belong in a config passed as an argument,
+where every read is traced; the same tunables in a module-level dict are a
+mutable global, the first row of the stale-results table above. An
+`ImmutableMap` config removes that hazard, since nothing can edit it in
+place, and it makes derivation the way to vary settings: an override is
+`cfg | {"gain": 2.0}`, a sweep is `[cfg.assoc("order", n) for n in orders]`,
+and each variant is a distinct value that recomputes only the steps that
+read the changed key.
+
+The second is the data flowing between steps. Frozen state means no step
+can mutate another's input, by design or by accident, and each step
+returns a derived map instead of editing a shared one:
+
+```python
+from valuekit import ImmutableMap
+
+ctx = ImmutableMap({"raw": signal, "fs": 1000.0})
+
+ctx2 = ctx | {"scaled": ctx["raw"] * gain}   # derive; ctx is unchanged
+ctx3 = ctx2.assoc("window", "hann")          # single-key derivation
+ctx4 = ctx3.dissoc("tmp")                    # drop keys
+```
+
+Values are frozen on entry: numpy arrays become read-only (copied only if
+writeable; set `arr.flags.writeable = False` beforehand to share without a
+copy), sets become frozensets, nested dicts become ImmutableMaps, and
+unknown mutable types are rejected with a `TypeError`. The rejection is
+deliberate: a type must be registered (`register_type`) before it can be
+stored, so nothing mutable gets in by accident. Deriving with `|` shares
+unchanged values by reference, so adding one key to a 2 GB context copies
+one dict, not 2 GB of data.
+
+Using the map activates nothing else: no cache, no decorator, no
+configuration.
+
+## Read granularity
 
 - `config["filter"]["order"]` records a dependency on that one leaf. Taking
   `f = config["filter"]` and then iterating, printing, or comparing `f`
   observes the whole subtree and records a whole-map dependency. Anything
   that looks at all keys (`len`, iteration, `==`, `keys()`) is a whole-map
   read: correct, but coarser.
-- Deriving inside a `@pure` function works exactly as it does outside — `|`,
+- Deriving inside a `@pure` function works exactly as it does outside: `|`,
   `assoc` and `dissoc` are all available on the map you were passed, and
   return a plain `ImmutableMap`. Each copies every key, so each is a
   whole-map read; derive from the narrowest map you can.
@@ -132,7 +169,7 @@ decision.
 - A recorded map passed into a nested `@pure` call records a whole-map
   dependency at that boundary.
 
-### Debugging
+## Debugging
 
 Caching stays on while a debugger is attached. A hit is bypassed, and the
 function runs, only when a live breakpoint intersects the function or
@@ -164,7 +201,7 @@ clear_cache(step)         # "step changed": deletes step's results and its calle
 clear_cache()             # or delete the cache directory; always safe
 ```
 
-### The store
+## The store
 
 The cache directory holds content-addressed files: arrays as `.npy`,
 reloaded as read-only memory maps that `freeze` shares without copying (a
@@ -181,21 +218,20 @@ call that raises caches nothing. There is no eviction in this version: the
 cache is a directory, so check its size with `du -sh` and delete it when it
 grows too large.
 
-### Parallelism
+## Parallelism
 
 ``run_all(fn, inputs)`` runs a module-level function over a batch of
 inputs in parallel and returns a ``BatchResult`` of per-input outcomes, in
 input order. Each input runs in its own process, spawned per task with at
 most ``max_workers`` at once. Isolation is the point: a timeout kills
 exactly one process, a segfault loses exactly one input, and neither
-affects the inputs running beside it or the capacity available to the
-rest of the batch. The cost is one process start per input (roughly 0.4 s
-including a numpy import), which overlaps across workers and is noise for
-inputs that take seconds or more; for very small inputs, batch them
-inside ``fn``. Workers configure themselves from the parent's cache
-directory and share the cache: value writes are idempotent and trace
-writes are atomic appends, so concurrent writers cannot drop each other's
-results.
+affects the other inputs or the capacity available to the rest of the
+batch. The cost is one process start per input (roughly 0.4 s including a
+numpy import). Starts overlap across workers, and for inputs that take
+seconds or more the cost does not matter; for very small inputs, batch
+them inside ``fn``. Each worker takes the parent's cache directory and
+shares the cache: value writes are idempotent and trace writes are atomic
+appends, so concurrent writers cannot drop each other's results.
 
 Every input is processed, and every failure is recorded against the input
 that caused it. An exception raised by ``fn`` carries the string-form
@@ -216,10 +252,10 @@ result[i].input               # the input that produced outcome i
 result[i].result()            # the value, or re-raises the exception
 ```
 
-``.values`` is the accessor to reach for by default: it is the plain list
-of results when everything succeeded, and it raises when something
-failed, so failures cannot be dropped by accident. ``.failures`` is for
-callers that handle failures explicitly and continue.
+Use ``.values`` by default: it is the plain list of results when
+everything succeeded, and it raises when something failed, so failures
+cannot be dropped by accident. ``.failures`` is for callers that handle
+failures explicitly and continue.
 
 Nothing is replayed automatically. To debug a failure, call the function
 on that one input yourself:
@@ -229,9 +265,9 @@ process_scenario(sid)         # the cached prefix replays in milliseconds;
                               # the failing step executes and raises here
 ```
 
-with a live stack and a working REPL. Picking the input is the point:
-which scenario fails first in a parallel batch is a race, so an automatic
-replay would drop you into whichever one happened to lose it.
+with a live stack and a working REPL. Choosing the input yourself is
+deliberate: which input fails first in a parallel batch differs from run
+to run, so an automatic replay would pick one arbitrarily.
 
 One debugger accommodation remains, because breakpoints do not reach
 worker processes. If a live breakpoint intersects anything reachable by
