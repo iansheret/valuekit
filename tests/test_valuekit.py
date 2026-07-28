@@ -556,6 +556,59 @@ class TestPure:
         assert f({"a": 1, "b": 999}) == 1
         assert len(calls) == 1
 
+    def test_derivation_works_inside_a_recorded_call(self, cache):
+        # The recording proxy carries all of ImmutableMap's interface, so a
+        # @pure function cannot tell it received one.
+        @pure
+        def f(ctx):
+            merged = ctx | {"scaled": 2}  # __or__
+            under = {"base": 0} | ctx  # __ror__
+            with_k = ctx.assoc("k", 1)
+            without = ctx.dissoc("raw")
+            return {
+                "kinds": tuple(
+                    type(m) is ImmutableMap for m in (merged, under, with_k, without)
+                ),
+                "merged": (merged["scaled"], merged["raw"]),
+                "under": (under["base"], under["raw"]),
+                "with_k": with_k["k"],
+                "dropped": "raw" not in without,
+            }
+
+        out = f(ImmutableMap({"raw": 1}))
+        assert out["kinds"] == (True,) * 4  # plain maps, not proxies
+        assert out["merged"] == (2, 1)
+        assert out["under"] == (0, 1)  # self wins on conflict
+        assert out["with_k"] == 1
+        assert out["dropped"] is True
+
+    def test_derivation_records_the_whole_map(self, cache):
+        # Deriving copies every key, so it is a whole-map read: an unrelated
+        # key must invalidate, unlike a single-leaf read.
+        calls = []
+
+        @pure
+        def f(ctx):
+            calls.append(1)
+            return (ctx | {"b": 2})["a"]
+
+        assert f(ImmutableMap({"a": 1})) == 1
+        assert f(ImmutableMap({"a": 1})) == 1
+        assert len(calls) == 1
+        assert f(ImmutableMap({"a": 1, "unread": 99})) == 1
+        assert len(calls) == 2
+
+    def test_recorded_map_pickles_as_a_plain_map(self, cache):
+        import pickle
+
+        @pure
+        def f(ctx):
+            back = pickle.loads(pickle.dumps(ctx))
+            return {"kind": type(back) is ImmutableMap, "n": len(back)}
+
+        out = f(ImmutableMap({"a": 1, "b": 2}))
+        assert out["kind"] is True and out["n"] == 2
+
     def test_absence_is_a_dependency(self, cache):
         calls = []
 

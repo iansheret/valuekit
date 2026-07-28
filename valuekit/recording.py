@@ -9,8 +9,13 @@ map and records what the function read:
 * ``k in m``                          → presence/absence dependency;
 * ``m[k]`` yielding a sub-map        → a child proxy with an extended path
   (reads inside it are recorded path-qualified);
-* iteration, ``len``, ``keys/items/values``, ``==``, ``repr``, and anything
-  else that observes the whole map → whole-map dependency (conservative).
+* iteration, ``len``, ``keys/items/values``, ``==``, ``repr``, deriving with
+  ``|`` / ``assoc`` / ``dissoc``, and anything else that observes the whole
+  map → whole-map dependency (conservative).
+
+The proxy carries the whole of ImmutableMap's interface, so a @pure function
+cannot tell that it received one: deriving a new map with ``|`` works inside a
+recorded call exactly as it does outside, and yields a plain ImmutableMap.
 
 The resulting trace is exactly the set of facts that must still hold for a
 recorded result to be valid, which is what makes invalidation fine-grained:
@@ -123,6 +128,41 @@ class RecordingMap(Mapping):
         else:
             self._rec.absent(self._path + (key,))
         return hit
+
+    # -- derivation -------------------------------------------------------------
+    #
+    # Every derived form reads all of self: ``|`` copies the underlying dict and
+    # ``dissoc`` filters it.  So each records a whole-map dependency and returns
+    # a plain ImmutableMap.  Reads of the result need no recording of their own,
+    # because a result derived from the whole of self is already covered by the
+    # dependency on the whole of self.
+
+    def __or__(self, other: Any) -> ImmutableMap:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        self._observe_all()
+        return self._base | other
+
+    def __ror__(self, other: Any) -> ImmutableMap:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        self._observe_all()
+        return other | self._base
+
+    def assoc(self, key: Any, value: Any) -> ImmutableMap:
+        self._observe_all()
+        return self._base.assoc(key, value)
+
+    def dissoc(self, *keys: Any) -> ImmutableMap:
+        self._observe_all()
+        return self._base.dissoc(*keys)
+
+    def __reduce__(self):
+        """Pickling reads everything, so it observes the whole map and reduces
+        to the ImmutableMap being proxied: the proxy itself is meaningless
+        outside the call that created it."""
+        self._observe_all()
+        return self._base.__reduce__()
 
     # -- whole-map observations (conservative fallback) -------------------------
 

@@ -115,6 +115,10 @@ decision.
   observes the whole subtree and records a whole-map dependency. Anything
   that looks at all keys (`len`, iteration, `==`, `keys()`) is a whole-map
   read: correct, but coarser.
+- Deriving inside a `@pure` function works exactly as it does outside — `|`,
+  `assoc` and `dissoc` are all available on the map you were passed, and
+  return a plain `ImmutableMap`. Each copies every key, so each is a
+  whole-map read; derive from the narrowest map you can.
 - Absence is a dependency. `config.get("detrend", 0)` on a map without
   `"detrend"` records the absence; adding that key later invalidates, and
   adding other keys does not.
