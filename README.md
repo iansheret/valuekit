@@ -305,6 +305,6 @@ pip install valuekit        # Python >= 3.11; depends only on numpy
 ## Development
 
 ```
-pip install -e .[dev]
+pip install -e ".[dev]"    # quoted: zsh globs the brackets
 pytest
 ```
