@@ -4,8 +4,11 @@ Focus: the correctness edges — staleness, granularity, arg binding,
 atomic store behaviour — rather than demos.
 """
 
+import dataclasses
+import functools
 import json
 import os
+import sys
 import warnings
 
 import numpy as np
@@ -493,6 +496,364 @@ class TestCustomTypeCodec:
         s = LocalStore(tmp_path)
         with pytest.raises(SerializationError):
             s.put_value(freeze(_NoCodec()))
+
+
+# ===========================================================================
+# plain-data dataclasses
+# ===========================================================================
+
+
+@dataclasses.dataclass
+class _Point:
+    x: int
+    y: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class _Frozen:
+    label: str
+    items: tuple = ()
+
+
+@dataclasses.dataclass(slots=True)
+class _Slotted:
+    a: int
+
+
+@dataclasses.dataclass
+class _SameFields:
+    x: int
+    y: float = 0.0
+
+
+@dataclasses.dataclass
+class _Base:
+    a: int
+
+
+@dataclasses.dataclass
+class _Derived(_Base):
+    b: int = 0
+
+
+@dataclasses.dataclass
+class _KwOnly:
+    a: int = 0
+    b: int = dataclasses.field(kw_only=True, default=1)
+
+
+class TestPlainDataHashing:
+    def test_identity_includes_the_class(self):
+        # Same field names, same values, different class: different values.
+        assert content_hash(_Point(1, 2.0)) != content_hash(_SameFields(1, 2.0))
+
+    def test_identity_includes_field_names(self):
+        @dataclasses.dataclass
+        class Renamed:
+            x: int
+            z: float = 0.0
+
+        Renamed.__qualname__ = _Point.__qualname__
+        Renamed.__module__ = _Point.__module__
+        assert content_hash(Renamed(1, 2.0)) != content_hash(_Point(1, 2.0))
+
+    def test_identity_includes_dataclass_params(self):
+        # order= generates comparisons a caller reaches through the data, so
+        # flipping it has to be a different value.
+        @dataclasses.dataclass(order=True)
+        class Ordered:
+            x: int
+            y: float = 0.0
+
+        Ordered.__qualname__ = _Point.__qualname__
+        Ordered.__module__ = _Point.__module__
+        assert content_hash(Ordered(1, 2.0)) != content_hash(_Point(1, 2.0))
+
+    def test_not_confusable_with_a_dict_of_the_same_fields(self):
+        assert content_hash(_Point(1, 2.0)) != content_hash({"x": 1, "y": 2.0})
+
+    def test_class_constants_are_not_behaviour(self):
+        @dataclasses.dataclass
+        class WithConstant:
+            x: int
+            SCALE = 2.0
+
+        assert content_hash(WithConstant(1)) == content_hash(WithConstant(1))
+
+    def test_self_reference_is_refused(self):
+        @dataclasses.dataclass
+        class Node:
+            child: object = None
+
+        n = Node()
+        n.child = n
+        with pytest.raises(TypeError, match="contains itself"):
+            content_hash(n)
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            pytest.param(lambda: _with_method(), id="method"),
+            pytest.param(lambda: _with_property(), id="property"),
+            pytest.param(lambda: _with_cached_property(), id="cached_property"),
+            pytest.param(lambda: _with_staticmethod(), id="staticmethod"),
+            pytest.param(lambda: _with_classmethod(), id="classmethod"),
+            pytest.param(lambda: _with_dunder(), id="hand_written_eq"),
+            pytest.param(lambda: _with_post_init(), id="post_init"),
+            pytest.param(lambda: _with_initvar(), id="initvar"),
+            pytest.param(lambda: _with_noninit_field(), id="non_init_field"),
+            pytest.param(lambda: _with_inherited_method(), id="inherited_method"),
+        ],
+    )
+    def test_behaviour_beyond_the_fields_is_refused(self, make):
+        with pytest.raises(TypeError, match="register_type"):
+            content_hash(make())
+
+    def test_stray_instance_attribute_is_refused(self):
+        p = _Point(1)
+        p.extra = 5  # not a field: the fields no longer describe the instance
+        with pytest.raises(TypeError, match="not its fields"):
+            content_hash(p)
+
+    def test_a_method_compiled_from_a_string_is_still_behaviour(self):
+        # exec'd code shares the "<string>" marker with the decorator's own
+        # methods, so the name has to carry the distinction.
+        ns = {}
+        exec(
+            "import dataclasses\n"
+            "@dataclasses.dataclass\n"
+            "class C:\n"
+            "    x: int\n"
+            "    def magnitude(self): return self.x\n",
+            ns,
+        )
+        with pytest.raises(TypeError, match="register_type"):
+            content_hash(ns["C"](1))
+
+    def test_a_callable_field_default_is_a_value(self):
+        # A default sits in the class namespace under the field's own name;
+        # it is data, and a function is hashed by its fingerprint.
+        @dataclasses.dataclass
+        class WithCallableDefault:
+            op: object = _default_op
+
+        assert content_hash(WithCallableDefault()) != content_hash(
+            WithCallableDefault(lambda n: n + 1)
+        )
+
+
+def _default_op(n):
+    return n
+
+
+def _with_method():
+    @dataclasses.dataclass
+    class C:
+        x: int
+
+        def magnitude(self):
+            return self.x
+
+    return C(1)
+
+
+def _with_property():
+    @dataclasses.dataclass
+    class C:
+        x: int
+
+        @property
+        def double(self):
+            return 2 * self.x
+
+    return C(1)
+
+
+def _with_cached_property():
+    @dataclasses.dataclass
+    class C:
+        x: int
+
+        @functools.cached_property
+        def double(self):
+            return 2 * self.x
+
+    return C(1)
+
+
+def _with_staticmethod():
+    @dataclasses.dataclass
+    class C:
+        x: int
+
+        @staticmethod
+        def helper():
+            return 1
+
+    return C(1)
+
+
+def _with_classmethod():
+    @dataclasses.dataclass
+    class C:
+        x: int
+
+        @classmethod
+        def build(cls):
+            return cls(1)
+
+    return C(1)
+
+
+def _with_dunder():
+    @dataclasses.dataclass
+    class C:
+        x: int
+
+        def __eq__(self, other):
+            return True
+
+    return C(1)
+
+
+def _with_post_init():
+    @dataclasses.dataclass
+    class C:
+        x: int
+
+        def __post_init__(self):
+            self.x += 1
+
+    return C(1)
+
+
+def _with_initvar():
+    @dataclasses.dataclass
+    class C:
+        x: int
+        scale: dataclasses.InitVar[int] = 1
+
+    return C(1)
+
+
+def _with_noninit_field():
+    @dataclasses.dataclass
+    class C:
+        x: int
+        y: int = dataclasses.field(init=False, default=0)
+
+    return C(1)
+
+
+def _with_inherited_method():
+    class Base:
+        def helper(self):
+            return 1
+
+    @dataclasses.dataclass
+    class C(Base):
+        x: int
+
+    return C(1)
+
+
+class TestPlainDataStore:
+    @pytest.mark.parametrize(
+        "value",
+        [_Point(1, 2.0), _Frozen("a", (1, 2)), _Slotted(3)],
+        ids=["plain", "frozen", "slots"],
+    )
+    def test_roundtrip_preserves_type_and_content(self, tmp_path, value):
+        s = LocalStore(tmp_path)
+        h = s.put_value(value)
+        back = s.get_value(h)
+        assert type(back) is type(value) and back == value
+        assert content_hash(back) == h
+
+    def test_nested_values_are_shared_by_content(self, tmp_path):
+        arr = np.arange(4.0)
+        arr.flags.writeable = False
+        s = LocalStore(tmp_path)
+        h = s.put_value({"a": _Frozen("x", (arr,)), "b": _Frozen("x", (arr,))})
+        back = s.get_value(h)
+        assert np.array_equal(back["a"].items[0], arr)
+        assert content_hash(back["a"]) == content_hash(back["b"])
+        assert len(list((tmp_path / "objects").rglob("*.npy"))) == 1  # stored once
+
+    def test_inherited_and_kw_only_fields_roundtrip(self, tmp_path):
+        s = LocalStore(tmp_path)
+        assert s.get_value(s.put_value(_Derived(1, 2))) == _Derived(1, 2)
+        assert content_hash(_Base(1)) != content_hash(_Derived(1))
+        assert s.get_value(s.put_value(_KwOnly(1, b=5))) == _KwOnly(1, b=5)
+
+    def test_locally_defined_class_is_hashable_but_not_storable(self, tmp_path):
+        value = _with_local_class()
+        content_hash(value)  # fine as an argument
+        s = LocalStore(tmp_path)
+        with pytest.raises(SerializationError, match="module level"):
+            s.put_value(value)
+
+    def test_changed_class_reads_as_a_miss(self, tmp_path, monkeypatch):
+        s = LocalStore(tmp_path)
+        h = s.put_value(_Point(1, 2.0))
+
+        @dataclasses.dataclass
+        class Grown:
+            x: int
+            y: float = 0.0
+            z: float = 0.0
+
+        Grown.__qualname__ = _Point.__qualname__
+        monkeypatch.setattr(sys.modules[__name__], "_Point", Grown)
+        with pytest.raises(CacheMiss):
+            s.get_value(h)
+
+    def test_unimported_class_reads_as_a_miss(self, tmp_path, monkeypatch):
+        s = LocalStore(tmp_path)
+        h = s.put_value(_Point(1, 2.0))
+        monkeypatch.delattr(sys.modules[__name__], "_Point")
+        with pytest.raises(CacheMiss):
+            s.get_value(h)
+
+
+def _with_local_class():
+    @dataclasses.dataclass
+    class Local:
+        x: int
+
+    return Local(1)
+
+
+class TestPlainDataPure:
+    def test_roundtrips_as_an_argument_and_a_return(self, cache):
+        calls = []
+
+        @pure
+        def step(cfg):
+            calls.append(cfg)
+            return _Frozen("out", (cfg.x, cfg.y))
+
+        first = step(_Point(3, 1.5))
+        second = step(_Point(3, 1.5))
+        assert len(calls) == 1  # the second call was a hit
+        assert type(second) is _Frozen and second == first
+
+    def test_a_changed_field_recomputes(self, cache):
+        calls = []
+
+        @pure
+        def step(cfg):
+            calls.append(cfg)
+            return cfg.x
+
+        step(_Point(3, 1.5))
+        step(_Point(4, 1.5))
+        assert len(calls) == 2
+
+    def test_a_dataclass_is_still_rejected_by_the_map(self):
+        # Caching does not imply freezing: a map needs a freeze strategy.
+        with pytest.raises(TypeError):
+            ImmutableMap({"cfg": _Point(1)})
 
 
 # ===========================================================================

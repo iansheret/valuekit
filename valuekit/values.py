@@ -18,7 +18,9 @@ a cached return value.
 
 The ImmutableMap handlers are registered in :mod:`valuekit.map` (they need
 the class itself); the function handlers are registered in
-:mod:`valuekit.codehash` (they need the code hasher).
+:mod:`valuekit.codehash` (they need the code hasher); plain-data dataclasses
+are handled in :mod:`valuekit.plaindata`, which needs no registration at all
+because the type it recognises is a family rather than a class.
 """
 
 from __future__ import annotations
@@ -130,9 +132,18 @@ def _frame(h: Any, tag: bytes, payload: bytes = b"") -> None:
     h.update(payload)
 
 
+# Handlers for type *families*, which singledispatch cannot key on: each is
+# tried in turn on a value no registered type claims, and reports whether it
+# hashed it.  Plain-data dataclasses register one in :mod:`valuekit.plaindata`.
+_hash_fallbacks: list[Callable[[Any, Any], bool]] = []
+
+
 @singledispatch
 def hash_update(v: Any, h: Any) -> None:
     """Feed the content of *v* into hasher *h*. Dispatch on type of *v*."""
+    for fallback in _hash_fallbacks:
+        if fallback(v, h):
+            return
     raise TypeError(
         f"No content-hash strategy for {type(v).__name__!r}. "
         "Register one with valuekit.register_type()."

@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0
+
+### Added
+
+- Plain-data dataclasses are `@pure` arguments and cached return values
+  without registration. A dataclass's identity is its qualified name, its
+  dataclass parameters and its ordered fields, so a change to any of them
+  recomputes. "Plain data" is checked rather than assumed: the class must be
+  built by assignment alone, hold exactly its declared fields, and carry no
+  methods, properties, or static and class methods, since a method reached
+  through an argument is invisible to the calling function's fingerprint.
+  Anything else raises and points at `register_type`. Stored entries name
+  their class but never import it, and a class that has changed since an
+  entry was written reads as a miss.
+
 ## 0.2.0 — 2026-07-28
 
 ### Changed

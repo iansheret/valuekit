@@ -177,8 +177,9 @@ configuration.
   keys on different branches accumulates one trace per observed read-set,
   each matched independently.
 - Every other argument (plain dicts, lists, arrays, scalars, tuples,
-  lambdas) keys the cache by content hash, whole. Nothing observed how the
-  function used it, so any change to it invalidates.
+  lambdas, plain-data dataclasses) keys the cache by content hash, whole.
+  Nothing observed how the function used it, so any change to it
+  invalidates.
 - A map passed from one `@pure` call into a nested one is traced in both:
   the inner call gets its own per-key trace, and the outer stays valid only
   for maps that would drive the inner the same way.
@@ -225,13 +226,43 @@ composite values reference their children by hash, so an array shared by
 many results is stored once. There is no pickle anywhere. Cacheable return
 values are a fixed set: `None`, `bool`, `int`, `float`, `complex`, `str`,
 `bytes`, `range`, numpy scalars and arrays, tuples, lists, sets, frozensets,
-dicts and `ImmutableMap`s of the same.
+dicts, `ImmutableMap`s and plain-data dataclasses of the same.
 
 A stored value reloads as an equal value of the same type, which is what
 lets a hit stand in for the call. That is also why the content hash
 distinguishes a list from a tuple, two dicts that differ only in order, and
 a writeable array from a read-only one: a hash has to identify a value
 exactly for a content-addressed store to be able to hand it back.
+
+### Plain-data dataclasses
+
+A dataclass whose whole meaning is its fields needs no registration: pass
+one as an argument, return one from a `@pure` function, nest them, and they
+are hashed and stored like any other value. Its identity is its qualified
+name, its dataclass parameters and its ordered fields, so renaming a field,
+adding one, or flipping `order=` is a different value and recomputes.
+`frozen=` and `slots=` are both fine.
+
+Plain data is checked, not assumed. The class must be built by assignment
+alone — no `__post_init__`, no `InitVar`, no `init=False` fields — the
+instance must hold exactly its declared fields, and neither the class nor
+any base may define a method, property, `staticmethod` or `classmethod`.
+Anything else raises, and points at `register_type`.
+
+Methods are the line because a method reached through an argument —
+`obs.magnitude()` — is an attribute name, so it resolves to nothing at
+module scope and never enters the calling function's fingerprint: edit it
+and the cache would serve a stale result. So adding a method to a dataclass
+you already cache turns it into a `register_type` job, where you take on
+hashing it yourself. That cliff is deliberate.
+
+A stored entry names its class, but nothing is imported on the strength of
+one: the class is resolved only among modules the process has already
+loaded, and a class that has changed since the entry was written reads as a
+miss rather than being rebuilt into something it no longer means.
+
+Caching a type is not the same as freezing it, so a dataclass still cannot
+go into an `ImmutableMap` without a `freeze_fn`.
 
 Writes are atomic; directories can be shared between processes; a missing
 or corrupt entry is treated as a miss. Deleting the cache is always safe. A
