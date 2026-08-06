@@ -19,6 +19,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   their class but never import it, and a class that has changed since an
   entry was written reads as a miss.
 
+### Fixed
+
+- Rebuilding a native extension you maintain yourself now recomputes what
+  depends on it. Its binary is hashed whenever the distribution providing it
+  was installed from a local directory, editable or not, since such a package
+  is rebuilt in place under an unchanged version; released wheels keep their
+  version markers and are never read. Objects a compiled module defines are
+  also recognised now: a nanobind function is neither a Python function nor a
+  builtin, so it previously reached the fingerprint as an untracked opaque
+  value and nothing about the extension was tracked at all.
+
 ## 0.2.0 — 2026-07-28
 
 ### Changed

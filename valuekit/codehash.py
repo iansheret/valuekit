@@ -7,6 +7,9 @@ its names resolve to.  The walk stops at boundaries:
 
 * installed packages contribute ``pkg:<name>==<version>`` (upgrading the
   package invalidates; edits inside site-packages are invisible);
+* native extensions whose version cannot describe them -- anything installed
+  from a local directory, editable or not, and so rebuilt in place --
+  contribute a content hash of the built binary;
 * the standard library contributes ``std:<module>`` (the Python version is
   already part of the global salt);
 * user modules referenced *as modules* (``mymod.helper()``) contribute a hash
@@ -30,8 +33,11 @@ breakpoints against these to decide when a cache hit must be bypassed.
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import types
+from importlib.machinery import EXTENSION_SUFFIXES
 from typing import Any, Callable
 
 import numpy as np
@@ -78,19 +84,119 @@ def _module_unit(mod: types.ModuleType) -> str | None:
 _USER, _PKG, _STD = "user", "pkg", "std"
 
 
-def _dist_version(top: str) -> str | None:
+_dists: dict[str, Any] = {}  # top-level import name -> Distribution or None
+
+
+def _distribution(top: str) -> Any:
+    """Return the installed distribution providing top-level module *top*."""
+    if top in _dists:
+        return _dists[top]
     import importlib.metadata as md
 
     try:
-        return md.version(top)
+        dist = md.distribution(top)
     except md.PackageNotFoundError:
         try:
-            dists = md.packages_distributions().get(top) or []
-            return md.version(dists[0]) if dists else None
+            # The import name and the distribution name differ often enough
+            # (sklearn/scikit-learn) to be worth the slower lookup.
+            names = md.packages_distributions().get(top) or []
+            dist = md.distribution(names[0]) if names else None
         except Exception:
-            return None
+            dist = None
+    except Exception:
+        dist = None
+    _dists[top] = dist
+    return dist
+
+
+def _dist_version(top: str) -> str | None:
+    dist = _distribution(top)
+    try:
+        return dist.version if dist is not None else None
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# native extensions
+# ---------------------------------------------------------------------------
+#
+# A compiled extension has no source to walk and no code object to hash, so
+# the binary is its identity.  Hashing it is only necessary where the version
+# marker cannot stand in: a distribution installed from a released artefact
+# changes only through a reinstall, which moves its version, while one
+# installed from a local directory -- editable or not -- is rebuilt in place
+# under the same version, and so would go unnoticed.
+#
+# The binary is also a stricter dependency than the sources it was built
+# from: it carries the compiler, its flags, and any library linked
+# statically into the result, none of which the sources mention.  And it is
+# the code that actually runs, so editing a source file without rebuilding
+# correctly changes nothing.
+
+_ext_digests: dict[tuple, str] = {}
+
+
+def _is_extension_file(filename: str) -> bool:
+    return filename.endswith(tuple(EXTENSION_SUFFIXES))
+
+
+def _is_dist_local(dist: Any) -> bool:
+    """Report whether *dist* was installed from a directory on this machine,
+    so that its version says nothing about its current contents."""
+    try:
+        text = dist.read_text("direct_url.json")
+    except Exception:
+        return False
+    try:
+        return bool(text) and "dir_info" in json.loads(text)
+    except ValueError:
+        return False
+
+
+def _is_live_extension(filename: str, top: str) -> bool:
+    """Report whether a file is an extension whose version cannot stand for
+    its contents, and so has to be hashed."""
+    if not _is_extension_file(filename):
+        return False
+    dist = _distribution(top)
+    return dist is None or _is_dist_local(dist)
+
+
+def _extension_digest(filename: str) -> str | None:
+    """Content digest of a compiled extension, or None if it cannot be read.
+
+    Memoised on the file's identity, so a fingerprint pays for a given build
+    once per process.
+    """
+    try:
+        stat = os.stat(filename)
+    except OSError:
+        return None
+    key = (filename, stat.st_mtime_ns, stat.st_size)
+    if key not in _ext_digests:
+        h = _new_hasher()
+        try:
+            with open(filename, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+        except OSError:
+            return None
+        _ext_digests[key] = h.hexdigest()
+    return _ext_digests[key]
+
+
+def _extension_marker(module_name: str | None) -> str | None:
+    """Return the marker for *module_name* if it names a native extension.
+
+    Objects a compiled module defines -- a nanobind function, a Cython class
+    -- carry no Python code, so the module they came from stands for them.
+    """
+    mod = sys.modules.get(module_name or "")
+    filename = getattr(mod, "__file__", None)
+    if not filename or not _is_extension_file(filename):
+        return None
+    return _classify(module_name, filename)[1]
 
 
 def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
@@ -105,6 +211,12 @@ def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
     if filename is None and top:
         mod = sys.modules.get(module_name or "")
         filename = getattr(mod, "__file__", None)
+    if filename and _is_live_extension(filename, top):
+        # An extension rebuilt in place under a fixed version: only its
+        # contents identify it.
+        ext_digest = _extension_digest(filename)
+        if ext_digest is not None:
+            return _PKG, f"ext:{module_name}={ext_digest}"
     if filename and ("site-packages" in filename or "dist-packages" in filename):
         ver = _dist_version(top)
         return _PKG, f"pkg:{top}=={ver or '?'}"
@@ -158,15 +270,27 @@ class _Walker:
     def _mark(self, text: str) -> None:
         _frame(self.h, b"k", text.encode("utf-8", "replace"))
 
-    def _try_digest(self, label: str, v: Any) -> None:
+    def _try_digest(self, label: str, v: Any) -> bool:
         if _is_mutable_value(v):
             self._mark(f"untracked:{label}:{type(v).__name__}")
-            return
+            return False
         try:
             _frame(self.h, b"v", label.encode() + b"=" + digest(v))
+            return True
         except Exception:
             # Not hashable either (open handle, logger, RNG, ...): same deal.
             self._mark(f"untracked:{label}:{type(v).__name__}")
+            return False
+
+    def _add_value(self, label: str, v: Any) -> None:
+        """Content-hash a plain value, falling back to the binary of the
+        extension that defines it: a nanobind function or a Cython class has
+        no other identity."""
+        if self._try_digest(label, v):
+            return
+        marker = _extension_marker(getattr(v, "__module__", None))
+        if marker is not None:
+            self._mark(f"{label}:{marker}")
 
     def _add_dep(self, label: str, v: Any) -> None:
         """A default/closure/extra dependency: functions, classes, and modules
@@ -178,7 +302,7 @@ class _Walker:
         ):
             self._add_global(label, v)
         else:
-            self._try_digest(label, v)
+            self._add_value(label, v)
 
     # -- entry points --------------------------------------------------------
 
@@ -280,7 +404,7 @@ class _Walker:
                 self._mark(f"cls:{name}:{marker}")
         else:
             # Module-level constant / object: content-hash if immutable.
-            self._try_digest(f"global[{name}]", obj)
+            self._add_value(f"global[{name}]", obj)
 
     def _add_user_module(self, name: str, mod: types.ModuleType) -> None:
         if id(mod) in self.seen:
