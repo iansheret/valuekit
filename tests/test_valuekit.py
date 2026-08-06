@@ -9,14 +9,17 @@ import functools
 import json
 import os
 import sys
+import types
 import warnings
+from importlib.machinery import EXTENSION_SUFFIXES
 
 import numpy as np
 import pytest
 
 import valuekit as vk
 from valuekit import ImmutableMap, pure, freeze, content_hash
-from valuekit.codehash import function_fingerprint
+from valuekit import codehash
+from valuekit.codehash import _classify, function_fingerprint
 from valuekit.store import LocalStore, CacheMiss, SerializationError
 from valuekit.values import encode_key, decode_key
 from valuekit import pure as _pure_mod  # module alias for store poking
@@ -305,6 +308,114 @@ class TestCodeHash:
             fp1 = function_fingerprint(build())[0]
             fp2 = function_fingerprint(build())[0]
         assert fp1 == fp2  # distinct opaque objects: untracked, stable
+
+
+# ===========================================================================
+# native extensions
+# ===========================================================================
+
+
+class _NativeCallable:
+    """Stands in for a nanobind function: callable, carrying no Python code,
+    and attributed to the module that defined it."""
+
+    def __call__(self, x):
+        return x
+
+
+@pytest.fixture
+def fake_extension(tmp_path, monkeypatch):
+    """A module that looks like a locally built compiled extension: a real
+    file with an extension suffix, installed where a wheel would put it, and
+    belonging to no installed distribution."""
+    installed = tmp_path / "site-packages"
+    installed.mkdir()
+    path = installed / f"_fake_ext{EXTENSION_SUFFIXES[0]}"
+    path.write_bytes(b"compiled bytes, version one")
+    mod = types.ModuleType("_fake_ext")
+    mod.__file__ = str(path)
+    monkeypatch.setitem(sys.modules, "_fake_ext", mod)
+    monkeypatch.setattr(_NativeCallable, "__module__", "_fake_ext")
+    return mod, path
+
+
+def _using_global(name, obj):
+    """Build a function whose body calls *obj* under the name *name*."""
+    ns = {name: obj}
+    exec(f"def f(x):\n    return {name}(x)", ns)
+    return ns["f"]
+
+
+class TestNativeExtensions:
+    def test_binary_contents_identify_the_extension(self, fake_extension):
+        mod, path = fake_extension
+        kind, marker = _classify(mod.__name__, mod.__file__)
+        assert marker.startswith("ext:_fake_ext=")
+        path.write_bytes(b"compiled bytes, version two -- rebuilt")
+        assert _classify(mod.__name__, mod.__file__)[1] != marker
+
+    def test_rebuilt_extension_invalidates_its_callers(self, fake_extension):
+        # The case this exists for: a @pure function calls into C++, the C++
+        # is edited and rebuilt, and the result must not be replayed.
+        mod, path = fake_extension
+        fn = _using_global("solve", _NativeCallable())
+        before = _fp(fn)
+        path.write_bytes(b"compiled bytes, version two -- rebuilt")
+        assert _fp(fn) != before
+
+    def test_an_identical_build_elsewhere_keeps_the_hash(
+        self, fake_extension, tmp_path
+    ):
+        # The marker is the contents, not the path or the timestamp, so a
+        # rebuild that changes nothing costs no recomputation.
+        mod, path = fake_extension
+        fn = _using_global("solve", _NativeCallable())
+        before = _fp(fn)
+        moved = tmp_path / f"elsewhere{EXTENSION_SUFFIXES[0]}"
+        moved.write_bytes(path.read_bytes())
+        mod.__file__ = str(moved)
+        assert _fp(fn) == before
+
+    def test_a_released_distribution_keeps_its_version_marker(
+        self, fake_extension, monkeypatch
+    ):
+        # A wheel changes only through a reinstall, which moves its version:
+        # there is nothing to gain by reading megabytes of binary.
+        mod, path = fake_extension
+
+        class _ReleasedDist:
+            version = "1.2.3"
+
+            def read_text(self, name):
+                return None  # no direct_url.json: not a local install
+
+        monkeypatch.setattr(codehash, "_distribution", lambda top: _ReleasedDist())
+        assert _classify(mod.__name__, mod.__file__)[1] == "pkg:_fake_ext==1.2.3"
+
+    def test_an_extension_module_is_tracked_as_a_module(self, fake_extension):
+        mod, path = fake_extension
+        fn = _using_global("ext", mod)
+        # A module global resolves by name, so the reference is to the module
+        # itself rather than to anything it defines.
+        before = _fp(fn)
+        path.write_bytes(b"compiled bytes, version two -- rebuilt")
+        assert _fp(fn) != before
+
+    def test_an_extension_built_in_the_source_tree_is_tracked(self, tmp_path):
+        # Built in place rather than installed: there is no version to lean
+        # on at all, so the contents are all there is.
+        path = tmp_path / f"_intree{EXTENSION_SUFFIXES[0]}"
+        path.write_bytes(b"compiled bytes, version one")
+        before = _classify("_intree", str(path))[1]
+        assert before.startswith("ext:_intree=")
+        path.write_bytes(b"compiled bytes, version two -- rebuilt")
+        assert _classify("_intree", str(path))[1] != before
+
+    def test_a_missing_binary_is_not_an_error(self, fake_extension):
+        mod, path = fake_extension
+        fn = _using_global("solve", _NativeCallable())
+        path.unlink()
+        _fp(fn)  # falls back to the version marker rather than raising
 
 
 # ===========================================================================

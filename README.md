@@ -77,6 +77,7 @@ A result is recomputed when any of these change:
 | an immutable module constant it uses (numbers, strings, tuples, frozensets, read-only arrays) | constants are part of the definition; `x / SPEED_OF_LIGHT` and `x / 299792458.0` invalidate identically |
 | default and closure values | part of the definition |
 | the version of an installed package it uses, or the Python version | package and standard-library boundaries contribute version markers |
+| the compiled contents of a native extension it calls, where that extension is your own | an extension installed from a local directory is rebuilt in place under an unchanged version, so its binary is hashed instead |
 
 Whitespace, comments, and the function's name are not changes.
 
@@ -104,6 +105,24 @@ Tunables belong in config maps rather than in module globals. A traced
 config read is exact per call (change an unread key and hits are kept),
 while a module constant is definition-wide (edit it and every function
 naming it recomputes).
+
+### Native extensions
+
+A compiled extension (nanobind, pybind11, Cython, plain C) has no source to
+walk, so its binary is its identity. That matters where the version marker
+cannot stand in for it: a package installed from a released wheel changes
+only through a reinstall, which moves its version, while a package installed
+from a local directory — `pip install -e .` or `pip install .` — is rebuilt
+in place under the same version. Extensions in the second group are hashed
+by content, so rebuilding your own C++ recomputes what depends on it, and
+released wheels keep their cheap version markers.
+
+The binary is a stricter dependency than the sources it was built from: it
+carries the compiler, its flags, and any library linked statically into the
+result, none of which the sources mention. It is also the code that actually
+runs, so editing a source file without rebuilding correctly changes nothing.
+The cost is one read of the file per build, on the order of a millisecond
+for a few megabytes.
 
 Decoration emits no warnings. Side effects in a `@pure` function (logging,
 progress bars, metrics) are permitted by the contract precisely because
