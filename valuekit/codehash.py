@@ -13,7 +13,9 @@ its names resolve to.  The walk stops at boundaries:
 * the standard library contributes ``std:<module>`` (the Python version is
   already part of the global salt);
 * user modules referenced *as modules* (``mymod.helper()``) contribute a hash
-  of the module's source file;
+  of the module's source file, and a package's submodules are followed
+  through attribute access (``mypkg.sub.f()`` depends on sub.py, not only on
+  the package's __init__.py);
 * module-level constants that are immutable (numbers, strings, bytes,
   tuples, frozensets, read-only arrays) are content-hashed — they are part
   of the function's definition; mutable globals (lists, dicts, sets,
@@ -292,15 +294,18 @@ class _Walker:
         if marker is not None:
             self._mark(f"{label}:{marker}")
 
-    def _add_dep(self, label: str, v: Any) -> None:
+    def _add_dep(self, label: str, v: Any, co_names: tuple = ()) -> None:
         """A default/closure/extra dependency: functions, classes, and modules
         route through global classification (recursing into user code and
-        collecting spans); plain values are content-hashed if immutable."""
+        collecting spans); plain values are content-hashed if immutable.
+
+        *co_names* are the referencing function's names, used to follow
+        attribute access into a module's submodules (see _add_user_module)."""
         if isinstance(
             v,
             (types.FunctionType, types.BuiltinFunctionType, types.ModuleType, type),
         ):
-            self._add_global(label, v)
+            self._add_global(label, v, co_names)
         else:
             self._add_value(label, v)
 
@@ -323,14 +328,16 @@ class _Walker:
             self._mark("cycle")
             return
         # Runtime state that parameterises the function but lives outside
-        # its bytecode:
+        # its bytecode.  A module arriving this way is attribute-accessed in
+        # the body, so the body's names are what resolve its submodules.
+        names = code.co_names
         for i, d in enumerate(fn.__defaults__ or ()):
-            self._add_dep(f"default[{i}]", d)
+            self._add_dep(f"default[{i}]", d, names)
         for k, d in (fn.__kwdefaults__ or {}).items():
-            self._add_dep(f"kwdefault[{k}]", d)
+            self._add_dep(f"kwdefault[{k}]", d, names)
         for i, cell in enumerate(fn.__closure__ or ()):
             try:
-                self._add_dep(f"closure[{i}]", cell.cell_contents)
+                self._add_dep(f"closure[{i}]", cell.cell_contents, names)
             except ValueError:  # empty cell
                 self._mark(f"emptycell[{i}]")
         self.add_code(code, fn.__globals__)
@@ -364,13 +371,15 @@ class _Walker:
                 obj = builtins_.get(name, _MISSING)
             if obj is _MISSING:
                 # Most commonly an attribute name (LOAD_ATTR shares co_names);
-                # nothing to resolve at module scope.
+                # nothing to resolve at module scope.  Such a name may still
+                # be a submodule of a module resolved here, which is why
+                # co_names is handed to _add_global below.
                 continue
-            self._add_global(name, obj)
+            self._add_global(name, obj, code.co_names)
 
     # -- classification of resolved globals ----------------------------------
 
-    def _add_global(self, name: str, obj: Any) -> None:
+    def _add_global(self, name: str, obj: Any, co_names: tuple = ()) -> None:
         if isinstance(obj, types.FunctionType):
             if getattr(obj, "_valuekit_pure", False):
                 self._mark(f"fn:{name}")
@@ -390,7 +399,7 @@ class _Walker:
         elif isinstance(obj, types.ModuleType):
             kind, marker = _classify(obj.__name__, getattr(obj, "__file__", None))
             if kind == _USER:
-                self._add_user_module(name, obj)
+                self._add_user_module(name, obj, co_names)
             else:
                 self._mark(f"mod:{name}:{marker}")
         elif isinstance(obj, type):
@@ -406,7 +415,9 @@ class _Walker:
             # Module-level constant / object: content-hash if immutable.
             self._add_value(f"global[{name}]", obj)
 
-    def _add_user_module(self, name: str, mod: types.ModuleType) -> None:
+    def _add_user_module(
+        self, name: str, mod: types.ModuleType, co_names: tuple = ()
+    ) -> None:
         if id(mod) in self.seen:
             return
         self.seen.add(id(mod))
@@ -421,6 +432,28 @@ class _Walker:
                 self.units.add(u)
         except Exception:
             self._mark(f"opaque-module:{name}")
+
+        # A package's source file is only its __init__.py, so stopping here
+        # would leave ``mypkg.sub.f()`` depending on nothing that sub.py says:
+        # ``sub`` and ``f`` are attribute names, which resolve to nothing at
+        # module scope and so never reach add_code's globals lookup.  The
+        # referencing code object's names are the candidate attributes; the
+        # seen-set makes mutually-importing packages terminate.
+        for attr in co_names:
+            try:
+                sub = getattr(mod, attr, None)
+            except Exception:
+                continue  # a module-level __getattr__ that raises
+            if not isinstance(sub, types.ModuleType):
+                continue
+            # Classify each submodule in its own right: a package may contain
+            # a compiled extension, which is identified by its binary rather
+            # than read as source.
+            kind, marker = _classify(sub.__name__, getattr(sub, "__file__", None))
+            if kind == _USER:
+                self._add_user_module(f"{name}.{attr}", sub, co_names)
+            else:
+                self._mark(f"mod:{name}.{attr}:{marker}")
 
     def _add_user_class(self, name: str, cls: type) -> None:
         if id(cls) in self.seen:

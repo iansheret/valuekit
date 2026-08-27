@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.1 — 2026-08-27
+
+### Fixed
+
+- Editing a submodule reached through attribute access now recomputes what
+  depends on it. `mypkg.sub.f()` spells `sub` and `f` as attribute names, which
+  resolve to nothing at module scope, and a package's source file is only its
+  `__init__.py` — so the walk stopped there and nothing sub.py said reached the
+  fingerprint. Editing sub.py left the fingerprint unchanged and `@pure` served
+  the old result without executing. The same shape defeated `clear_cache(fn)`,
+  since callers never recorded the submodule's unit. Submodules named by the
+  referencing function are now followed, at any depth, each classified in its
+  own right so that a compiled extension inside a package is still identified
+  by its binary rather than read as source. Reaching a submodule as a name
+  (`from mypkg.sub import f`) was always tracked and is unchanged, as is a flat
+  module referenced as a module.
+
+  `@pure` functions using that import style will recompute once. Results they
+  cached before this release may have been computed from code that has since
+  changed — if you have relied on this style, clearing the cache directory is
+  the cautious move, though results are not silently reused: the fingerprint
+  now differs, so the affected entries are simply never consulted again.
+
 ## 0.3.0 — 2026-08-06
 
 ### Added

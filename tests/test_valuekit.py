@@ -311,6 +311,212 @@ class TestCodeHash:
 
 
 # ===========================================================================
+# submodules reached by attribute access
+# ===========================================================================
+#
+# ``mypkg.sub.f()`` spells ``sub`` and ``f`` as attribute names, and an
+# attribute name resolves to nothing at module scope.  A package's source
+# file is only its __init__.py, so a walk that stops there depends on
+# nothing sub.py says: editing it left the fingerprint unchanged and @pure
+# served a stale result.  Every test here is a regression guard for that.
+
+_TEST_PKGS = ("vk_sub_pkg", "vk_deep_pkg", "vk_flat_mod", "vk_cyc_a", "vk_cyc_b")
+
+
+def _write_tree(root, files: dict) -> None:
+    """Write {"pkg/mod.py": source, ...} under *root*."""
+    for rel, src in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(src)
+
+
+def _fresh_import(root, name: str):
+    """Import *name* from *root*, discarding any copy already imported.
+
+    Each version of a package goes in its own directory, so no stale .pyc
+    can be reused when a rewrite happens to leave mtime and size alone.
+    """
+    import importlib
+
+    for m in [k for k in sys.modules if k == name or k.startswith(name + ".")]:
+        del sys.modules[m]
+    importlib.invalidate_caches()
+    sys.path.insert(0, str(root))
+    try:
+        return importlib.import_module(name)
+    finally:
+        sys.path.remove(str(root))
+
+
+def _pkg_versions(tmp_path, files_for, name):
+    """Yield the module built from files_for(src) for two leaf sources."""
+    for i, leaf in enumerate(("def f(x):\n    return x + 1\n", "def f(x):\n    return x + 555555\n")):
+        root = tmp_path / f"v{i}"
+        _write_tree(root, files_for(leaf))
+        yield _fresh_import(root, name)
+
+
+class TestSubmoduleWalk:
+    @pytest.fixture(autouse=True)
+    def _purge(self):
+        yield
+        for m in [k for k in sys.modules if k.startswith(_TEST_PKGS)]:
+            del sys.modules[m]
+
+    @staticmethod
+    def _pkg(leaf):
+        return {
+            "vk_sub_pkg/__init__.py": "from . import leaf\n",
+            "vk_sub_pkg/leaf.py": leaf,
+        }
+
+    def test_attribute_submodule_invalidates(self, tmp_path):
+        # The bug: `import pkg` then `pkg.leaf.f(x)`.
+        fps = []
+        for mod in _pkg_versions(tmp_path, self._pkg, "vk_sub_pkg"):
+            ns = {"pkg": mod}
+            exec("def step(x):\n    return pkg.leaf.f(x)", ns)
+            fps.append(_fp(ns["step"]))
+        assert fps[0] != fps[1]
+
+    def test_explicit_submodule_import_invalidates(self, tmp_path):
+        # `import pkg.leaf` binds `pkg`, so the call site is identical.
+        fps = []
+        for mod in _pkg_versions(tmp_path, self._pkg, "vk_sub_pkg"):
+            ns = {"pkg": mod}
+            exec("def step(x):\n    return pkg.leaf.f(x)", ns)
+            fps.append(_fp(ns["step"]))
+        assert fps[0] != fps[1]
+
+    def test_from_import_still_invalidates(self, tmp_path):
+        # Control: reached as a name, tracked before this fix and after.
+        fps = []
+        for mod in _pkg_versions(tmp_path, self._pkg, "vk_sub_pkg"):
+            ns = {"f": mod.leaf.f}
+            exec("def step(x):\n    return f(x)", ns)
+            fps.append(_fp(ns["step"]))
+        assert fps[0] != fps[1]
+
+    def test_walk_descends_more_than_one_level(self, tmp_path):
+        def files(leaf):
+            return {
+                "vk_deep_pkg/__init__.py": "from . import inner\n",
+                "vk_deep_pkg/inner/__init__.py": "from . import leaf\n",
+                "vk_deep_pkg/inner/leaf.py": leaf,
+            }
+
+        fps = []
+        for mod in _pkg_versions(tmp_path, files, "vk_deep_pkg"):
+            ns = {"pkg": mod}
+            exec("def step(x):\n    return pkg.inner.leaf.f(x)", ns)
+            fps.append(_fp(ns["step"]))
+        assert fps[0] != fps[1]  # the walk stopped at the first __init__.py
+
+    def test_submodule_source_appears_in_spans(self, tmp_path):
+        mod = next(_pkg_versions(tmp_path, self._pkg, "vk_sub_pkg"))
+        ns = {"pkg": mod}
+        exec("def step(x):\n    return pkg.leaf.f(x)", ns)
+        files = {os.path.basename(s[0]) for s in function_fingerprint(ns["step"])[1]}
+        assert {"__init__.py", "leaf.py"} <= files
+
+    def test_submodule_unit_recorded_so_clear_cache_reaches(self, tmp_path):
+        # clear_cache(fn) queries _module_unit(fn's module); a caller only
+        # matches if it recorded that unit while walking.
+        mod = next(_pkg_versions(tmp_path, self._pkg, "vk_sub_pkg"))
+        ns = {"pkg": mod}
+        exec("def step(x):\n    return pkg.leaf.f(x)", ns)
+        units = set(function_fingerprint(ns["step"])[2])
+        assert codehash._module_unit(mod.leaf) in units
+
+    def test_non_user_submodule_not_followed(self, tmp_path):
+        # A stdlib module bound inside a package is an attribute like any
+        # other; it must stop at the classification boundary, not be read.
+        def files(leaf):
+            return {
+                "vk_sub_pkg/__init__.py": "import json\nfrom . import leaf\n",
+                "vk_sub_pkg/leaf.py": leaf,
+            }
+
+        mod = next(_pkg_versions(tmp_path, files, "vk_sub_pkg"))
+        ns = {"pkg": mod}
+        exec("def step(x):\n    return pkg.json.dumps(pkg.leaf.f(x))", ns)
+        spans = function_fingerprint(ns["step"])[1]
+        assert not any("json" in os.path.basename(s[0]) for s in spans)
+
+    def test_mutually_importing_packages_terminate(self, tmp_path):
+        root = tmp_path / "cyc"
+        _write_tree(
+            root,
+            {
+                "vk_cyc_a/__init__.py": "import vk_cyc_b\ndef f(x):\n    return x\n",
+                "vk_cyc_b/__init__.py": "import vk_cyc_a\ndef g(x):\n    return x\n",
+            },
+        )
+        mod = _fresh_import(root, "vk_cyc_a")
+        ns = {"a": mod}
+        exec("def step(x):\n    return a.vk_cyc_b.g(a.f(x))", ns)
+        h = _fp(ns["step"])  # must terminate rather than recurse forever
+        assert isinstance(h, str) and len(h) == 40
+
+    def test_no_stale_hit_when_submodule_edited(self, cache, tmp_path):
+        # The user-visible guarantee, end to end: a hit must equal what
+        # executing the current definition would return.
+        seen = []
+        for mod in _pkg_versions(tmp_path, self._pkg, "vk_sub_pkg"):
+            calls = []
+            ns = {"pure": pure, "pkg": mod, "calls": calls}
+            exec(
+                "@pure\ndef step(x):\n"
+                "    calls.append(1)\n"
+                "    return pkg.leaf.f(x)",
+                ns,
+            )
+            seen.append((ns["step"](10), bool(calls)))
+        assert seen[0] == (11, True)
+        assert seen[1] == (555565, True)  # executed; previously served 11
+
+    def test_unchanged_submodule_still_hits(self, cache, tmp_path):
+        # The fix must not cost hits when nothing changed.
+        root = tmp_path / "v"
+        _write_tree(root, self._pkg("def f(x):\n    return x + 1\n"))
+        mod = _fresh_import(root, "vk_sub_pkg")
+        calls = []
+        ns = {"pure": pure, "pkg": mod, "calls": calls}
+        exec(
+            "@pure\ndef step(x):\n    calls.append(1)\n    return pkg.leaf.f(x)",
+            ns,
+        )
+        assert ns["step"](10) == 11 and ns["step"](10) == 11
+        assert calls == [1]
+
+    def test_breakpoint_in_submodule_forces_caller(self, cache, tmp_path, monkeypatch):
+        # A breakpoint in a submodule must force its @pure callers, or the
+        # cached caller would skip straight past it.
+        import bdb
+
+        root = tmp_path / "v"
+        _write_tree(root, self._pkg("def f(x):\n    return x + 1\n"))
+        mod = _fresh_import(root, "vk_sub_pkg")
+        calls = []
+        ns = {"pure": pure, "pkg": mod, "calls": calls}
+        exec(
+            "@pure\ndef step(x):\n    calls.append(1)\n    return pkg.leaf.f(x)",
+            ns,
+        )
+        assert ns["step"](10) == 11 and calls == [1]  # recorded
+
+        dbg = bdb.Bdb()
+        monkeypatch.setattr(sys, "gettrace", lambda: dbg.trace_dispatch)
+        dbg.set_break(mod.leaf.__file__, 2)
+        try:
+            assert ns["step"](10) == 11
+            assert calls == [1, 1]  # forced, not served from the cache
+        finally:
+            dbg.clear_all_breaks()
+
+
+# ===========================================================================
 # native extensions
 # ===========================================================================
 
