@@ -6,9 +6,11 @@ atomic store behaviour — rather than demos.
 
 import dataclasses
 import functools
+import io
 import json
 import os
 import sys
+import time
 import types
 import warnings
 from importlib.machinery import EXTENSION_SUFFIXES
@@ -21,6 +23,8 @@ import valuekit as vk
 from valuekit import ImmutableMap, pure, freeze, content_hash
 from valuekit import codehash
 from valuekit import events
+from valuekit import parallel
+from valuekit import wire
 from valuekit.codehash import _classify, function_fingerprint
 from valuekit.store import LocalStore, CacheMiss, SerializationError
 from valuekit.values import encode_key, decode_key
@@ -2608,3 +2612,233 @@ class TestEvents:
         assert (cache / "runs").is_dir()
         # runs/ is additive: the format guard still accepts the directory.
         assert LocalStore(cache).get_traces("nothing") == []
+
+
+# ===========================================================================
+# the wire format and a worker on the other end of a pipe
+# ===========================================================================
+#
+# The pipe backend runs on this machine with no network, which is the point:
+# the framing, the value codec, the handshake and the failure mapping all get
+# exercised in CI without ssh being configured anywhere.
+
+
+class TestWire:
+    def test_every_storable_type_round_trips(self):
+        ro = np.arange(4.0)
+        ro.flags.writeable = False
+        for v in (
+            None, True, 42, 3.5, 2 + 3j, "hi", b"raw", range(1, 9, 2),
+            (1, "a"), [1, "a"], {1, 2}, frozenset({1, 2}),
+            {"b": 1, "a": 2}, ImmutableMap({"k": (1, 2)}),
+            np.arange(6.0).reshape(2, 3), np.int64(7), ro,
+        ):
+            root, objs = wire.pack(v)
+            back = wire.unpack(root, objs)
+            if isinstance(v, np.ndarray):
+                assert np.array_equal(back, v)
+                # Writeability is part of the content hash, so it is part of
+                # the value and has to survive the trip.
+                assert back.flags.writeable == v.flags.writeable
+            else:
+                assert back == v and type(back) is type(v)
+
+    def test_types_the_hash_separates_stay_separate(self):
+        assert wire.pack((1, 2))[0] != wire.pack([1, 2])[0]
+        assert wire.pack({"a": 1, "b": 2})[0] != wire.pack({"b": 2, "a": 1})[0]
+        w = np.arange(3.0)
+        r = np.arange(3.0)
+        r.flags.writeable = False
+        assert wire.pack(w)[0] != wire.pack(r)[0]
+
+    def test_a_shared_object_is_sent_once(self):
+        big = np.zeros(100)
+        _, objs = wire.pack([big, big, big])
+        assert len(objs) == 2  # the list, and the array once
+
+    def test_objects_the_peer_has_are_not_resent(self):
+        v = [np.zeros(10), 1]
+        _, first = wire.pack(v)
+        _, again = wire.pack(v, seen=set(first))
+        assert again == {}
+
+    def test_a_frame_round_trips(self):
+        buf = io.BytesIO()
+        wire.write_frame(buf, wire.TASK, b"payload")
+        buf.seek(0)
+        assert wire.read_frame(buf) == (wire.TASK, b"payload")
+        assert wire.read_frame(buf) is None  # clean end of stream
+
+    def test_a_truncated_frame_is_a_transport_error(self):
+        buf = io.BytesIO()
+        wire.write_frame(buf, wire.TASK, b"payload")
+        cut = io.BytesIO(buf.getvalue()[:-3])
+        with pytest.raises(wire.WireError):
+            wire.read_frame(cut)
+
+    def test_an_absurd_length_is_refused_rather_than_allocated(self):
+        # An unbounded length is what lets a corrupt header ask for gigabytes.
+        buf = io.BytesIO(wire.TASK + (1 << 62).to_bytes(8, "little"))
+        with pytest.raises(wire.WireError, match="refusing"):
+            wire.read_frame(buf)
+
+    def test_a_missing_object_is_a_transport_error_not_a_cache_miss(self):
+        # The store turns corruption into a CacheMiss, which correctly means
+        # "recompute" for a cache and would wrongly mean it for a connection.
+        root, objs = wire.pack([1, 2, 3])
+        objs.pop(next(h for h in objs if h != root))
+        with pytest.raises(wire.WireError):
+            wire.unpack(root, objs)
+        assert not issubclass(wire.WireError, CacheMiss)
+
+    def test_an_unknown_object_marker_is_refused(self):
+        root, objs = wire.pack(7)
+        objs[root] = b"?" + objs[root][1:]
+        with pytest.raises(wire.WireError, match="marker"):
+            wire.unpack(root, objs)
+
+
+def _hello(fn, salt=None, fingerprint=None, cache_dir=""):
+    from valuekit.pure import _salt
+
+    return wire.strings(
+        salt or _salt(),
+        fn.__module__,
+        fn.__qualname__,
+        fingerprint or function_fingerprint(fn)[0],
+        cache_dir,
+    )
+
+
+def _handshake(body):
+    """Run a worker's handshake in-process; return the READY reason."""
+    from valuekit import worker
+
+    rx, tx = io.BytesIO(), io.BytesIO()
+    wire.write_frame(rx, wire.HELLO, body)
+    rx.seek(0)
+    worker.serve(rx, tx)
+    tx.seek(0)
+    tag, reason = wire.read_frame(tx)
+    assert tag == wire.READY
+    return reason.decode()
+
+
+class TestWorkerHandshake:
+    def test_matching_fingerprint_is_admitted(self, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        assert _handshake(_hello(m.process)) == ""
+
+    def test_a_differing_fingerprint_refuses(self, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        reason = _handshake(_hello(m.process, fingerprint="0" * 40))
+        assert "differs here" in reason and "not in sync" in reason
+
+    def test_a_salt_mismatch_names_the_interpreter(self, tmp_path):
+        # The fingerprint frames raw bytecode, so two Python versions differ
+        # on identical source; the salt is checked first so the message says
+        # so instead of showing two opaque digests.
+        m, _ = _write_batch_module(tmp_path)
+        reason = _handshake(_hello(m.process, salt="valuekit-epoch2|py3.0"))
+        assert "py3.0" in reason and "differs here" not in reason
+
+    def test_a_function_in___main___is_refused(self, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        body = wire.strings(
+            __import__("valuekit.pure", fromlist=["_salt"])._salt(),
+            "__main__",
+            "work",
+            function_fingerprint(m.process)[0],
+            "",
+        )
+        reason = _handshake(body)
+        assert "__main__" in reason and "Move it to a module" in reason
+
+    def test_an_unimportable_module_refuses(self):
+        from valuekit.pure import _salt
+
+        body = wire.strings(_salt(), "no_such_module_xyz", "f", "0" * 40, "")
+        assert "cannot import" in _handshake(body)
+
+
+class TestPipeBackend:
+    @pytest.fixture(autouse=True)
+    def _use_pipes(self, monkeypatch):
+        from valuekit.backend import PipeBackend
+
+        monkeypatch.setattr(parallel, "_backend_factory", PipeBackend)
+
+    def test_results_come_back_in_input_order(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.process, [1, 2, 4], max_workers=2)
+        assert r.values == [11, 21, 41]
+
+    def test_a_raised_exception_is_attributed_to_its_input(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.process, [1, 3, 4])
+        assert [x for x, _ in r.failures] == [3]
+        # The wire cannot carry an exception object, so a remote failure is a
+        # RuntimeError naming the original -- unlike the local backend, which
+        # pickles the exception itself.
+        (_, exc), = r.failures
+        assert isinstance(exc, RuntimeError)
+        assert "bad calibration" in str(exc)
+        assert "ValueError" in str(exc.__cause__) or "ValueError" in str(exc)
+
+    def test_a_worker_that_dies_is_recorded_against_its_input(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.hard_death, [0, 1, 2])
+        failed = [x for x, _ in r.failures]
+        assert failed == [1]
+        assert r[0].result() == 0 and r[2].result() == 4  # neighbours unharmed
+
+    def test_a_non_storable_input_names_the_type(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.process, [lambda z: z])
+        (_, exc), = r.failures
+        assert "function" in str(exc)  # not a pickle error
+
+    def test_the_cache_is_shared_with_workers(self, cache, tmp_path):
+        m, counts = _write_batch_module(tmp_path)
+        vk.run_all(m.process, [1, 2])
+        n = len(counts())
+        vk.run_all(m.process, [1, 2])
+        assert len(counts()) == n  # second round: all hits, zero executions
+
+    def test_workers_report_themselves_as_workers(self, cache, tmp_path):
+        # A subprocess worker is not a multiprocessing child, so it cannot be
+        # recognised from the process tree and has to say so.
+        m, _ = _write_batch_module(tmp_path)
+        vk.run_all(m.process, [1, 2])
+        roles = [e["role"] for _, e in _events(cache, "run")]
+        assert roles.count("driver") == 1 and roles.count("worker") == 2
+
+    def test_a_timeout_kills_one_input_and_spares_the_rest(self, cache, tmp_path):
+        # A worker speaks before it finishes -- a greeting, then the result's
+        # objects -- so "readable" is not "done". Reading until done would sit
+        # inside a task that has already blown its deadline and never come
+        # back to enforce it.
+        m, _ = _write_batch_module(tmp_path)
+        t0 = time.monotonic()
+        r = vk.run_all(m.quick_or_hang, [7, 9, 8], max_workers=3, timeout=1.5)
+        assert time.monotonic() - t0 < 20  # the hang did not stall the batch
+        failed = [(x, type(e).__name__) for x, e in r.failures]
+        assert failed == [(9, "TimeoutError")]
+        assert r[0].result() == 70 and r[2].result() == 80
+
+    def test_a_breakpoint_still_short_circuits_before_any_backend(
+        self, cache, tmp_path, monkeypatch
+    ):
+        import bdb
+
+        m, _ = _write_batch_module(tmp_path)
+        fname, lo, _ = function_fingerprint(m.process)[1][0]
+        dbg = bdb.Bdb()
+        dbg.set_break(fname, lo + 1)
+        monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
+        try:
+            assert vk.run_all(m.process, [1, 2]).values == [11, 21]
+        finally:
+            dbg.clear_all_breaks()
+        (_, batch), = _events(cache, "batch")
+        assert batch["mode"] == "sequential"

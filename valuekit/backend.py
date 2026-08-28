@@ -28,6 +28,8 @@ import multiprocessing
 import os
 import traceback
 from multiprocessing import connection as _mp_connection
+
+from .codec import SerializationError
 from typing import Any, Protocol
 
 __all__ = ["Backend", "Handle", "LocalBackend"]
@@ -168,6 +170,223 @@ class LocalBackend:
         by_conn = {h.conn: h for h in handles}
         ready = _mp_connection.wait(list(by_conn), timeout=timeout)
         return [by_conn[c] for c in ready]
+
+    def close(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# a worker on the other end of a pipe
+# ---------------------------------------------------------------------------
+#
+# Same machine, same filesystem, no network -- so this proves the framing,
+# the value codec, the handshake and the failure mapping without any of
+# them depending on ssh being configured.  It is what makes the protocol
+# testable in CI, and it is the shape a remote transport will slot into:
+# only how the process is launched differs.
+
+
+class _PipeHandle:
+    """One worker subprocess and the framed conversation with it.
+
+    Frames are drained without blocking and parsed out of a buffer, rather
+    than read on demand.  A worker speaks several times before it finishes
+    -- a greeting, then the result's objects -- so "the pipe is readable"
+    does not mean "the answer is here", and reading until it is would sit
+    inside a task that has already blown its deadline.
+    """
+
+    __slots__ = ("proc", "objects", "_failure", "_buf", "_result", "_eof")
+
+    def __init__(self, proc, failure: str | None = None):
+        self.proc = proc
+        self.objects: dict[str, bytes] = {}
+        self._failure = failure
+        self._buf = b""
+        self._result: tuple | None = None
+        self._eof = False
+        if proc is not None:
+            os.set_blocking(proc.stdout.fileno(), False)
+
+    def fileno(self) -> int:
+        return self.proc.stdout.fileno()
+
+    # -- reading ---------------------------------------------------------
+
+    def drain(self) -> None:
+        """Take whatever has arrived and parse any complete frames."""
+        from . import wire
+
+        if self._result is not None or self._eof:
+            return
+        try:
+            chunk = os.read(self.fileno(), 1 << 16)
+        except BlockingIOError:
+            return
+        except OSError as e:
+            self._result = ("err_str", "OSError", str(e), "")
+            return
+        if not chunk:
+            self._eof = True
+            return
+        self._buf += chunk
+        try:
+            self._parse(wire)
+        except wire.WireError as e:
+            self._result = ("err_str", "WireError", str(e), "")
+
+    def _parse(self, wire) -> None:
+        while self._result is None:
+            if len(self._buf) < 9:
+                return
+            n = int.from_bytes(self._buf[1:9], "little")
+            if n > wire.MAX_FRAME:
+                raise wire.WireError(f"frame claims {n} bytes; refusing")
+            if len(self._buf) < 9 + n:
+                return
+            tag, body = self._buf[:1], self._buf[9 : 9 + n]
+            self._buf = self._buf[9 + n :]
+            if tag == wire.OBJECT:
+                wire.recv_object(body, self.objects)
+            elif tag == wire.READY:
+                if body:
+                    self._result = (
+                        "err_str",
+                        "RuntimeError",
+                        body.decode("utf-8", "replace"),
+                        "",
+                    )
+            elif tag == wire.RESULT:
+                if body[:1] == b"o":
+                    self._result = ("ok", wire.unpack(body[1:].hex(), self.objects))
+                else:
+                    kind, text, tb = wire.unstrings(body[1:])
+                    self._result = ("err_str", kind, text, tb)
+            else:
+                raise wire.WireError(f"unexpected frame {tag!r}")
+
+    def settled(self) -> bool:
+        """Whether there is an answer, or the worker has gone."""
+        return self._failure is not None or self._result is not None or self._eof
+
+    def recv(self) -> tuple | None:
+        if self._failure is not None:
+            return ("err_str", "RuntimeError", self._failure, "")
+        return self._result  # None means it went away without answering
+
+    def poll(self) -> bool:
+        self.drain()
+        return self._result is not None
+
+    # -- lifecycle -------------------------------------------------------
+
+    def kill(self) -> None:
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    def reap(self) -> None:
+        for stream in (self.proc.stdin, self.proc.stdout):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    def death(self) -> str:
+        return f"exit code {self.proc.returncode}; a segfault or a broken pipe?"
+
+
+class PipeBackend:
+    """Workers launched as subprocesses of this machine, over stdio.
+
+    The handshake happens per task here because a worker handles one input
+    and exits, mirroring the local backend.  Lifting it to once per host is
+    what a persistent connection buys, and belongs with the transport that
+    needs it.
+    """
+
+    poll_interval = None
+
+    def __init__(self, fn, cache_dir: str | None, python: str | None = None):
+        import sys
+
+        self._fn = fn
+        self._cache_dir = cache_dir or ""
+        self._python = python or sys.executable
+        # A spawned process inherits sys.path through multiprocessing's
+        # preparation data; a plain subprocess does not, so it is handed over
+        # explicitly. Once a worker runs against a synced snapshot the path
+        # comes from there instead, and this goes away.
+        self._env = dict(os.environ)
+        self._env["PYTHONPATH"] = os.pathsep.join(
+            p for p in sys.path if p and os.path.isdir(p)
+        )
+
+        from . import wire
+        from .codehash import function_fingerprint
+        from .pure import _salt
+
+        self._greeting = wire.strings(
+            _salt(),
+            getattr(fn, "__module__", "") or "",
+            getattr(fn, "__qualname__", "") or "",
+            function_fingerprint(fn)[0],
+            self._cache_dir,
+        )
+
+    def default_workers(self) -> int:
+        return os.cpu_count() or 1
+
+    def start(self, x: Any) -> _PipeHandle:
+        import subprocess
+
+        from . import wire
+
+        proc = subprocess.Popen(
+            [self._python, "-m", "valuekit.worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=self._env,
+        )
+        handle = _PipeHandle(proc)
+        try:
+            wire.write_frame(proc.stdin, wire.HELLO, self._greeting)
+            root = wire.send_value(proc.stdin, x, set())
+            wire.write_frame(proc.stdin, wire.TASK, bytes.fromhex(root))
+        except SerializationError as e:
+            # A value the wire cannot carry is the caller's problem, not a
+            # worker failure: say so against this input rather than letting
+            # the worker die of a truncated stream.
+            handle.kill()
+            handle._failure = str(e)
+        except Exception as e:
+            handle.kill()
+            handle._failure = f"could not send the task: {e}"
+        return handle
+
+    def wait(self, handles: list, timeout: float | None) -> list:
+        import select
+
+        settled = [h for h in handles if h.settled()]
+        if settled:
+            return settled  # already answered; do not block on the others
+        try:
+            readable, _, _ = select.select(handles, [], [], timeout)
+        except (OSError, ValueError):
+            return [h for h in handles if h.settled()]
+        for h in readable:
+            h.drain()
+        return [h for h in handles if h.settled()]
 
     def close(self) -> None:
         pass

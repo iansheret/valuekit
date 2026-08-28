@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+Groundwork for running a batch somewhere other than this machine. Nothing here
+is user-visible: `run_all` keeps its signature and its behaviour, and every
+batch still runs in local processes.
+
+- Scheduling is separated from where work runs. `run_all` keeps the admission
+  limit, deadlines, input ordering and failure attribution; a backend starts,
+  waits for and kills a unit of work. Waiting is a backend method because
+  readiness is not portable — on Windows `multiprocessing.connection.wait`
+  needs a real Win32 handle, so a subprocess pipe is not interchangeable there.
+- The value codec is now free functions parameterised by how a child value is
+  reached, so the same pickle-free format serves a directory on disk and a
+  connection to a peer. Content-addressing then deduplicates on the wire for
+  the reason it deduplicates on disk.
+- A worker that speaks a framed protocol over a pipe, with a handshake that
+  recomputes the function's fingerprint and refuses if the code it would run is
+  not the code the driver meant. It runs on this machine, which is the point:
+  the framing, codec, handshake and failure mapping are all exercised in CI
+  with no network involved.
+
 ## 0.4.0 — 2026-08-28
 
 ### Added

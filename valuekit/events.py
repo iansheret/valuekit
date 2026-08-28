@@ -50,14 +50,32 @@ _MAX_AGE = 7 * 24 * 3600  # seconds
 _FLUSH_INTERVAL = 0.25  # seconds between flushes
 
 
+_role_override: str | None = None
+
+
+def set_role(role: str) -> None:
+    """Declare this process a "driver" or a "worker".
+
+    A worker that was not started by :mod:`multiprocessing` cannot be
+    recognised by inspecting the process tree, so one says so instead.  Must
+    be called before the first event, since the role is recorded in the run
+    header.
+    """
+    global _role_override
+    _role_override = role
+
+
 def _role() -> str:
     """"driver" or "worker".
 
-    A batch spawns one process per input, each of which records its own
-    file; without this a twelve-input batch reads as thirteen runs.  Imported
-    here rather than at module scope to keep this module cheap for
-    :mod:`valuekit.pure`, which imports it.
+    A batch runs one worker per input, each recording its own file; without
+    this a twelve-input batch reads as thirteen runs.  The multiprocessing
+    check covers spawned workers, which do not announce themselves; anything
+    else has to call :func:`set_role`.  Imported here rather than at module
+    scope to keep this module cheap for :mod:`valuekit.pure`.
     """
+    if _role_override is not None:
+        return _role_override
     try:
         import multiprocessing
 

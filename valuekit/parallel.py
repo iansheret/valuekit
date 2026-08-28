@@ -74,6 +74,13 @@ _POLL = 0.2  # seconds between timeout checks while tasks are running
 # the run file already carries the pid, so a counter is identifier enough.
 _batch_seq = 0
 
+# Which backend a batch runs on.  Private and local-only for now: choosing
+# where work happens is a deployment question, so when it becomes settable
+# it will be settable from configuration, never from the call site -- a
+# host list in code could reach a fingerprint, and where a computation ran
+# must not be able to affect its result.
+_backend_factory = LocalBackend
+
 
 class Outcome:
     """The outcome of one input of a batch.
@@ -270,7 +277,7 @@ def run_all(
 
     events.emit(store, "batch", id=batch, fn=name, n=len(inputs), mode="parallel")
 
-    backend = LocalBackend(fn, cache_dir)
+    backend = _backend_factory(fn, cache_dir)
     workers = max_workers or backend.default_workers()
 
     # A deadline needs checking even while nothing is ready to read; a

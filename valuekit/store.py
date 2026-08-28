@@ -42,31 +42,16 @@ from __future__ import annotations
 
 import json
 import os
-import struct
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 
-from .map import ImmutableMap
-from .plaindata import (
-    is_dataclass_instance,
-    plain_data_class,
-    plain_data_state,
-    rebuild_plain_data,
-)
-from .values import (
-    content_hash,
-    custom_reduce,
-    custom_rebuild,
-    encode_key,
-    decode_key,
-    _blob,
-    _read_blob,
-)
+from .codec import SerializationError, decode, encode
+from .values import content_hash
 
 __all__ = ["CacheMiss", "SerializationError", "CacheStore", "LocalStore"]
 
@@ -75,11 +60,6 @@ FORMAT_VERSION = 5
 
 class CacheMiss(Exception):
     """A value or trace could not be retrieved; recompute."""
-
-
-class SerializationError(TypeError):
-    """A value cannot be stored. Only the fixed set of storable types may
-    appear in cached return values."""
 
 
 class CacheStore(Protocol):
@@ -167,70 +147,7 @@ class LocalStore:
         return h
 
     def _encode(self, v: Any) -> bytes:
-        t = type(v)
-        if t is tuple:
-            hs = [bytes.fromhex(self.put_value(x)) for x in v]
-            return _blob(b"T", b"".join(hs))
-        if t is list:
-            hs = [bytes.fromhex(self.put_value(x)) for x in v]
-            return _blob(b"L", b"".join(hs))
-        if t is frozenset:
-            hs = sorted(bytes.fromhex(self.put_value(x)) for x in v)
-            return _blob(b"F", b"".join(hs))
-        if t is set:
-            hs = sorted(bytes.fromhex(self.put_value(x)) for x in v)
-            return _blob(b"S", b"".join(hs))
-        if isinstance(v, ImmutableMap):
-            pairs = sorted(
-                (bytes.fromhex(self.put_value(k)), bytes.fromhex(self.put_value(val)))
-                for k, val in v.items()
-            )
-            return _blob(b"M", b"".join(k + val for k, val in pairs))
-        if isinstance(v, Mapping):
-            # Insertion order is preserved, matching how a plain mapping is
-            # hashed: it is observable, so it is part of the value.
-            pairs = [
-                (bytes.fromhex(self.put_value(k)), bytes.fromhex(self.put_value(val)))
-                for k, val in v.items()
-            ]
-            return _blob(b"D", b"".join(k + val for k, val in pairs))
-        reduced = custom_reduce(v)
-        if reduced is not None:
-            name, red = reduced
-            h = bytes.fromhex(self.put_value(red))
-            return _blob(b"C", _blob(b"s", name.encode("utf-8")) + h)
-        if is_dataclass_instance(v):
-            # A plain-data dataclass stores its identity beside its field
-            # values, so a class that has changed since is refused on the way
-            # back out rather than rebuilt into something it no longer means.
-            name, field_names, params_key, values = plain_data_state(v)
-            try:
-                plain_data_class(name)
-            except ValueError as e:
-                raise SerializationError(
-                    f"Cannot cache a {t.__name__!r}: {e}, so a stored entry "
-                    "could never be rebuilt. Define it at module level, or "
-                    "register it with valuekit.register_type()."
-                ) from None
-            h = bytes.fromhex(self.put_value(values))
-            return _blob(
-                b"P",
-                _blob(b"s", name.encode("utf-8"))
-                + _blob(b"s", ",".join(field_names).encode("utf-8"))
-                + _blob(b"s", params_key.encode("utf-8"))
-                + h,
-            )
-        try:
-            return _blob(b"I", encode_key(v))  # atomics + np scalars
-        except Exception:
-            raise SerializationError(
-                f"Cannot cache a value of type {t.__name__!r}. Cached return "
-                "values are limited to: None, bool, int, float, complex, str, "
-                "bytes, range, numpy scalars/arrays, tuples, lists, sets, "
-                "frozensets, dicts, ImmutableMaps and plain-data dataclasses "
-                "of the same -- or a type registered with a "
-                "reduce_fn/rebuild_fn via valuekit.register_type()."
-            ) from None
+        return encode(v, self.put_value)
 
     def get_value(self, h: str) -> Any:
         path = self._find(h)
@@ -249,42 +166,7 @@ class LocalStore:
             raise CacheMiss(f"{h}: {e}") from e
 
     def _decode(self, data: bytes) -> Any:
-        tag, body, pos = _read_blob(data, 0)
-        if pos != len(data):
-            raise ValueError("trailing bytes in stored value")
-        if tag == b"I":
-            return decode_key(body)
-        if tag == b"C":
-            _, name, p = _read_blob(body, 0)
-            reduced = self.get_value(body[p:].hex())
-            return custom_rebuild(name.decode("utf-8"), reduced)
-        if tag == b"P":
-            _, name, p = _read_blob(body, 0)
-            _, names, p = _read_blob(body, p)
-            _, params_key, p = _read_blob(body, p)
-            joined = names.decode("utf-8")
-            return rebuild_plain_data(
-                name.decode("utf-8"),
-                tuple(joined.split(",")) if joined else (),
-                params_key.decode("utf-8"),
-                self.get_value(body[p:].hex()),
-            )
-        n = 20  # raw digest size
-        hs = [body[i : i + n].hex() for i in range(0, len(body), n)]
-        if tag == b"T":
-            return tuple(self.get_value(x) for x in hs)
-        if tag == b"L":
-            return [self.get_value(x) for x in hs]
-        if tag == b"F":
-            return frozenset(self.get_value(x) for x in hs)
-        if tag == b"S":
-            return {self.get_value(x) for x in hs}
-        if tag in (b"M", b"D"):
-            d = {}
-            for i in range(0, len(hs), 2):
-                d[self.get_value(hs[i])] = self.get_value(hs[i + 1])
-            return ImmutableMap(d) if tag == b"M" else d
-        raise ValueError(f"unknown value tag {tag!r}")
+        return decode(data, self.get_value)
 
     # -- traces ---------------------------------------------------------------
 
