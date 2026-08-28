@@ -9,6 +9,7 @@ import functools
 import io
 import json
 import os
+import subprocess
 import sys
 import time
 import types
@@ -24,6 +25,7 @@ from valuekit import ImmutableMap, pure, freeze, content_hash
 from valuekit import codehash
 from valuekit import events
 from valuekit import parallel
+from valuekit import sync
 from valuekit import wire
 from valuekit.codehash import _classify, function_fingerprint
 from valuekit.store import LocalStore, CacheMiss, SerializationError
@@ -2698,15 +2700,18 @@ class TestWire:
             wire.unpack(root, objs)
 
 
-def _hello(fn, salt=None, fingerprint=None, cache_dir=""):
+def _hello(fn, salt=None, fingerprint=None, cache_dir="", mhash=""):
     from valuekit.pure import _salt
 
+    # An empty manifest hash means "no snapshot": the worker imports the way
+    # it always did, which is what the handshake tests are about.
     return wire.strings(
         salt or _salt(),
         fn.__module__,
         fn.__qualname__,
         fingerprint or function_fingerprint(fn)[0],
         cache_dir,
+        mhash,
     )
 
 
@@ -2750,6 +2755,7 @@ class TestWorkerHandshake:
             "work",
             function_fingerprint(m.process)[0],
             "",
+            "",
         )
         reason = _handshake(body)
         assert "__main__" in reason and "Move it to a module" in reason
@@ -2757,7 +2763,7 @@ class TestWorkerHandshake:
     def test_an_unimportable_module_refuses(self):
         from valuekit.pure import _salt
 
-        body = wire.strings(_salt(), "no_such_module_xyz", "f", "0" * 40, "")
+        body = wire.strings(_salt(), "no_such_module_xyz", "f", "0" * 40, "", "")
         assert "cannot import" in _handshake(body)
 
 
@@ -2842,3 +2848,226 @@ class TestPipeBackend:
             dbg.clear_all_breaks()
         (_, batch), = _events(cache, "batch")
         assert batch["mode"] == "sequential"
+
+
+# ===========================================================================
+# code sync
+# ===========================================================================
+#
+# The worker runs on this machine, so the driver's live tree is genuinely
+# reachable. That is exactly why these tests matter: without the snapshot and
+# the audit, a worker could import from the live tree and the whole feature
+# would look like it worked while proving nothing.
+
+
+def _project(tmp_path, body="def work(x):\n    return x + 100\n", extra=None):
+    """A small project tree with a marker file, as a real one would have."""
+    root = tmp_path / "proj"
+    root.mkdir(exist_ok=True)
+    (root / "pyproject.toml").write_text("[project]\nname='p'\nversion='0'\n")
+    (root / "vk_sync_mod.py").write_text(body)
+    for name, text in (extra or {}).items():
+        p = root / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+    return root
+
+
+def _load(root, name="vk_sync_mod"):
+    import importlib.util
+
+    sys.modules.pop(name, None)
+    spec = importlib.util.spec_from_file_location(name, root / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestSync:
+    @pytest.fixture(autouse=True)
+    def _cleanup(self):
+        yield
+        for name in [k for k in sys.modules if k.startswith("vk_sync_mod")]:
+            del sys.modules[name]
+
+    def test_untracked_files_are_included(self, tmp_path):
+        # The commonest edit-loop case: a helper written and not yet added.
+        root = _project(tmp_path, extra={"helper.py": "X = 1\n"})
+        rels = {rel for rel, _ in sync.manifest(str(root))}
+        assert {"vk_sync_mod.py", "helper.py", "pyproject.toml"} <= rels
+
+    def test_build_artefacts_are_never_shipped(self, tmp_path):
+        root = _project(
+            tmp_path,
+            extra={
+                "_core.so": "not really a binary",
+                "thing.o": "object file",
+                "__pycache__/x.cpython-311.pyc": "bytecode",
+            },
+        )
+        rels = {rel for rel, _ in sync.manifest(str(root))}
+        assert not any(r.endswith((".so", ".o", ".pyc")) for r in rels)
+        assert not any("__pycache__" in r for r in rels)
+
+    def test_the_cache_directory_is_not_packed_into_its_own_snapshot(self, tmp_path):
+        root = _project(tmp_path)
+        (root / "cache").mkdir()
+        (root / "cache" / "junk").write_text("x" * 100)
+        rels = {rel for rel, _ in sync.manifest(str(root), exclude=[root / "cache"])}
+        assert not any(r.startswith("cache") for r in rels)
+
+    def test_a_file_deleted_from_the_worktree_does_not_break_the_manifest(
+        self, tmp_path
+    ):
+        # git ls-files --cached reads the index, so a staged-then-deleted path
+        # is still listed and cannot be opened. There is no flag for it.
+        root = _project(tmp_path, extra={"gone.py": "x = 1\n"})
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        (root / "gone.py").unlink()
+        rels = {rel for rel, _ in sync.manifest(str(root))}
+        assert "vk_sync_mod.py" in rels and "gone.py" not in rels
+
+    def test_the_hash_is_stable_and_moves_with_content(self, tmp_path):
+        root = _project(tmp_path)
+        first = sync.manifest_hash(sync.manifest(str(root)))
+        assert first == sync.manifest_hash(sync.manifest(str(root)))
+        (root / "vk_sync_mod.py").write_text("def work(x):\n    return x + 999\n")
+        assert sync.manifest_hash(sync.manifest(str(root))) != first
+
+    def test_the_environment_is_not_user_code(self):
+        assert sync.is_environment(np.__file__)
+        assert not sync.is_environment(__file__)
+
+    def test_spans_that_are_not_files_are_ignored(self):
+        # Spans carry <string> for generated code, and stdlib paths for a user
+        # class whose methods came from elsewhere.
+        spans = [("<string>", 1, 2), ("relative.py", 1, 2), (np.__file__, 1, 2)]
+        assert sync.user_span_files(spans) == []
+
+    def test_a_packed_tree_round_trips(self, tmp_path):
+        root = _project(tmp_path, extra={"pkg/__init__.py": "", "pkg/a.py": "A = 2\n"})
+        entries = sync.manifest(str(root))
+        dest = tmp_path / "out"
+        dest.mkdir()
+        sync.extract_tree(sync.pack_tree(str(root), entries), str(dest))
+        assert (dest / "pkg" / "a.py").read_text() == "A = 2\n"
+        assert {p.name for p in dest.rglob("*.py")} == {
+            "vk_sync_mod.py", "__init__.py", "a.py"
+        }
+
+
+class TestSnapshot:
+    @pytest.fixture(autouse=True)
+    def _use_pipes(self, monkeypatch):
+        from valuekit.backend import PipeBackend
+
+        monkeypatch.setattr(parallel, "_backend_factory", PipeBackend)
+        yield
+        for name in [k for k in sys.modules if k.startswith("vk_sync_mod")]:
+            del sys.modules[name]
+
+    def test_a_batch_runs_from_a_snapshot(self, cache, tmp_path):
+        m = _load(_project(tmp_path))
+        assert vk.run_all(m.work, [1, 2]).values == [101, 102]
+        snaps = list((cache / "code").iterdir())
+        assert len(snaps) == 1 and (snaps[0] / "vk_sync_mod.py").exists()
+
+    def test_the_worker_imports_the_snapshot_not_the_live_tree(self, cache, tmp_path):
+        from valuekit.backend import PipeBackend
+
+        root = _project(tmp_path)
+        m = _load(root)
+        backend = PipeBackend(m.work, str(cache))
+        backend.ensure_ready()
+        # Delete the source outright. If the worker were resolving imports
+        # against the live tree this cannot survive.
+        (root / "vk_sync_mod.py").unlink()
+        handle = backend.start(7)
+        deadline = time.monotonic() + 30
+        while not handle.settled() and time.monotonic() < deadline:
+            backend.wait([handle], 0.2)
+        try:
+            assert handle.recv() == ("ok", 107)
+        finally:
+            handle.reap()
+
+    def test_an_edit_produces_a_new_snapshot_and_the_new_answer(self, cache, tmp_path):
+        root = _project(tmp_path)
+        m = _load(root)
+        assert vk.run_all(m.work, [1]).values == [101]
+        (root / "vk_sync_mod.py").write_text(
+            "def work(x):\n    return x + 999999\n"  # a different length: a
+        )                                            # same-length edit within
+        m = _load(root)                              # one second reloads the
+        assert vk.run_all(m.work, [1]).values == [1000000]  # stale .pyc
+        assert len(list((cache / "code").iterdir())) == 2  # both kept, immutable
+
+    def test_an_unchanged_tree_is_not_resent(self, cache, tmp_path):
+        from valuekit.backend import PipeBackend
+
+        m = _load(_project(tmp_path))
+        PipeBackend(m.work, str(cache)).ensure_ready()
+        before = (cache / "code").stat().st_mtime_ns
+        # A second backend over the same tree finds the snapshot already there
+        # and asks for nothing.
+        second = PipeBackend(m.work, str(cache))
+        second.ensure_ready()
+        assert (cache / "code").stat().st_mtime_ns == before
+        assert len(list((cache / "code").iterdir())) == 1
+
+    def test_a_half_built_snapshot_is_never_adopted(self, cache, tmp_path):
+        from valuekit.backend import PipeBackend
+
+        m = _load(_project(tmp_path))
+        backend = PipeBackend(m.work, str(cache))
+        # A directory with the right name but no .complete marker must not be
+        # mistaken for a finished snapshot.
+        half = cache / "code" / backend._hash
+        half.mkdir(parents=True)
+        (half / "vk_sync_mod.py").write_text("def work(x):\n    return 'WRONG'\n")
+        backend.ensure_ready()
+        assert vk.run_all(m.work, [1]).values == [101]
+
+    def test_a_dependency_outside_the_project_is_refused_before_dispatch(
+        self, cache, tmp_path
+    ):
+        outside = tmp_path / "sibling"
+        outside.mkdir()
+        (outside / "vk_sync_mod_far.py").write_text("def helper(x):\n    return x\n")
+        sys.path.insert(0, str(outside))
+        try:
+            _load(outside, "vk_sync_mod_far")
+            m = _load(
+                _project(
+                    tmp_path,
+                    body="import vk_sync_mod_far\n"
+                    "def work(x):\n    return vk_sync_mod_far.helper(x)\n",
+                )
+            )
+            with pytest.raises(RuntimeError, match="outside its project"):
+                vk.run_all(m.work, [1])
+        finally:
+            sys.path.remove(str(outside))
+            sys.modules.pop("vk_sync_mod_far", None)
+
+    def test_a_worker_without_safe_extraction_refuses_at_readiness(
+        self, cache, tmp_path, monkeypatch
+    ):
+        # tarfile grew filter= in 3.11.4; the project supports >=3.11, and
+        # hand-rolling a traversal filter for bytes from a peer is not our job.
+        monkeypatch.delattr(sync.tarfile, "data_filter", raising=False)
+        assert "3.11.4" in sync.check_extraction_supported()
+
+    def test_readiness_failure_is_one_error_not_one_per_input(self, cache, tmp_path):
+        from valuekit.backend import PipeBackend
+
+        m = _load(_project(tmp_path))
+        backend = PipeBackend(m.work, str(cache))
+        backend._ids = ("wrong-salt",) + backend._ids[1:]
+        backend._greeting = wire.strings(*backend._ids, *backend._roots)
+        with pytest.raises(RuntimeError, match="wrong-salt"):
+            backend.ensure_ready()

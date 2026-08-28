@@ -24,6 +24,20 @@ batch still runs in local processes.
   not the code the driver meant. It runs on this machine, which is the point:
   the framing, codec, handshake and failure mapping are all exercised in CI
   with no network involved.
+- Code sync. The driver describes its project as a manifest — tracked files
+  plus untracked ones that are not ignored, since the helper you just wrote and
+  have not `git add`ed is the commonest thing to be editing — and the worker
+  materialises an immutable snapshot named by the manifest hash and imports
+  from that. Build artefacts are never shipped, and neither is anything outside
+  the project: a dependency is the environment's job on both machines.
+- A readiness phase, once per host rather than once per input. Syncing,
+  importing and verifying happen before any input is claimed, so a sync
+  failure, a missing dependency or a compile error is reported as one fact
+  about the host instead of as an identical failure against every input.
+- After importing, the worker checks that every user module actually came from
+  the snapshot. A path entry is not proof: an editable install's meta-path
+  finder runs first and can silently win. That check is what separates running
+  the driver's code from running whatever the worker happened to have.
 
 ## 0.4.0 — 2026-08-28
 

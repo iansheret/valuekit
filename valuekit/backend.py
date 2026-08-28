@@ -319,45 +319,133 @@ class PipeBackend:
     def __init__(self, fn, cache_dir: str | None, python: str | None = None):
         import sys
 
-        self._fn = fn
-        self._cache_dir = cache_dir or ""
-        self._python = python or sys.executable
-        # A spawned process inherits sys.path through multiprocessing's
-        # preparation data; a plain subprocess does not, so it is handed over
-        # explicitly. Once a worker runs against a synced snapshot the path
-        # comes from there instead, and this goes away.
-        self._env = dict(os.environ)
-        self._env["PYTHONPATH"] = os.pathsep.join(
-            p for p in sys.path if p and os.path.isdir(p)
-        )
-
-        from . import wire
+        from . import sync, wire
         from .codehash import function_fingerprint
         from .pure import _salt
 
-        self._greeting = wire.strings(
+        self._fn = fn
+        self._cache_dir = cache_dir or ""
+        self._python = python or sys.executable
+        # No PYTHONPATH: a worker resolves imports through the snapshot, and
+        # handing over the driver's sys.path would let them resolve to the
+        # driver's live tree instead -- which on one machine would look like
+        # it worked while proving nothing.
+        self._env = dict(os.environ)
+        self._env.pop("PYTHONPATH", None)
+
+        self._root = sync.sync_root(fn)
+        self._entries = sync.manifest(
+            self._root, exclude=[self._cache_dir] if self._cache_dir else []
+        )
+        self._hash = sync.manifest_hash(self._entries)
+        self._roots = sync.import_roots(self._root)
+        self._ready = False
+
+        self._ids = (
             _salt(),
             getattr(fn, "__module__", "") or "",
             getattr(fn, "__qualname__", "") or "",
             function_fingerprint(fn)[0],
             self._cache_dir,
+            self._hash,
         )
+        self._greeting = wire.strings(*self._ids, *self._roots)
 
     def default_workers(self) -> int:
         return os.cpu_count() or 1
 
-    def start(self, x: Any) -> _PipeHandle:
+    def _spawn(self, extra: list[str], quiet: bool = True):
         import subprocess
 
-        from . import wire
-
-        proc = subprocess.Popen(
-            [self._python, "-m", "valuekit.worker"],
+        return subprocess.Popen(
+            [self._python, "-m", "valuekit.worker", *extra],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL if quiet else subprocess.PIPE,
             env=self._env,
+            cwd=self._cache_dir or None,
         )
+
+    def ensure_ready(self) -> None:
+        """Sync and verify this host once, before any input is dispatched.
+
+        A failure here is a fact about the host, so it is raised as one
+        rather than recorded against whichever input happened to go first.
+        """
+        from . import sync, wire
+
+        if self._ready:
+            return
+        self._preflight()
+        proc = self._spawn(["--ready"], quiet=False)
+        try:
+            wire.write_frame(proc.stdin, wire.SYNC, self._greeting)
+            frame = wire.read_frame(proc.stdout)
+            if frame is None or frame[0] != wire.WANT:
+                raise RuntimeError(self._why(proc, "the worker said nothing"))
+            if frame[1]:
+                wire.write_frame(
+                    proc.stdin, wire.TREE, sync.pack_tree(self._root, self._entries)
+                )
+            frame = wire.read_frame(proc.stdout)
+            if frame is None or frame[0] != wire.READY:
+                raise RuntimeError(self._why(proc, "the worker never reported"))
+            if frame[1]:
+                raise RuntimeError(frame[1].decode("utf-8", "replace"))
+        finally:
+            for stream in (proc.stdin, proc.stdout):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+        self._ready = True
+
+    def _preflight(self) -> None:
+        """Refuse a dependency the snapshot could never contain.
+
+        Only the outside-the-project case is checked here, because it is the
+        only one the worker cannot explain for itself: it would report
+        "cannot import X" without being able to say that X lives in a sibling
+        checkout the driver never offered to send.  A file inside the project
+        but excluded from the manifest already fails loudly at import, which
+        is diagnosis enough without a second mechanism.
+        """
+        from . import sync
+        from .codehash import function_fingerprint
+
+        try:
+            spans = function_fingerprint(self._fn)[1]
+        except Exception:
+            return
+        root = os.path.realpath(self._root)
+        outside = [f for f in sync.user_span_files(spans) if not sync._under(f, root)]
+        if outside:
+            listed = "\n  ".join(sorted(outside))
+            raise RuntimeError(
+                f"{getattr(self._fn, '__qualname__', self._fn)} depends on user "
+                f"code outside its project at {root}, which cannot be sent to a "
+                f"worker:\n  {listed}\n"
+                "Move it into the project, or install it as a package so both "
+                "machines resolve it the same way."
+            )
+
+    @staticmethod
+    def _why(proc, fallback: str) -> str:
+        """Fold the worker's stderr into the reason it gave none."""
+        try:
+            err = proc.stderr.read().decode("utf-8", "replace").strip()
+        except Exception:
+            err = ""
+        return f"{fallback}:\n{err}" if err else fallback
+
+    def start(self, x: Any) -> _PipeHandle:
+        from . import wire
+
+        proc = self._spawn([])
         handle = _PipeHandle(proc)
         try:
             wire.write_frame(proc.stdin, wire.HELLO, self._greeting)

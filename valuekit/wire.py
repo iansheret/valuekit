@@ -42,7 +42,10 @@ OBJECT = b"\x03"  # either way: one content-addressed object
 TASK = b"\x04"  # driver -> worker: the root hash of the input
 RESULT = b"\x05"  # worker -> driver: ok or error
 EVENT = b"\x06"  # reserved: worker -> driver events, once the
-                 # worker is on another filesystem (step 3)
+                 # worker is on another filesystem
+SYNC = b"\x07"  # driver -> worker: manifest hash and import roots
+WANT = b"\x08"  # worker -> driver: empty if it has the snapshot already
+TREE = b"\x09"  # driver -> worker: the project tree, packed
 
 
 class WireError(Exception):

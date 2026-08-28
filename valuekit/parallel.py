@@ -278,6 +278,15 @@ def run_all(
     events.emit(store, "batch", id=batch, fn=name, n=len(inputs), mode="parallel")
 
     backend = _backend_factory(fn, cache_dir)
+
+    # Whatever a backend must do once before it can take work -- syncing the
+    # project, checking the environment -- happens here, before any input is
+    # claimed. A failure is a fact about the host, so it is raised as one
+    # rather than recorded identically against every input.
+    ensure_ready = getattr(backend, "ensure_ready", None)
+    if ensure_ready is not None:
+        ensure_ready()
+
     workers = max_workers or backend.default_workers()
 
     # A deadline needs checking even while nothing is ready to read; a
