@@ -367,6 +367,53 @@ set_cache_dir(os.environ.get("VALUEKIT_CACHE"))   # None disables caching
 Nothing is cached until `set_cache_dir` is called: importing valuekit has no
 effect on its own.
 
+## Watching a run
+
+A cache that works is silent, which makes it hard to tell from one that
+doesn't: a step that ought to be hitting and quietly isn't looks exactly
+like a step that is slow. `python -m valuekit.monitor` shows what is
+actually happening, from a separate process:
+
+```
+$ python -m valuekit.monitor ~/.cache/mypipeline
+
+runs: 1 live, 9 workers, 0 finished
+
+  pid 97702    process_scenarios.py         up 2.7s
+
+batches
+  process                  [################........] 8/12  2.7s  1 failed
+
+this run
+  function                        hits  misses    rate  forced  errors      time
+  calculate_geometry                11       0    100%       0       0        1ms
+  detrend                            0       9      0%       0       0       3.7s
+
+failures
+      1.9s ago  process[5]                               RuntimeError
+```
+
+The hit rate is the number to look at. Everything else is context for it.
+
+Start it whenever you like, including twenty minutes into a long run — it
+reads what has been recorded so far rather than needing to have been
+watching from the beginning. It only reads, so nothing it does can affect
+the run. Run it over ssh on the machine doing the work if that is where the
+work is.
+
+Events go in `runs/` inside the cache directory, one file per process, and
+nothing is recorded until `set_cache_dir` has been called — the same rule as
+everything else here. That does mean a `run_all` batch with no cache
+directory is not observable. The monitor takes the cache directory as an
+argument, falling back to `$VALUEKIT_CACHE`.
+
+There is nothing to switch on and no way to get it wrong: emission never
+fails a run, an unwritable directory just disables it, old run files are
+reaped, and a run that produces a huge number of events stops recording
+detail rather than filling a disk. It costs about 3 µs per `@pure` call —
+under a tenth of a cache hit, which is dominated by reading the function's
+trace file.
+
 ## Install
 
 ```

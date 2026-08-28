@@ -12,6 +12,7 @@ import sys
 import types
 import warnings
 from importlib.machinery import EXTENSION_SUFFIXES
+from pathlib import Path as _Path
 
 import numpy as np
 import pytest
@@ -19,6 +20,7 @@ import pytest
 import valuekit as vk
 from valuekit import ImmutableMap, pure, freeze, content_hash
 from valuekit import codehash
+from valuekit import events
 from valuekit.codehash import _classify, function_fingerprint
 from valuekit.store import LocalStore, CacheMiss, SerializationError
 from valuekit.values import encode_key, decode_key
@@ -2428,3 +2430,181 @@ class TestRunAll:
 
         assert vk.run_all(batch, [1, 2, 3]).values == [2, 3, 4]
         assert calls == [1, 2, 3]  # sequential, in-process: breakpoints fire
+
+
+# ===========================================================================
+# run events
+# ===========================================================================
+#
+# The cache's whole promise is that it can stay on, and none of it is
+# visible from outside: a step that ought to hit and silently does not looks
+# exactly like a slow one. These assert what the event stream records.
+
+
+def _events(cache_dir, ev=None):
+    """Every event under a cache directory, oldest first, optionally of one
+    kind. Reads the files back and parses them, the same out-of-band shape
+    the batch tests already use for execution counts."""
+    events._flush()  # writes are batched on an interval; force them out
+    out = []
+    runs = _Path(cache_dir) / "runs"
+    for p in sorted(runs.glob("*.jsonl")) if runs.exists() else []:
+        for line in p.read_text().splitlines():
+            if line.strip():
+                out.append((p.name, json.loads(line)))
+    out.sort(key=lambda pe: pe[1]["t"])
+    return [(s, e) for s, e in out if ev is None or e["ev"] == ev]
+
+
+class TestEvents:
+    def test_miss_then_hit(self, cache):
+        @pure
+        def step(x):
+            return x + 1
+
+        assert step(1) == 2 and step(1) == 2
+        kinds = [e["ev"] for _, e in _events(cache) if e["ev"] in ("hit", "miss")]
+        assert kinds == ["miss", "hit"]
+        (_, hit), = _events(cache, "hit")
+        # The full qualname, matching what a stored trace records.
+        assert hit["fn"].endswith("step") and hit["dur"] >= 0
+
+    def test_lookup_and_execution_are_timed_separately(self, cache):
+        @pure
+        def step(x):
+            return x + 1
+
+        step(1)
+        (_, miss), = _events(cache, "miss")
+        # A miss carries both; a hit never executed, so it carries only dur.
+        assert "exec" in miss and "dur" in miss and miss["stored"] is True
+        step(1)
+        (_, hit), = _events(cache, "hit")
+        assert "exec" not in hit
+
+    def test_evicted_value_is_not_reported_as_a_hit(self, cache):
+        # A trace can match and the value still be gone; the lookup falls
+        # through to the next candidate, so reporting the match would
+        # overcount hits.
+        @pure
+        def step(x):
+            return x + 1
+
+        step(1)
+        for obj in (cache / "objects").rglob("*"):
+            if obj.is_file():
+                obj.unlink()
+        assert step(1) == 2  # recomputed
+        assert _events(cache, "hit") == []
+        assert len(_events(cache, "miss")) == 2
+
+    def test_breakpoint_reports_forced_not_hit(self, cache, monkeypatch):
+        import bdb
+
+        @pure
+        def step(x):
+            return x + 1
+
+        step(1)  # recorded
+        fname, lo, _ = step._valuekit_identity()[1][0]
+        dbg = bdb.Bdb()
+        dbg.set_break(fname, lo + 1)
+        monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
+        try:
+            assert step(1) == 2
+        finally:
+            dbg.clear_all_breaks()
+        assert [e["ev"] for _, e in _events(cache, "forced")] == ["forced"]
+        assert _events(cache, "hit") == []
+
+    def test_raising_body_is_reported_and_still_raises(self, cache):
+        @pure
+        def step(x):
+            raise ValueError("nope")
+
+        with pytest.raises(ValueError, match="nope"):
+            step(1)
+        (_, err), = _events(cache, "error")
+        assert err["exc"] == "ValueError" and err["fn"].endswith("step")
+        assert _events(cache, "miss") == []  # nothing was stored
+
+    def test_nothing_is_written_without_a_cache_directory(self, tmp_path):
+        # The documented rule: the cache directory is where valuekit writes,
+        # and nothing is written until one is named.
+        @pure
+        def step(x):
+            return x + 1
+
+        assert step(1) == 2
+        assert not (tmp_path / "runs").exists()
+
+    def test_run_all_reports_batch_outcomes_and_end(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.process, [1, 2, 4], max_workers=2)
+        assert len(r) == 3
+
+        (_, batch), = _events(cache, "batch")
+        assert batch["n"] == 3 and batch["mode"] == "parallel"
+        outcomes = [e for _, e in _events(cache, "outcome")]
+        assert sorted(o["i"] for o in outcomes) == [0, 1, 2]
+        assert all(o["ok"] and o["host"] == "local" for o in outcomes)
+        assert [e["id"] for _, e in _events(cache, "end")] == [batch["id"]]
+
+    def test_run_all_reports_a_failure_against_its_input(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        vk.run_all(m.process, [1, 3, 4])
+        failed = [e for _, e in _events(cache, "outcome") if not e["ok"]]
+        assert len(failed) == 1 and failed[0]["i"] == 1
+        assert failed[0]["exc"] == "ValueError"
+
+    def test_workers_write_their_own_files(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        vk.run_all(m.process, [1, 2, 4], max_workers=3)
+        by_pid = {}
+        for source, e in _events(cache, "run"):
+            by_pid.setdefault(e["pid"], set()).add(source)
+        # No file is shared between processes: concurrent appends are what
+        # does not work on Windows.
+        assert all(len(files) == 1 for files in by_pid.values())
+        roles = [e["role"] for _, e in _events(cache, "run")]
+        assert roles.count("driver") == 1 and roles.count("worker") == 3
+
+    def test_sequential_fallback_still_reports(self, cache, tmp_path, monkeypatch):
+        import bdb
+
+        m, _ = _write_batch_module(tmp_path)
+        fname, lo, _ = function_fingerprint(m.process)[1][0]
+        dbg = bdb.Bdb()
+        dbg.set_break(fname, lo + 1)
+        monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
+        try:
+            vk.run_all(m.process, [1, 2])
+        finally:
+            dbg.clear_all_breaks()
+        (_, batch), = _events(cache, "batch")
+        assert batch["mode"] == "sequential"  # debugging a batch is not dark
+        assert len(_events(cache, "outcome")) == 2
+
+    def test_emission_failure_does_not_break_a_run(self, cache):
+        # A diagnostic that can break a pipeline is worse than no diagnostic.
+        # A plain file where the directory belongs makes the mkdir fail, so
+        # this is the real failure rather than a patched one.
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "runs").write_text("in the way")
+
+        @pure
+        def step(x):
+            return x + 1
+
+        assert step(1) == 2 and step(1) == 2  # hit and miss both survive
+        assert (cache / "runs").is_file()
+
+    def test_existing_cache_opens_with_runs_beside_it(self, cache):
+        @pure
+        def step(x):
+            return x + 1
+
+        step(1)
+        assert (cache / "runs").is_dir()
+        # runs/ is additive: the format guard still accepts the directory.
+        assert LocalStore(cache).get_traces("nothing") == []

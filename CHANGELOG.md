@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.0 — 2026-08-28
+
+### Added
+
+- A running pipeline can now be watched from a separate process.
+  `python -m valuekit.monitor <cache-dir>` shows, live, the hit rate per
+  function, batch progress, and failures. It attaches whenever you start it,
+  including part-way through a long run, and only ever reads: nothing it does
+  can affect the run it is watching.
+
+  The hit rate is the point. It is what the library promises and the one thing
+  that was previously invisible — a step that ought to be hitting and silently
+  is not looks exactly like a slow step.
+
+  Events are written to `runs/` inside the configured cache directory, one file
+  per process, and nothing is written until `set_cache_dir` is called: the rule
+  is unchanged, the cache directory is where valuekit writes. A batch run with
+  no cache directory is therefore not observable. Old run files are reaped, and
+  a file that reaches its size cap stops recording detail and counts what it
+  dropped rather than filling a disk.
+
+  Emission never fails a run: an unwritable directory or a full disk disables it
+  for that process and changes nothing else. It costs roughly 3 µs per `@pure`
+  call, under a tenth of the cost of a cache hit, which is dominated by reading
+  and parsing the function's trace file.
+
 ## 0.3.1 — 2026-08-27
 
 ### Fixed

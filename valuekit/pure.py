@@ -39,8 +39,10 @@ import hashlib
 import inspect
 import os
 import sys
+import time
 from typing import Any, Callable
 
+from . import events
 from .codehash import _module_unit, _unit_digest, function_fingerprint
 from .debughook import breakpoints_force
 from .map import ImmutableMap, map_digest
@@ -280,6 +282,7 @@ def pure(fn: Callable):
         if breakpoints_force(spans):
             global _force_epoch
             _force_epoch += 1
+            events.emit(store, "forced", fn=qn, key=fn_key)
             return fn(*args, **kwargs)
 
         bound = sig.bind(*args, **kwargs)
@@ -296,12 +299,23 @@ def pure(fn: Callable):
         }
 
         # -- lookup ---------------------------------------------------------
+        t_lookup = time.perf_counter()
         for trace in store.get_traces(fn_key):
             if _match_trace(trace, arguments, arg_hashes):
                 try:
-                    return store.get_value(trace["result"])
+                    value = store.get_value(trace["result"])
                 except CacheMiss:
                     continue  # value evicted/corrupt: try others, else rerun
+                # Only now is the hit real: a CacheMiss above falls through
+                # to the next candidate, so reporting a match would overcount.
+                events.emit(
+                    store,
+                    "hit",
+                    fn=qn,
+                    key=fn_key,
+                    dur=time.perf_counter() - t_lookup,
+                )
+                return value
 
         # Wrap ImmutableMap arguments so their reads are observed; everything
         # else is passed through untouched and depended on whole.
@@ -313,7 +327,15 @@ def pure(fn: Callable):
                 bound.arguments[name] = RecordingMap(v, rec)
 
         epoch_before = _force_epoch
-        result = fn(*bound.args, **bound.kwargs)  # exceptions: cache untouched
+        t_exec = time.perf_counter()
+        try:
+            result = fn(*bound.args, **bound.kwargs)  # exceptions: cache untouched
+        except BaseException as e:
+            # Report and re-raise unchanged: the cache is still untouched,
+            # and a body that raises is otherwise invisible from outside.
+            events.emit(store, "error", fn=qn, key=fn_key, exc=type(e).__name__)
+            raise
+        exec_dur = time.perf_counter() - t_exec
 
         # A proxy must not outlive the call it belongs to, wherever in the
         # result it sits.
@@ -324,6 +346,15 @@ def pure(fn: Callable):
             # Something in this call's dynamic extent was debugger-forced
             # (a breakpoint appeared after our own entry check): this result
             # may reflect a debug session, so it must not be persisted.
+            events.emit(
+                store,
+                "miss",
+                fn=qn,
+                key=fn_key,
+                dur=time.perf_counter() - t_lookup,
+                exec=exec_dur,
+                stored=False,
+            )
             return result
 
         # Store before finalising the recorders, so that a proxy reached only
@@ -340,6 +371,15 @@ def pure(fn: Callable):
             fn_key,
             {"fn": qn, "deps": deps, "result": result_hash},
             units=units,
+        )
+        events.emit(
+            store,
+            "miss",
+            fn=qn,
+            key=fn_key,
+            dur=time.perf_counter() - t_lookup,
+            exec=exec_dur,
+            stored=True,
         )
         return result
 

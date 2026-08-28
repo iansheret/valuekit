@@ -58,6 +58,7 @@ from collections import deque
 from multiprocessing import connection as _mp_connection
 from typing import Any, Callable, Iterable, Iterator
 
+from . import events
 from .codehash import function_fingerprint
 from .debughook import breakpoints_force
 from .store import LocalStore
@@ -65,6 +66,10 @@ from .store import LocalStore
 __all__ = ["run_all", "BatchResult", "Outcome"]
 
 _POLL = 0.2  # seconds between timeout checks while tasks are running
+
+# Distinguishes concurrent batches within one process in the event stream;
+# the run file already carries the pid, so a counter is identifier enough.
+_batch_seq = 0
 
 
 class Outcome:
@@ -263,6 +268,19 @@ def run_all(
     """
     inputs = list(inputs)
 
+    # Resolved before the breakpoint check below, so that the sequential
+    # fallback reports itself too: a batch being debugged is one you most
+    # want to watch.
+    from .pure import _current_store
+
+    store = _current_store()
+    cache_dir = str(store.root) if isinstance(store, LocalStore) else None
+    name = getattr(fn, "__qualname__", repr(fn))
+
+    global _batch_seq
+    _batch_seq += 1
+    batch = _batch_seq
+
     # A live breakpoint anywhere reachable from fn: run sequentially, in
     # this process, so the breakpoint fires and the debugger contract
     # applies.  (Also covers VALUEKIT_ALWAYS_RUN.)
@@ -271,16 +289,22 @@ def run_all(
     except Exception:
         spans = []
     if breakpoints_force(spans):
-        return BatchResult(Outcome(x, value=fn(x)) for x in inputs)
+        events.emit(
+            store, "batch", id=batch, fn=name, n=len(inputs), mode="sequential"
+        )
+        seq: list[Outcome] = []
+        try:
+            for i, x in enumerate(inputs):
+                seq.append(Outcome(x, value=fn(x)))  # exceptions propagate
+                events.emit(store, "outcome", id=batch, i=i, ok=True, host="local")
+        finally:
+            events.emit(store, "end", id=batch)
+        return BatchResult(seq)
 
-    from .pure import _current_store
-
-    store = _current_store()
-    cache_dir = str(store.root) if isinstance(store, LocalStore) else None
+    events.emit(store, "batch", id=batch, fn=name, n=len(inputs), mode="parallel")
 
     ctx = multiprocessing.get_context("spawn")
     workers = max_workers or os.cpu_count() or 1
-    name = getattr(fn, "__qualname__", repr(fn))
 
     outcomes: list[Outcome | None] = [None] * len(inputs)
     queue = deque(enumerate(inputs))
@@ -328,7 +352,18 @@ def run_all(
                 running.remove(t)
                 t.proc.join()
                 t.conn.close()
-                outcomes[t.idx] = _harvest(t, msg, name, timeout)
+                o = _harvest(t, msg, name, timeout)
+                outcomes[t.idx] = o
+                exc = o.exception()
+                events.emit(
+                    store,
+                    "outcome",
+                    id=batch,
+                    i=t.idx,
+                    ok=exc is None,
+                    host="local",
+                    exc=None if exc is None else type(exc).__name__,
+                )
     finally:
         # Covers KeyboardInterrupt: no orphans.
         for t in running:
@@ -336,5 +371,8 @@ def run_all(
                 t.proc.kill()
             except Exception:
                 pass
+        # In the finally, not after the return: an interrupted batch is
+        # exactly the one whose final state is worth having.
+        events.emit(store, "end", id=batch)
 
     return BatchResult(o for o in outcomes if o is not None)
