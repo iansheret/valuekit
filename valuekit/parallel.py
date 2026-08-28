@@ -38,6 +38,12 @@ from ``fn``, the whole batch runs sequentially in this process, where
 breakpoints fire and the usual debugger rules apply.  The sequential
 fallback does not enforce the timeout.
 
+This module owns the scheduling -- admission, deadlines, input-order
+reassembly, and attributing each failure to the input that caused it --
+while :mod:`valuekit.backend` owns starting and killing a unit of work.
+The split is what lets work run somewhere other than this machine without
+the scheduling being written twice.
+
 Workers are configured automatically (each process applies the parent's
 cache directory before running) and share the cache: value writes are
 idempotent and trace writes are atomic appends, so concurrent writers
@@ -50,15 +56,12 @@ itself start processes (parallelise in this driver, not inside it).
 
 from __future__ import annotations
 
-import multiprocessing
-import os
 import time
-import traceback
 from collections import deque
-from multiprocessing import connection as _mp_connection
 from typing import Any, Callable, Iterable, Iterator
 
 from . import events
+from .backend import LocalBackend
 from .codehash import function_fingerprint
 from .debughook import breakpoints_force
 from .store import LocalStore
@@ -168,48 +171,13 @@ class _RemoteTraceback(Exception):
         return self.tb
 
 
-def _child_main(conn, cache_dir: str | None, fn, x) -> None:
-    """Runs in the worker process: configure the cache, run one input, send
-    one message back: ("ok", value) or ("err", exc, tb) or, when the
-    exception or value cannot be pickled, ("err_str", type_name, text, tb).
-    """
-    try:
-        if cache_dir is not None:
-            from .pure import set_cache_dir
-
-            set_cache_dir(cache_dir)
-        try:
-            value = fn(x)
-        except BaseException as e:
-            tb = traceback.format_exc()
-            try:
-                conn.send(("err", e, tb))
-            except Exception:
-                conn.send(("err_str", type(e).__name__, str(e), tb))
-            return
-        try:
-            conn.send(("ok", value))
-        except Exception as e:
-            conn.send(
-                (
-                    "err_str",
-                    type(e).__name__,
-                    f"the result could not be sent back: {e}",
-                    traceback.format_exc(),
-                )
-            )
-    finally:
-        conn.close()
-
-
 class _Task:
-    __slots__ = ("x", "idx", "proc", "conn", "deadline", "timed_out")
+    __slots__ = ("x", "idx", "handle", "deadline", "timed_out")
 
-    def __init__(self, x, idx, proc, conn, deadline):
+    def __init__(self, x, idx, handle, deadline):
         self.x = x
         self.idx = idx
-        self.proc = proc
-        self.conn = conn
+        self.handle = handle
         self.deadline = deadline
         self.timed_out = False
 
@@ -227,9 +195,8 @@ def _harvest(t: _Task, msg, name: str, timeout) -> Outcome:
         else:
             exc = RuntimeError(
                 f"a worker died without raising while processing "
-                f"{name}({t.x!r}) (exit code {t.proc.exitcode}; a segfault "
-                f"or an out-of-memory kill?). Completed steps are cached; "
-                f"call {name}({t.x!r}) yourself to debug it."
+                f"{name}({t.x!r}) ({t.handle.death()}). Completed steps are "
+                f"cached; call {name}({t.x!r}) yourself to debug it."
             )
         return Outcome(t.x, exc=exc)
     kind = msg[0]
@@ -303,22 +270,26 @@ def run_all(
 
     events.emit(store, "batch", id=batch, fn=name, n=len(inputs), mode="parallel")
 
-    ctx = multiprocessing.get_context("spawn")
-    workers = max_workers or os.cpu_count() or 1
+    backend = LocalBackend(fn, cache_dir)
+    workers = max_workers or backend.default_workers()
+
+    # A deadline needs checking even while nothing is ready to read; a
+    # backend may also want waking periodically for its own reasons.
+    intervals = [
+        p
+        for p in (_POLL if timeout is not None else None, backend.poll_interval)
+        if p is not None
+    ]
+    poll = min(intervals) if intervals else None
 
     outcomes: list[Outcome | None] = [None] * len(inputs)
     queue = deque(enumerate(inputs))
     running: list[_Task] = []
 
     def _start(idx: int, x: Any) -> None:
-        recv_end, send_end = ctx.Pipe(duplex=False)
-        proc = ctx.Process(
-            target=_child_main, args=(send_end, cache_dir, fn, x), daemon=True
-        )
-        proc.start()
-        send_end.close()  # keep only the child's handle: EOF then means death
+        handle = backend.start(x)
         deadline = time.monotonic() + timeout if timeout is not None else None
-        running.append(_Task(x, idx, proc, recv_end, deadline))
+        running.append(_Task(x, idx, handle, deadline))
 
     try:
         while queue or running:
@@ -326,32 +297,21 @@ def run_all(
                 _start(*queue.popleft())
             if not running:
                 break
-            ready = _mp_connection.wait(
-                [t.conn for t in running],
-                timeout=_POLL if timeout is not None else None,
-            )
+            ready = backend.wait([t.handle for t in running], timeout=poll)
             now = time.monotonic()
             for t in list(running):
                 msg = None
-                if t.conn in ready:
-                    try:
-                        msg = t.conn.recv()
-                    except EOFError:
-                        msg = None  # died without sending
+                if t.handle in ready:
+                    msg = t.handle.recv()
                 elif t.deadline is not None and now >= t.deadline:
-                    t.proc.kill()
-                    t.proc.join()
-                    if t.conn.poll():  # finished just before the kill landed
-                        try:
-                            msg = t.conn.recv()
-                        except EOFError:
-                            msg = None
+                    t.handle.kill()
+                    if t.handle.poll():  # finished just before the kill landed
+                        msg = t.handle.recv()
                     t.timed_out = msg is None
                 else:
                     continue
                 running.remove(t)
-                t.proc.join()
-                t.conn.close()
+                t.handle.reap()
                 o = _harvest(t, msg, name, timeout)
                 outcomes[t.idx] = o
                 exc = o.exception()
@@ -368,9 +328,10 @@ def run_all(
         # Covers KeyboardInterrupt: no orphans.
         for t in running:
             try:
-                t.proc.kill()
+                t.handle.kill()
             except Exception:
                 pass
+        backend.close()
         # In the finally, not after the return: an interrupted batch is
         # exactly the one whose final state is worth having.
         events.emit(store, "end", id=batch)
