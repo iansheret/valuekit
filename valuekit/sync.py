@@ -177,26 +177,33 @@ def sync_root(fn: Any) -> str:
     return str(here)
 
 
-_file_digests: dict[tuple, str] = {}
-
-
 def _file_digest(path: str) -> str | None:
-    """Content digest of a file, memoised on its identity and mtime."""
+    """Content digest of a file, or None if it cannot be read.
+
+    Deliberately not memoised on ``(mtime, size)``, the way an extension
+    binary's digest is in :mod:`valuekit.codehash`.  That key fails in the
+    dangerous direction here: a file whose content changes without moving
+    its mtime or its size -- a same-size edit within one tick on a
+    coarse-mtime filesystem such as HFS+, ext3 or exFAT -- would keep its old
+    digest, leave the manifest hash unmoved, and let a worker reuse a
+    snapshot of the previous source.  A remote quietly running stale code is
+    the worst outcome this library has.
+
+    The cost of not memoising is small for the same reason whole-tree
+    transfer is affordable: the boundary rule keeps a project tree to its own
+    source, with no libraries, vendored dependencies or build output.  A tree
+    small enough to ship every time is small enough to hash every time.
+
+    Reads through symlinks, so the snapshot holds real files.
+    """
+    h = _new_hasher()
     try:
-        st = os.stat(path)  # follows symlinks: the snapshot holds real files
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
     except OSError:
-        return None
-    key = (path, st.st_mtime_ns, st.st_size)
-    if key not in _file_digests:
-        h = _new_hasher()
-        try:
-            with open(path, "rb") as f:
-                for block in iter(lambda: f.read(1 << 20), b""):
-                    h.update(block)
-        except OSError:
-            return None
-        _file_digests[key] = h.hexdigest()
-    return _file_digests[key]
+        return None  # staged-then-deleted, or vanished under us
+    return h.hexdigest()
 
 
 def _skip(rel: str) -> bool:

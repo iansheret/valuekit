@@ -2938,6 +2938,26 @@ class TestSync:
         (root / "vk_sync_mod.py").write_text("def work(x):\n    return x + 999\n")
         assert sync.manifest_hash(sync.manifest(str(root))) != first
 
+    def test_content_is_hashed_even_when_mtime_and_size_do_not_move(
+        self, tmp_path
+    ):
+        # Memoising a file digest on (mtime, size) fails in the dangerous
+        # direction: a same-size edit within one tick on a coarse-mtime
+        # filesystem would keep the old digest, leave the manifest hash
+        # unmoved, and let a worker reuse a snapshot of the previous source.
+        root = _project(tmp_path)
+        f = root / "vk_sync_mod.py"
+        before = os.stat(f)
+        first = sync.manifest_hash(sync.manifest(str(root)))
+
+        f.write_text("def work(x):\n    return x + 999\n")  # same length
+        os.utime(f, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = os.stat(f)
+        assert after.st_size == before.st_size
+        assert after.st_mtime_ns == before.st_mtime_ns
+
+        assert sync.manifest_hash(sync.manifest(str(root))) != first
+
     def test_the_environment_is_not_user_code(self):
         assert sync.is_environment(np.__file__)
         assert not sync.is_environment(__file__)
