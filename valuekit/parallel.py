@@ -60,7 +60,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Iterable, Iterator
 
-from . import events
+from . import runlog
 from .backend import LocalBackend
 from .codehash import function_fingerprint
 from .debughook import breakpoints_force
@@ -70,7 +70,7 @@ __all__ = ["run_all", "BatchResult", "Outcome"]
 
 _POLL = 0.2  # seconds between timeout checks while tasks are running
 
-# Distinguishes concurrent batches within one process in the event stream;
+# Distinguishes concurrent batches within one process in the run log;
 # the run file already carries the pid, so a counter is identifier enough.
 _batch_seq = 0
 
@@ -263,19 +263,19 @@ def run_all(
     except Exception:
         spans = []
     if breakpoints_force(spans):
-        events.emit(
+        runlog.record(
             store, "batch", id=batch, fn=name, n=len(inputs), mode="sequential"
         )
         seq: list[Outcome] = []
         try:
             for i, x in enumerate(inputs):
                 seq.append(Outcome(x, value=fn(x)))  # exceptions propagate
-                events.emit(store, "outcome", id=batch, i=i, ok=True, host="local")
+                runlog.record(store, "outcome", id=batch, i=i, ok=True, host="local")
         finally:
-            events.emit(store, "end", id=batch)
+            runlog.record(store, "end", id=batch)
         return BatchResult(seq)
 
-    events.emit(store, "batch", id=batch, fn=name, n=len(inputs), mode="parallel")
+    runlog.record(store, "batch", id=batch, fn=name, n=len(inputs), mode="parallel")
 
     backend = _backend_factory(fn, cache_dir)
 
@@ -331,7 +331,7 @@ def run_all(
                 o = _harvest(t, msg, name, timeout)
                 outcomes[t.idx] = o
                 exc = o.exception()
-                events.emit(
+                runlog.record(
                     store,
                     "outcome",
                     id=batch,
@@ -350,6 +350,6 @@ def run_all(
         backend.close()
         # In the finally, not after the return: an interrupted batch is
         # exactly the one whose final state is worth having.
-        events.emit(store, "end", id=batch)
+        runlog.record(store, "end", id=batch)
 
     return BatchResult(o for o in outcomes if o is not None)

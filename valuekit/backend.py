@@ -326,7 +326,7 @@ class PipeBackend:
         self._fn = fn
         self._cache_dir = cache_dir or ""
         self._python = python or sys.executable
-        # No PYTHONPATH: a worker resolves imports through the snapshot, and
+        # No PYTHONPATH: a worker resolves imports through its source tree, and
         # handing over the driver's sys.path would let them resolve to the
         # driver's live tree instead -- which on one machine would look like
         # it worked while proving nothing.
@@ -405,7 +405,7 @@ class PipeBackend:
         self._ready = True
 
     def _preflight(self) -> None:
-        """Refuse a dependency the snapshot could never contain.
+        """Refuse a dependency the source tree could never contain.
 
         Only the outside-the-project case is checked here, because it is the
         only one the worker cannot explain for itself: it would report

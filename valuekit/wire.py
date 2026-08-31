@@ -36,15 +36,15 @@ __all__ = ["WireError", "read_frame", "write_frame", "pack", "unpack"]
 # refused rather than acted on.
 MAX_FRAME = 1 << 31
 
-HELLO = b"\x01"  # driver -> worker: salt, module, qualname, fingerprint
+HELLO = b"\x01"  # driver -> worker: ids, cache, source id, import roots
 READY = b"\x02"  # worker -> driver: empty if admitted, else the reason
 OBJECT = b"\x03"  # either way: one content-addressed object
 TASK = b"\x04"  # driver -> worker: the root hash of the input
 RESULT = b"\x05"  # worker -> driver: ok or error
-EVENT = b"\x06"  # reserved: worker -> driver events, once the
+EVENT = b"\x06"  # reserved: worker -> driver log records, once the
                  # worker is on another filesystem
 SYNC = b"\x07"  # driver -> worker: manifest hash and import roots
-WANT = b"\x08"  # worker -> driver: empty if it has the snapshot already
+WANT = b"\x08"  # worker -> driver: empty if it has the source tree already
 TREE = b"\x09"  # driver -> worker: the project tree, packed
 
 

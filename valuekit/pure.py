@@ -42,7 +42,7 @@ import sys
 import time
 from typing import Any, Callable
 
-from . import events
+from . import runlog
 from .codehash import _module_unit, _unit_digest, function_fingerprint
 from .debughook import breakpoints_force
 from .map import ImmutableMap, map_digest
@@ -282,7 +282,7 @@ def pure(fn: Callable):
         if breakpoints_force(spans):
             global _force_epoch
             _force_epoch += 1
-            events.emit(store, "forced", fn=qn, key=fn_key)
+            runlog.record(store, "forced", fn=qn, key=fn_key)
             return fn(*args, **kwargs)
 
         bound = sig.bind(*args, **kwargs)
@@ -308,7 +308,7 @@ def pure(fn: Callable):
                     continue  # value evicted/corrupt: try others, else rerun
                 # Only now is the hit real: a CacheMiss above falls through
                 # to the next candidate, so reporting a match would overcount.
-                events.emit(
+                runlog.record(
                     store,
                     "hit",
                     fn=qn,
@@ -333,7 +333,7 @@ def pure(fn: Callable):
         except BaseException as e:
             # Report and re-raise unchanged: the cache is still untouched,
             # and a body that raises is otherwise invisible from outside.
-            events.emit(store, "error", fn=qn, key=fn_key, exc=type(e).__name__)
+            runlog.record(store, "error", fn=qn, key=fn_key, exc=type(e).__name__)
             raise
         exec_dur = time.perf_counter() - t_exec
 
@@ -346,7 +346,7 @@ def pure(fn: Callable):
             # Something in this call's dynamic extent was debugger-forced
             # (a breakpoint appeared after our own entry check): this result
             # may reflect a debug session, so it must not be persisted.
-            events.emit(
+            runlog.record(
                 store,
                 "miss",
                 fn=qn,
@@ -372,7 +372,7 @@ def pure(fn: Callable):
             {"fn": qn, "deps": deps, "result": result_hash},
             units=units,
         )
-        events.emit(
+        runlog.record(
             store,
             "miss",
             fn=qn,

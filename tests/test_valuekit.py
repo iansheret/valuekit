@@ -23,7 +23,7 @@ import pytest
 import valuekit as vk
 from valuekit import ImmutableMap, pure, freeze, content_hash
 from valuekit import codehash
-from valuekit import events
+from valuekit import runlog
 from valuekit import parallel
 from valuekit import sync
 from valuekit import wire
@@ -2439,7 +2439,7 @@ class TestRunAll:
 
 
 # ===========================================================================
-# run events
+# the run log
 # ===========================================================================
 #
 # The cache's whole promise is that it can stay on, and none of it is
@@ -2447,11 +2447,11 @@ class TestRunAll:
 # exactly like a slow one. These assert what the event stream records.
 
 
-def _events(cache_dir, ev=None):
-    """Every event under a cache directory, oldest first, optionally of one
-    kind. Reads the files back and parses them, the same out-of-band shape
+def _records(cache_dir, ev=None):
+    """Every log record under a cache directory, oldest first, optionally of
+    one kind. Reads the files back and parses them, the same out-of-band shape
     the batch tests already use for execution counts."""
-    events._flush()  # writes are batched on an interval; force them out
+    runlog._flush()  # writes are batched on an interval; force them out
     out = []
     runs = _Path(cache_dir) / "runs"
     for p in sorted(runs.glob("*.jsonl")) if runs.exists() else []:
@@ -2462,16 +2462,16 @@ def _events(cache_dir, ev=None):
     return [(s, e) for s, e in out if ev is None or e["ev"] == ev]
 
 
-class TestEvents:
+class TestRunLog:
     def test_miss_then_hit(self, cache):
         @pure
         def step(x):
             return x + 1
 
         assert step(1) == 2 and step(1) == 2
-        kinds = [e["ev"] for _, e in _events(cache) if e["ev"] in ("hit", "miss")]
+        kinds = [e["ev"] for _, e in _records(cache) if e["ev"] in ("hit", "miss")]
         assert kinds == ["miss", "hit"]
-        (_, hit), = _events(cache, "hit")
+        (_, hit), = _records(cache, "hit")
         # The full qualname, matching what a stored trace records.
         assert hit["fn"].endswith("step") and hit["dur"] >= 0
 
@@ -2481,11 +2481,11 @@ class TestEvents:
             return x + 1
 
         step(1)
-        (_, miss), = _events(cache, "miss")
+        (_, miss), = _records(cache, "miss")
         # A miss carries both; a hit never executed, so it carries only dur.
         assert "exec" in miss and "dur" in miss and miss["stored"] is True
         step(1)
-        (_, hit), = _events(cache, "hit")
+        (_, hit), = _records(cache, "hit")
         assert "exec" not in hit
 
     def test_evicted_value_is_not_reported_as_a_hit(self, cache):
@@ -2501,8 +2501,8 @@ class TestEvents:
             if obj.is_file():
                 obj.unlink()
         assert step(1) == 2  # recomputed
-        assert _events(cache, "hit") == []
-        assert len(_events(cache, "miss")) == 2
+        assert _records(cache, "hit") == []
+        assert len(_records(cache, "miss")) == 2
 
     def test_breakpoint_reports_forced_not_hit(self, cache, monkeypatch):
         import bdb
@@ -2520,8 +2520,8 @@ class TestEvents:
             assert step(1) == 2
         finally:
             dbg.clear_all_breaks()
-        assert [e["ev"] for _, e in _events(cache, "forced")] == ["forced"]
-        assert _events(cache, "hit") == []
+        assert [e["ev"] for _, e in _records(cache, "forced")] == ["forced"]
+        assert _records(cache, "hit") == []
 
     def test_raising_body_is_reported_and_still_raises(self, cache):
         @pure
@@ -2530,9 +2530,9 @@ class TestEvents:
 
         with pytest.raises(ValueError, match="nope"):
             step(1)
-        (_, err), = _events(cache, "error")
+        (_, err), = _records(cache, "error")
         assert err["exc"] == "ValueError" and err["fn"].endswith("step")
-        assert _events(cache, "miss") == []  # nothing was stored
+        assert _records(cache, "miss") == []  # nothing was stored
 
     def test_nothing_is_written_without_a_cache_directory(self, tmp_path):
         # The documented rule: the cache directory is where valuekit writes,
@@ -2549,17 +2549,17 @@ class TestEvents:
         r = vk.run_all(m.process, [1, 2, 4], max_workers=2)
         assert len(r) == 3
 
-        (_, batch), = _events(cache, "batch")
+        (_, batch), = _records(cache, "batch")
         assert batch["n"] == 3 and batch["mode"] == "parallel"
-        outcomes = [e for _, e in _events(cache, "outcome")]
+        outcomes = [e for _, e in _records(cache, "outcome")]
         assert sorted(o["i"] for o in outcomes) == [0, 1, 2]
         assert all(o["ok"] and o["host"] == "local" for o in outcomes)
-        assert [e["id"] for _, e in _events(cache, "end")] == [batch["id"]]
+        assert [e["id"] for _, e in _records(cache, "end")] == [batch["id"]]
 
     def test_run_all_reports_a_failure_against_its_input(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
         vk.run_all(m.process, [1, 3, 4])
-        failed = [e for _, e in _events(cache, "outcome") if not e["ok"]]
+        failed = [e for _, e in _records(cache, "outcome") if not e["ok"]]
         assert len(failed) == 1 and failed[0]["i"] == 1
         assert failed[0]["exc"] == "ValueError"
 
@@ -2567,12 +2567,12 @@ class TestEvents:
         m, _ = _write_batch_module(tmp_path)
         vk.run_all(m.process, [1, 2, 4], max_workers=3)
         by_pid = {}
-        for source, e in _events(cache, "run"):
+        for source, e in _records(cache, "run"):
             by_pid.setdefault(e["pid"], set()).add(source)
         # No file is shared between processes: concurrent appends are what
         # does not work on Windows.
         assert all(len(files) == 1 for files in by_pid.values())
-        roles = [e["role"] for _, e in _events(cache, "run")]
+        roles = [e["role"] for _, e in _records(cache, "run")]
         assert roles.count("driver") == 1 and roles.count("worker") == 3
 
     def test_sequential_fallback_still_reports(self, cache, tmp_path, monkeypatch):
@@ -2587,9 +2587,9 @@ class TestEvents:
             vk.run_all(m.process, [1, 2])
         finally:
             dbg.clear_all_breaks()
-        (_, batch), = _events(cache, "batch")
+        (_, batch), = _records(cache, "batch")
         assert batch["mode"] == "sequential"  # debugging a batch is not dark
-        assert len(_events(cache, "outcome")) == 2
+        assert len(_records(cache, "outcome")) == 2
 
     def test_emission_failure_does_not_break_a_run(self, cache):
         # A diagnostic that can break a pipeline is worse than no diagnostic.
@@ -2703,7 +2703,7 @@ class TestWire:
 def _hello(fn, salt=None, fingerprint=None, cache_dir="", mhash=""):
     from valuekit.pure import _salt
 
-    # An empty manifest hash means "no snapshot": the worker imports the way
+    # An empty manifest hash means "no source tree": the worker imports the way
     # it always did, which is what the handshake tests are about.
     return wire.strings(
         salt or _salt(),
@@ -2816,7 +2816,7 @@ class TestPipeBackend:
         # recognised from the process tree and has to say so.
         m, _ = _write_batch_module(tmp_path)
         vk.run_all(m.process, [1, 2])
-        roles = [e["role"] for _, e in _events(cache, "run")]
+        roles = [e["role"] for _, e in _records(cache, "run")]
         assert roles.count("driver") == 1 and roles.count("worker") == 2
 
     def test_a_timeout_kills_one_input_and_spares_the_rest(self, cache, tmp_path):
@@ -2846,7 +2846,7 @@ class TestPipeBackend:
             assert vk.run_all(m.process, [1, 2]).values == [11, 21]
         finally:
             dbg.clear_all_breaks()
-        (_, batch), = _events(cache, "batch")
+        (_, batch), = _records(cache, "batch")
         assert batch["mode"] == "sequential"
 
 
@@ -2855,7 +2855,7 @@ class TestPipeBackend:
 # ===========================================================================
 #
 # The worker runs on this machine, so the driver's live tree is genuinely
-# reachable. That is exactly why these tests matter: without the snapshot and
+# reachable. That is exactly why these tests matter: without the source tree and
 # the audit, a worker could import from the live tree and the whole feature
 # would look like it worked while proving nothing.
 
@@ -2912,7 +2912,7 @@ class TestSync:
         assert not any(r.endswith((".so", ".o", ".pyc")) for r in rels)
         assert not any("__pycache__" in r for r in rels)
 
-    def test_the_cache_directory_is_not_packed_into_its_own_snapshot(self, tmp_path):
+    def test_the_cache_directory_is_not_packed_into_its_own_source_tree(self, tmp_path):
         root = _project(tmp_path)
         (root / "cache").mkdir()
         (root / "cache" / "junk").write_text("x" * 100)
@@ -2944,7 +2944,7 @@ class TestSync:
         # Memoising a file digest on (mtime, size) fails in the dangerous
         # direction: a same-size edit within one tick on a coarse-mtime
         # filesystem would keep the old digest, leave the manifest hash
-        # unmoved, and let a worker reuse a snapshot of the previous source.
+        # unmoved, and let a worker reuse a source tree from the previous content.
         root = _project(tmp_path)
         f = root / "vk_sync_mod.py"
         before = os.stat(f)
@@ -2980,7 +2980,7 @@ class TestSync:
         }
 
 
-class TestSnapshot:
+class TestSourceTree:
     @pytest.fixture(autouse=True)
     def _use_pipes(self, monkeypatch):
         from valuekit.backend import PipeBackend
@@ -2990,13 +2990,13 @@ class TestSnapshot:
         for name in [k for k in sys.modules if k.startswith("vk_sync_mod")]:
             del sys.modules[name]
 
-    def test_a_batch_runs_from_a_snapshot(self, cache, tmp_path):
+    def test_a_batch_runs_from_a_source_tree(self, cache, tmp_path):
         m = _load(_project(tmp_path))
         assert vk.run_all(m.work, [1, 2]).values == [101, 102]
-        snaps = list((cache / "code").iterdir())
-        assert len(snaps) == 1 and (snaps[0] / "vk_sync_mod.py").exists()
+        trees = list((cache / "source").iterdir())
+        assert len(trees) == 1 and (trees[0] / "vk_sync_mod.py").exists()
 
-    def test_the_worker_imports_the_snapshot_not_the_live_tree(self, cache, tmp_path):
+    def test_the_worker_imports_the_source_tree_not_the_live_tree(self, cache, tmp_path):
         from valuekit.backend import PipeBackend
 
         root = _project(tmp_path)
@@ -3015,7 +3015,7 @@ class TestSnapshot:
         finally:
             handle.reap()
 
-    def test_an_edit_produces_a_new_snapshot_and_the_new_answer(self, cache, tmp_path):
+    def test_an_edit_produces_a_new_source_tree_and_the_new_answer(self, cache, tmp_path):
         root = _project(tmp_path)
         m = _load(root)
         assert vk.run_all(m.work, [1]).values == [101]
@@ -3024,29 +3024,29 @@ class TestSnapshot:
         )                                            # same-length edit within
         m = _load(root)                              # one second reloads the
         assert vk.run_all(m.work, [1]).values == [1000000]  # stale .pyc
-        assert len(list((cache / "code").iterdir())) == 2  # both kept, immutable
+        assert len(list((cache / "source").iterdir())) == 2  # both kept, immutable
 
     def test_an_unchanged_tree_is_not_resent(self, cache, tmp_path):
         from valuekit.backend import PipeBackend
 
         m = _load(_project(tmp_path))
         PipeBackend(m.work, str(cache)).ensure_ready()
-        before = (cache / "code").stat().st_mtime_ns
-        # A second backend over the same tree finds the snapshot already there
+        before = (cache / "source").stat().st_mtime_ns
+        # A second backend over the same tree finds the source tree already there
         # and asks for nothing.
         second = PipeBackend(m.work, str(cache))
         second.ensure_ready()
-        assert (cache / "code").stat().st_mtime_ns == before
-        assert len(list((cache / "code").iterdir())) == 1
+        assert (cache / "source").stat().st_mtime_ns == before
+        assert len(list((cache / "source").iterdir())) == 1
 
-    def test_a_half_built_snapshot_is_never_adopted(self, cache, tmp_path):
+    def test_a_half_built_source_tree_is_never_adopted(self, cache, tmp_path):
         from valuekit.backend import PipeBackend
 
         m = _load(_project(tmp_path))
         backend = PipeBackend(m.work, str(cache))
         # A directory with the right name but no .complete marker must not be
-        # mistaken for a finished snapshot.
-        half = cache / "code" / backend._hash
+        # mistaken for a finished source tree.
+        half = cache / "source" / backend._hash
         half.mkdir(parents=True)
         (half / "vk_sync_mod.py").write_text("def work(x):\n    return 'WRONG'\n")
         backend.ensure_ready()

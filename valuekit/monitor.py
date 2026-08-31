@@ -1,6 +1,6 @@
 """Watch a running pipeline: ``python -m valuekit.monitor <cache-dir>``.
 
-Reads the event files :mod:`valuekit.events` writes under ``<cache>/runs/``
+Reads the run-log files :mod:`valuekit.runlog` writes under ``<cache>/runs/``
 and redraws a summary a few times a second.  It is a separate process with
 its own lifetime, so it can be started twenty minutes into a run, left open
 across several, or run over ssh on the machine doing the work.  It only
@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 _REFRESH = 0.5  # seconds between redraws
-_LIVE_AFTER = 5.0  # a run with no event for longer than this reads as idle
+_LIVE_AFTER = 5.0  # a run with no record for longer than this reads as idle
 _MAX_FAILURES = 8
 
 
@@ -121,7 +121,7 @@ class _State:
         drivers = [r for r in self.runs.values() if r["role"] != "worker"]
         if not drivers:
             return set(self.runs)
-        # No grace window: a driver writes its batch event before spawning
+        # No grace window: a driver writes its batch record before spawning
         # anything, so its own file always predates its workers'. Allowing
         # slack here instead lets the previous run's stragglers leak in and
         # quietly spoil the rate.
@@ -150,7 +150,7 @@ class _Tail:
             except OSError:
                 continue
             # Only consume up to the last newline: the writer may be midway
-            # through a line, and a partial line is not yet an event.
+            # through a line, and a partial line is not yet a record.
             cut = data.rfind("\n")
             if cut < 0:
                 continue
@@ -260,8 +260,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "usage: python -m valuekit.monitor <cache-dir>\n"
             "       (or set VALUEKIT_CACHE)\n\n"
-            "The cache directory is the one passed to set_cache_dir(); events\n"
-            "are written under its runs/ subdirectory. Nothing is recorded for\n"
+            "The cache directory is the one passed to set_cache_dir(); the run\n"
+            "log is written under its runs/ subdirectory. Nothing is recorded for\n"
             "a program that never configures a cache.",
             file=sys.stderr,
         )

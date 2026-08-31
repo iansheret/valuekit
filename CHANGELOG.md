@@ -27,7 +27,7 @@ batch still runs in local processes.
 - Code sync. The driver describes its project as a manifest — tracked files
   plus untracked ones that are not ignored, since the helper you just wrote and
   have not `git add`ed is the commonest thing to be editing — and the worker
-  materialises an immutable snapshot named by the manifest hash and imports
+  unpacks an immutable source tree named by the manifest hash and imports
   from that. Build artefacts are never shipped, and neither is anything outside
   the project: a dependency is the environment's job on both machines.
 - A readiness phase, once per host rather than once per input. Syncing,
@@ -35,7 +35,7 @@ batch still runs in local processes.
   failure, a missing dependency or a compile error is reported as one fact
   about the host instead of as an identical failure against every input.
 - After importing, the worker checks that every user module actually came from
-  the snapshot. A path entry is not proof: an editable install's meta-path
+  the source tree. A path entry is not proof: an editable install's meta-path
   finder runs first and can silently win. That check is what separates running
   the driver's code from running whatever the worker happened to have.
 
@@ -53,14 +53,14 @@ batch still runs in local processes.
   that was previously invisible — a step that ought to be hitting and silently
   is not looks exactly like a slow step.
 
-  Events are written to `runs/` inside the configured cache directory, one file
+  The run log is written to `runs/` inside the configured cache directory, one file
   per process, and nothing is written until `set_cache_dir` is called: the rule
   is unchanged, the cache directory is where valuekit writes. A batch run with
-  no cache directory is therefore not observable. Old run files are reaped, and
+  no cache directory is therefore not observable. Old run files are pruned, and
   a file that reaches its size cap stops recording detail and counts what it
   dropped rather than filling a disk.
 
-  Emission never fails a run: an unwritable directory or a full disk disables it
+  Writing the log never fails a run: an unwritable directory or a full disk stops it
   for that process and changes nothing else. It costs roughly 3 µs per `@pure`
   call, under a tenth of the cost of a cache hit, which is dominated by reading
   and parsing the function's trace file.

@@ -3,8 +3,8 @@
 A worker must run the code the driver meant, and the driver must not have to
 remember to copy it there -- an edit loop that needs a manual sync step is an
 edit loop nobody uses.  So the driver describes its project as a *manifest*,
-the worker materialises an immutable *snapshot* of it, and imports from that
-rather than from whatever happens to be on its own disk.
+the worker unpacks an immutable copy of it -- a *source tree* -- and imports
+from that rather than from whatever happens to be on its own disk.
 
 What gets sent is the user-code partition and nothing else, the same
 boundary :func:`valuekit.codehash._classify` already draws: the project's own
@@ -14,7 +14,7 @@ be worse than useless anyway, since it is the wrong architecture as often as
 not.  Compiled artefacts are therefore excluded outright rather than by
 trusting the project's ignore rules.
 
-The snapshot is named by the manifest hash and never modified, so several
+A source tree is named by the manifest hash and never modified, so several
 versions of a project coexist, a batch cannot have its source changed
 underneath it, and re-running an unchanged tree costs one comparison.  It
 lives under the cache directory, beside ``objects/`` and ``runs/``: the cache
@@ -22,7 +22,7 @@ directory is where valuekit writes, and nothing is written until one is named.
 
 Nothing here trusts that the sync worked.  :mod:`valuekit.worker` audits what
 it actually imported afterwards, and the fingerprint handshake checks the
-result again -- because a snapshot on ``sys.path`` can still lose to an
+result again -- because a source tree on ``sys.path`` can still lose to an
 editable install's meta-path finder, and a silent wrong answer is the one
 outcome worth any amount of machinery to avoid.
 """
@@ -186,7 +186,7 @@ def _file_digest(path: str) -> str | None:
     its mtime or its size -- a same-size edit within one tick on a
     coarse-mtime filesystem such as HFS+, ext3 or exFAT -- would keep its old
     digest, leave the manifest hash unmoved, and let a worker reuse a
-    snapshot of the previous source.  A remote quietly running stale code is
+    source tree built from the previous content.  A remote quietly running stale code is
     the worst outcome this library has.
 
     The cost of not memoising is small for the same reason whole-tree
@@ -194,7 +194,7 @@ def _file_digest(path: str) -> str | None:
     source, with no libraries, vendored dependencies or build output.  A tree
     small enough to ship every time is small enough to hash every time.
 
-    Reads through symlinks, so the snapshot holds real files.
+    Reads through symlinks, so a source tree holds real files.
     """
     h = _new_hasher()
     try:
@@ -252,7 +252,7 @@ def manifest(root: str, exclude: Iterable[str] = ()) -> list[tuple[str, str]]:
 
     *exclude* names directories to leave out whatever the ignore rules say --
     valuekit's own cache above all, since a cache configured inside the
-    project would otherwise be packed into the snapshot that lives in it.
+    project would otherwise be packed into the source tree that lives beside it.
 
     Missing files are dropped rather than raising: ``git ls-files --cached``
     reads the index, so a path staged and then deleted from the worktree is

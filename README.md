@@ -401,15 +401,15 @@ watching from the beginning. It only reads, so nothing it does can affect
 the run. Run it over ssh on the machine doing the work if that is where the
 work is.
 
-Events go in `runs/` inside the cache directory, one file per process, and
+The run log goes in `runs/` inside the cache directory, one file per process, and
 nothing is recorded until `set_cache_dir` has been called — the same rule as
 everything else here. That does mean a `run_all` batch with no cache
 directory is not observable. The monitor takes the cache directory as an
 argument, falling back to `$VALUEKIT_CACHE`.
 
-There is nothing to switch on and no way to get it wrong: emission never
+There is nothing to switch on and no way to get it wrong: writing the log never
 fails a run, an unwritable directory just disables it, old run files are
-reaped, and a run that produces a huge number of events stops recording
+pruned, and a run that produces a huge number of records stops recording
 detail rather than filling a disk. It costs about 3 µs per `@pure` call —
 under a tenth of a cache hit, which is dominated by reading the function's
 trace file.

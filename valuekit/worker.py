@@ -1,10 +1,10 @@
-"""A worker that runs the driver's code, from a snapshot of the driver's code.
+"""A worker that runs the driver's code, from a copy of the driver's source.
 
 ``python -m valuekit.worker`` reads framed messages on stdin and writes them
 on stdout.  It comes in two shapes.  ``--ready`` makes one process per host
-that materialises a snapshot of the project, imports from it, checks what it
+that unpacks the project's source tree, imports from it, checks what it
 got, and exits; every later process then runs exactly one input against that
-finished snapshot and exits, which is what keeps the isolation `run_all`
+finished source tree and exits, which is what keeps the isolation `run_all`
 already promises -- a segfault or a timeout costs one input and nothing else.
 
 Readiness is separate for a reason.  A sync failure, a missing dependency or
@@ -14,11 +14,11 @@ that wrong would break the one property `run_all` is built around: every
 failure recorded against the input that caused it.
 
     driver -> SYNC    salt, ids, manifest hash, import roots
-    worker -> WANT    empty if the snapshot is already here, else send it
+    worker -> WANT    empty if the source tree is already here, else send it
     driver -> TREE    the tarball, only if wanted
     worker -> READY   empty if admitted, else why not
 
-    driver -> HELLO   salt, module, qualname, fingerprint, cache, snapshot
+    driver -> HELLO   salt, module, qualname, fingerprint, cache, source id
     worker -> READY   empty if admitted, else why not
     driver -> OBJECT* the input's object graph
     driver -> TASK    the input's root hash
@@ -26,7 +26,7 @@ failure recorded against the input that caused it.
     worker -> RESULT  ok and a root hash, or a failure
 
 Three checks guard the result, and they are deliberately independent.  The
-snapshot decides what is on ``sys.path``; the *audit* then confirms that what
+source tree decides what is on ``sys.path``; the *audit* then confirms that what
 was actually imported came from there, because a path entry can still lose to
 an editable install's meta-path finder; and the fingerprint handshake
 confirms the code means what the driver thinks.  The audit matters most: it
@@ -48,7 +48,7 @@ import traceback
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from . import events, sync, wire
+from . import runlog, sync, wire
 
 __all__ = ["main", "serve", "serve_ready"]
 
@@ -61,30 +61,30 @@ def _resolve(module: str, qualname: str):
     return obj
 
 
-def snapshot_dir(cache_dir: str, manifest_hash: str) -> Path:
-    """Where a snapshot lives: beside objects/, traces/ and runs/."""
-    return Path(cache_dir) / "code" / manifest_hash
+def source_dir(cache_dir: str, manifest_hash: str) -> Path:
+    """Where a synced source tree lives: beside objects/ and runs/."""
+    return Path(cache_dir) / "source" / manifest_hash
 
 
-def _install(snapshot: Path, roots: list[str]) -> None:
-    """Put the snapshot's import roots ahead of everything else."""
+def _install(source: Path, roots: list[str]) -> None:
+    """Put the source tree's import roots ahead of everything else."""
     for rel in reversed(roots):
-        entry = str((snapshot / rel).resolve())
+        entry = str((source / rel).resolve())
         while entry in sys.path:
             sys.path.remove(entry)
         sys.path.insert(0, entry)
 
 
-def _audit(snapshot: Path) -> str:
-    """Confirm every user module actually came from the snapshot.
+def _audit(source: Path) -> str:
+    """Confirm every user module actually came from the source tree.
 
-    A snapshot on ``sys.path`` is not proof that imports resolved through it:
+    A source tree on ``sys.path`` is not proof that imports resolved through it:
     a PEP 660 editable install puts a finder on ``sys.meta_path``, which runs
     before any path entry, and namespace packages merge portions across
     entries.  This is the check that is independent of the sync having
     worked -- without it a worker could quietly run the wrong source.
     """
-    real = str(snapshot.resolve())
+    real = str(source.resolve())
     strays: list[str] = []
     for name, mod in list(sys.modules.items()):
         if name.startswith("valuekit") or name in ("__main__", "__mp_main__"):
@@ -101,7 +101,7 @@ def _audit(snapshot: Path) -> str:
         strays.append(f"{name} from {path}")
     if strays:
         return (
-            "these modules were imported from outside the snapshot, so this "
+            "these modules were imported from outside the source tree, so this "
             "worker would not be running the driver's code:\n  "
             + "\n  ".join(sorted(strays))
             + f"\nExpected everything under {real}."
@@ -161,8 +161,8 @@ def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
         wire.write_frame(tx, wire.READY, reason.encode("utf-8"))
         return 1
 
-    snapshot = snapshot_dir(cache_dir, mhash)
-    complete = snapshot / ".complete"
+    source = source_dir(cache_dir, mhash)
+    complete = source / ".complete"
     wire.write_frame(tx, wire.WANT, b"" if complete.exists() else b"send")
     if not complete.exists():
         frame = wire.read_frame(rx)
@@ -170,7 +170,7 @@ def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
             wire.write_frame(tx, wire.READY, b"the project tree never arrived")
             return 1
         try:
-            _materialise(frame[1], snapshot)
+            unpack(frame[1], source)
         except Exception as e:
             wire.write_frame(
                 tx, wire.READY, f"could not unpack the project: {e}".encode()
@@ -180,13 +180,13 @@ def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
     from .pure import set_cache_dir
 
     set_cache_dir(cache_dir)
-    _install(snapshot, roots)
+    _install(source, roots)
 
     reason = _admit(salt, module, qualname, fingerprint)
     if not reason:
         # After the import, and before the fingerprint is trusted: a
         # fingerprint that matches the wrong file is still the wrong file.
-        reason = _audit(snapshot)
+        reason = _audit(source)
     wire.write_frame(tx, wire.READY, reason.encode("utf-8"))
     return 1 if reason else 0
 
@@ -200,12 +200,12 @@ def _refuse_early(salt: str, cache_dir: str) -> str:
     if not cache_dir:
         return (
             "this worker has no cache directory, so it has nowhere to keep a "
-            "snapshot of the project. Configure one with set_cache_dir()."
+            "copy of the project. Configure one with set_cache_dir()."
         )
     return sync.check_extraction_supported()
 
 
-def _materialise(data: bytes, snapshot: Path) -> None:
+def unpack(data: bytes, source: Path) -> None:
     """Unpack into a fresh directory, then move it into place.
 
     Immutability of the name is not atomicity of the construction: two
@@ -216,35 +216,35 @@ def _materialise(data: bytes, snapshot: Path) -> None:
     import shutil
     import uuid
 
-    parent = snapshot.parent
+    parent = source.parent
     parent.mkdir(parents=True, exist_ok=True)
-    _reap(parent)
+    prune(parent)
     tmp = parent / f".tmp-{uuid.uuid4().hex}"
     try:
         tmp.mkdir()
         sync.extract_tree(data, str(tmp))
         (tmp / ".complete").write_bytes(b"")
         try:
-            os.rename(tmp, snapshot)
+            os.rename(tmp, source)
         except OSError:
-            if (snapshot / ".complete").exists():
+            if (source / ".complete").exists():
                 shutil.rmtree(tmp, ignore_errors=True)  # someone else won
             else:
                 # Something is in the way without the marker, so it is debris
                 # from a crash or a kill: it can never be adopted, and leaving
-                # it would block this snapshot for good.
-                shutil.rmtree(snapshot, ignore_errors=True)
-                os.rename(tmp, snapshot)
+                # it would block this source tree for good.
+                shutil.rmtree(source, ignore_errors=True)
+                os.rename(tmp, source)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
 
 
-_MAX_SNAPSHOTS = 10
+_MAX_TREES = 10
 
 
-def _reap(parent: Path) -> None:
-    """Drop the oldest snapshots. Best effort; a live one is only wasted disk."""
+def prune(parent: Path) -> None:
+    """Drop the oldest source trees. Best effort; a live one is only wasted disk."""
     try:
         kept = sorted(
             (p for p in parent.iterdir() if p.is_dir() and not p.name.startswith(".")),
@@ -254,7 +254,7 @@ def _reap(parent: Path) -> None:
         return
     import shutil
 
-    for p in kept[: max(0, len(kept) - _MAX_SNAPSHOTS + 1)]:
+    for p in kept[: max(0, len(kept) - _MAX_TREES + 1)]:
         shutil.rmtree(p, ignore_errors=True)
 
 
@@ -276,13 +276,13 @@ def serve(rx: BinaryIO, tx: BinaryIO) -> int:
     salt, module, qualname, fingerprint, cache_dir, mhash = parts[:6]
     roots = [r for r in parts[6:] if r]
 
-    # The snapshot has to be on the path before _admit, which imports.
+    # The source tree has to be on the path before _admit, which imports.
     if mhash:
-        snapshot = snapshot_dir(cache_dir, mhash)
-        if not (snapshot / ".complete").exists():
-            wire.write_frame(tx, wire.READY, b"the snapshot is missing")
+        source = source_dir(cache_dir, mhash)
+        if not (source / ".complete").exists():
+            wire.write_frame(tx, wire.READY, b"the source tree is missing")
             return 1
-        _install(snapshot, roots)
+        _install(source, roots)
 
     reason = _admit(salt, module, qualname, fingerprint)
     wire.write_frame(tx, wire.READY, reason.encode("utf-8"))
@@ -339,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     # Declared here rather than in serve(): the role is a fact about this
     # process, and serve() is also called in-process by tests, which must
     # not relabel their own caller.
-    events.set_role("worker")
+    runlog.set_role("worker")
     args = sys.argv[1:] if argv is None else argv
     rx, tx = sys.stdin.buffer, sys.stdout.buffer
     try:
@@ -347,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     except wire.WireError:
         return 2
     finally:
-        events._flush()
+        runlog._flush()
 
 
 if __name__ == "__main__":
