@@ -3,6 +3,14 @@
 ``run_all(fn, inputs)`` runs ``fn`` over ``inputs`` in parallel and returns
 a :class:`BatchResult` of per-input outcomes, in input order.
 
+``fn`` must be memoised (``@pure`` or ``@pure_local``).  Three things rest
+on that.  An input whose result the cache already holds needs no worker,
+and is answered here.  Each input's root trace can be named in a *batch
+record* (see :mod:`valuekit.batches`), which is how analysis code reaches
+what the batch produced without reconstructing arguments.  And running
+somewhere other than this machine is safe only for a function whose
+effects do not matter, which is what memoisation already assumes.
+
 Each input runs in its own process (spawned per task, up to ``max_workers``
 at once) rather than in a shared worker pool.  Isolation is the point: a
 timeout kills exactly one process, a segfault loses exactly one input, and
@@ -45,13 +53,12 @@ The split is what lets work run somewhere other than this machine without
 the scheduling being written twice.
 
 Workers are configured automatically (each process applies the parent's
-cache directory before running) and share the cache: value writes are
-idempotent and trace writes are atomic appends, so concurrent writers
-cannot drop each other's results.  ``fn`` must be a module-level function
-(it is sent to workers by reference) and need not itself be @pure;
-typically it is a plain driver calling @pure steps.  Worker processes are
-daemonic: they are cleaned up if the parent exits, and ``fn`` cannot
-itself start processes (parallelise in this driver, not inside it).
+cache directory before running) and share the cache: every write is a
+content-named file, so concurrent writers cannot drop each other's
+results.  ``fn`` must be a module-level function (it is sent to workers by
+reference).  Worker processes are daemonic: they are cleaned up if the
+parent exits, and ``fn`` cannot itself start processes (parallelise in this
+driver, not inside it).
 """
 
 from __future__ import annotations
@@ -62,9 +69,10 @@ from typing import Any, Callable, Iterable, Iterator
 
 from . import runlog
 from .backend import LocalBackend
+from .batches import BatchWriter
 from .codehash import function_fingerprint
 from .debughook import breakpoints_force
-from .store import LocalStore
+from .store import CacheMiss, LocalStore
 
 __all__ = ["run_all", "BatchResult", "Outcome"]
 
@@ -219,27 +227,96 @@ def _harvest(t: _Task, msg, name: str, timeout) -> Outcome:
     return Outcome(t.x, exc=exc)
 
 
+class _Record:
+    """Everything one batch reports about an input as it finishes: the run
+    log, the batch record, and the enclosing computation's call list."""
+
+    def __init__(self, store, fn, name: str, batch_id: int, inputs: list):
+        from .pure import _record_call
+
+        self._store = store
+        self._fn = fn
+        self._name = name
+        self._id = batch_id
+        self._record_call = _record_call
+        self._writer = None
+        if isinstance(store, LocalStore):
+            try:
+                self._writer = BatchWriter(
+                    store, name, fn.__qualname__, fn._valuekit_identity()[0], inputs
+                )
+            except Exception:
+                self._writer = None  # the record is a diagnostic, never a failure
+
+    def outcome(self, i: int, o: Outcome, host: str = "local") -> None:
+        exc = o.exception()
+        trace = None
+        if exc is None:
+            found = self._fn._valuekit_lookup(o.input)
+            if found is not None:
+                trace = found[0]
+                self._record_call(
+                    self._fn.__qualname__, self._fn._valuekit_identity()[0], trace
+                )
+        runlog.record(
+            self._store,
+            "outcome",
+            id=self._id,
+            i=i,
+            ok=exc is None,
+            host=host,
+            exc=None if exc is None else type(exc).__name__,
+        )
+        if self._writer is not None:
+            self._writer.outcome(i, trace, exc)
+
+
+def _cached(fn, x) -> Outcome | None:
+    """The stored outcome for *x*, if this store already holds one."""
+    found = fn._valuekit_lookup(x)
+    if found is None:
+        return None
+    from .pure import _current_store
+
+    try:
+        return Outcome(x, value=_current_store().get_value(found[1]["result"]))
+    except CacheMiss:
+        return None
+
+
 def run_all(
     fn: Callable[[Any], Any],
     inputs: Iterable[Any],
     max_workers: int | None = None,
     *,
     timeout: float | None = None,
+    name: str | None = None,
 ) -> BatchResult:
     """Run ``fn`` over ``inputs`` in parallel; return a BatchResult in
     input order.
 
-    Each input runs in its own process; ``max_workers`` caps how many run
-    at once (default: the CPU count).  ``timeout`` limits the seconds each
-    input may spend running; a breach kills that input's process and
-    records a TimeoutError on its outcome, leaving the rest of the batch
-    unaffected.  Worker deaths are likewise recorded per input.
+    ``fn`` must be ``@pure`` or ``@pure_local``.  Each input runs in its
+    own process; ``max_workers`` caps how many run at once (default: the
+    CPU count).  An input whose result is already cached is answered
+    without a worker.  ``timeout`` limits the seconds each input may spend
+    running; a breach kills that input's process and records a
+    TimeoutError on its outcome, leaving the rest of the batch unaffected.
+    Worker deaths are likewise recorded per input.
 
     Every input is processed and failures are collected on the
     BatchResult: ``.values`` raises an ExceptionGroup if any input failed,
     and ``.failures`` gives the ``(input, exception)`` pairs.  Nothing is
     replayed automatically; to debug one input, call ``fn(x)`` on it.
+
+    The batch is recorded under ``name`` (default: the function's qualified
+    name) for :func:`valuekit.batch` to read.
     """
+    if not getattr(fn, "_valuekit_pure", False):
+        raise TypeError(
+            f"run_all() takes a @pure or @pure_local function; got "
+            f"{getattr(fn, '__qualname__', fn)!r}. Decorate it: a batch's "
+            "results are recorded by the function that produced them."
+        )
     inputs = list(inputs)
 
     # Resolved before the breakpoint check below, so that the sequential
@@ -249,7 +326,8 @@ def run_all(
 
     store = _current_store()
     cache_dir = str(store.root) if isinstance(store, LocalStore) else None
-    name = getattr(fn, "__qualname__", repr(fn))
+    qualname = getattr(fn, "__qualname__", repr(fn))
+    name = name or qualname
 
     global _batch_seq
     _batch_seq += 1
@@ -264,18 +342,37 @@ def run_all(
         spans = []
     if breakpoints_force(spans):
         runlog.record(
-            store, "batch", id=batch, fn=name, n=len(inputs), mode="sequential"
+            store, "batch", id=batch, fn=qualname, name=name, n=len(inputs),
+            mode="sequential",
         )
+        record = _Record(store, fn, name, batch, inputs)
         seq: list[Outcome] = []
         try:
             for i, x in enumerate(inputs):
-                seq.append(Outcome(x, value=fn(x)))  # exceptions propagate
-                runlog.record(store, "outcome", id=batch, i=i, ok=True, host="local")
+                o = Outcome(x, value=fn(x))  # exceptions propagate
+                seq.append(o)
+                record.outcome(i, o)
         finally:
             runlog.record(store, "end", id=batch)
         return BatchResult(seq)
 
-    runlog.record(store, "batch", id=batch, fn=name, n=len(inputs), mode="parallel")
+    runlog.record(
+        store, "batch", id=batch, fn=qualname, name=name, n=len(inputs), mode="parallel"
+    )
+    record = _Record(store, fn, name, batch, inputs)
+
+    outcomes: list[Outcome | None] = [None] * len(inputs)
+    queue = deque()
+    for i, x in enumerate(inputs):
+        o = _cached(fn, x) if store is not None else None
+        if o is None:
+            queue.append((i, x))
+        else:
+            outcomes[i] = o
+            record.outcome(i, o)
+    if not queue:
+        runlog.record(store, "end", id=batch)
+        return BatchResult(o for o in outcomes if o is not None)
 
     backend = _backend_factory(fn, cache_dir)
 
@@ -298,8 +395,6 @@ def run_all(
     ]
     poll = min(intervals) if intervals else None
 
-    outcomes: list[Outcome | None] = [None] * len(inputs)
-    queue = deque(enumerate(inputs))
     running: list[_Task] = []
 
     def _start(idx: int, x: Any) -> None:
@@ -328,18 +423,9 @@ def run_all(
                     continue
                 running.remove(t)
                 t.handle.reap()
-                o = _harvest(t, msg, name, timeout)
+                o = _harvest(t, msg, qualname, timeout)
                 outcomes[t.idx] = o
-                exc = o.exception()
-                runlog.record(
-                    store,
-                    "outcome",
-                    id=batch,
-                    i=t.idx,
-                    ok=exc is None,
-                    host="local",
-                    exc=None if exc is None else type(exc).__name__,
-                )
+                record.outcome(t.idx, o)
     finally:
         # Covers KeyboardInterrupt: no orphans.
         for t in running:

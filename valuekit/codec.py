@@ -123,6 +123,27 @@ def encode(v: Any, put: Callable[[Any], str]) -> bytes:
         ) from None
 
 
+def children(data: bytes) -> list[str]:
+    """The hashes an encoded value refers to, without rebuilding it.
+
+    What a reachability walk over the store needs: which objects this one
+    keeps alive.  Nothing is decoded, so no class has to be importable.
+    """
+    tag, body, _ = _read_blob(data, 0)
+    if tag == b"I":
+        return []
+    if tag == b"C":
+        _, _, p = _read_blob(body, 0)
+        return [body[p:].hex()]
+    if tag == b"P":
+        _, _, p = _read_blob(body, 0)
+        _, _, p = _read_blob(body, p)
+        _, _, p = _read_blob(body, p)
+        return [body[p:].hex()]
+    n = _DIGEST_SIZE
+    return [body[i : i + n].hex() for i in range(0, len(body), n)]
+
+
 def decode(data: bytes, get: Callable[[str], Any]) -> Any:
     """Rebuild a value encoded by :func:`encode`, children through *get*."""
     tag, body, pos = _read_blob(data, 0)

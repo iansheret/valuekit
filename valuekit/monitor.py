@@ -79,7 +79,7 @@ class _State:
 
         if ev == "batch":
             self.batches[(source, e.get("id"))] = {
-                "fn": e.get("fn", "?"),
+                "fn": e.get("name") or e.get("fn", "?"),
                 "n": e.get("n", 0),
                 "mode": e.get("mode", "parallel"),
                 "done": 0,

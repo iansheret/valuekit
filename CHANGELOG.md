@@ -6,64 +6,111 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
-Groundwork for running a batch somewhere other than this machine. Nothing here
-is user-visible: `run_all` keeps its signature and its behaviour, and every
-batch still runs in local processes.
-
-- Scheduling is separated from where work runs. `run_all` keeps the admission
-  limit, deadlines, input ordering and failure attribution; a backend starts,
-  waits for and kills a unit of work. Waiting is a backend method because
-  readiness is not portable — on Windows `multiprocessing.connection.wait`
-  needs a real Win32 handle, so a subprocess pipe is not interchangeable there.
-- The value codec is now free functions parameterised by how a child value is
-  reached, so the same pickle-free format serves a directory on disk and a
-  connection to a peer. Content-addressing then deduplicates on the wire for
-  the reason it deduplicates on disk.
-- A worker that speaks a framed protocol over a pipe, with a handshake that
-  recomputes the function's fingerprint and refuses if the code it would run is
-  not the code the driver meant. It runs on this machine, which is the point:
-  the framing, codec, handshake and failure mapping are all exercised in CI
-  with no network involved.
-- Code sync. The driver describes its project as a manifest — tracked files
-  plus untracked ones that are not ignored, since the helper you just wrote and
-  have not `git add`ed is the commonest thing to be editing — and the worker
-  unpacks an immutable source tree named by the manifest hash and imports
-  from that. Build artefacts are never shipped, and neither is anything outside
-  the project: a dependency is the environment's job on both machines.
-- A readiness phase, once per host rather than once per input. Syncing,
-  importing and verifying happen before any input is claimed, so a sync
-  failure, a missing dependency or a compile error is reported as one fact
-  about the host instead of as an identical failure against every input.
-- After importing, the worker checks that every user module actually came from
-  the source tree. A path entry is not proof: an editable install's meta-path
-  finder runs first and can silently win. That check is what separates running
-  the driver's code from running whatever the worker happened to have.
-
-## 0.4.0 — 2026-08-28
+Caches written by earlier versions are refused; delete the directory. The
+trace layout changed (each trace is now its own file) and a trace now
+records more than it did.
 
 ### Added
 
-- A running pipeline can now be watched from a separate process.
+- `log(name, value)` binds a name to a value inside a `@pure` function. The
+  value is stored like a result and the binding is recorded in the call's
+  trace, so it is found again on every later hit without the body running.
+  A memoised call made inside another is recorded the same way, under its
+  function name, with no call needed.
+
+- `run_all` records each batch under a name (default: the function's
+  qualified name; `name=` to choose) and `valuekit.batch(name)` reads it
+  back: rows by input, values by name (`b[7]["detrend"]`, whether `detrend`
+  was a nested step or a `log` name, at any depth), a column across inputs,
+  rows grouped by a logged parameter, failures with their messages. Nothing
+  is imported or run to read a batch, and a batch can be read while it is
+  still running. Every input of a batch ran under one fingerprint, which the
+  record carries, so a batch cannot mix results from two versions of the
+  code.
+
+- `@pure_local`: memoised exactly like `@pure`, on a different promise. The
+  result may depend on something outside the program -- a file on this
+  machine, a database, a download that needs this machine's credentials --
+  which the user promises does not change for the same arguments. It runs
+  only on the machine driving the pipeline; a worker elsewhere sends the
+  call back. This is what lets a batch that fetches data run remotely
+  without credentials leaving the driver.
+
+- `fn.cached(...)` returns a `@pure` function's stored result without
+  executing, or raises `CacheMiss`. `run_all` uses the same lookup to answer
+  an already-cached input without starting a worker.
+
+- `python -m valuekit.sweep <module>...` deletes what the current code can no
+  longer reach: traces and batches of functions whose fingerprint no
+  importable function produces, then objects no remaining trace or batch
+  names. Retention is by code version, not by age; nothing is removed for
+  being old.
+
+- A running pipeline can be watched from a separate process.
   `python -m valuekit.monitor <cache-dir>` shows, live, the hit rate per
   function, batch progress, and failures. It attaches whenever you start it,
-  including part-way through a long run, and only ever reads: nothing it does
-  can affect the run it is watching.
+  including part-way through a long run, and only ever reads. The run log is
+  written to `runs/` inside the cache directory; a batch run with no cache
+  directory is therefore not observable. Writing it never fails a run.
 
-  The hit rate is the point. It is what the library promises and the one thing
-  that was previously invisible — a step that ought to be hitting and silently
-  is not looks exactly like a slow step.
+### Changed
 
-  The run log is written to `runs/` inside the configured cache directory, one file
-  per process, and nothing is written until `set_cache_dir` is called: the rule
-  is unchanged, the cache directory is where valuekit writes. A batch run with
-  no cache directory is therefore not observable. Old run files are pruned, and
-  a file that reaches its size cap stops recording detail and counts what it
-  dropped rather than filling a disk.
+- `run_all` requires a `@pure` or `@pure_local` function and raises
+  `TypeError` otherwise. A batch's results are recorded by the function that
+  produced them, an already-cached input needs no worker, and a function
+  whose effects do not matter is the only kind that can safely run
+  elsewhere.
 
-  Writing the log never fails a run: an unwritable directory or a full disk stops it
-  for that process and changes nothing else. It costs roughly 3 µs per `@pure`
-  call, under a tenth of the cost of a cache hit, which is dominated by reading
-  and parsing the function's trace file.
+- Each trace is its own file, named by the hash of its content, under
+  `traces/<fnkey>/`. Two processes writing the same trace write the same
+  bytes under the same name, so there are no appends and nothing to
+  coordinate. This fixes lost traces on Windows, where an append is not
+  atomic, and makes a hit cost one `stat` instead of a re-read of the
+  function's whole trace file.
+
+- A trace records the memoised calls made inside it and its `log` bindings,
+  in order. Matching is unchanged.
+
+- The Windows CI job is gating. Besides the appends, three defects were
+  fixed there: replacing an object file another process has memory-mapped
+  is treated as the completed write it is; polling a killed worker's pipe
+  reports death instead of raising; and the pipe backend waits on reader
+  threads rather than `select`, which Windows refuses for pipes and which
+  made a batch spin forever.
+
+- `valuekit` itself is never classified as user code, wherever it is
+  installed from, so a function naming `log` or `ImmutableMap` does not hash
+  the library's module state.
+
+### Remote execution (not yet reachable by users)
+
+Groundwork for running a batch somewhere other than this machine. `run_all`
+keeps its signature apart from `name=`, and every batch still runs in local
+processes unless a private hook selects the pipe backend.
+
+- Scheduling is separated from where work runs. `run_all` keeps the admission
+  limit, deadlines, input ordering and failure attribution; a backend starts,
+  waits for and kills a unit of work.
+- The value codec is free functions parameterised by how a child value is
+  reached, so the same pickle-free format serves a directory on disk and a
+  connection to a peer. A peer's object frames carry the same bytes the
+  store writes, so they are stored without being decoded.
+- A worker that speaks a framed protocol over a pipe, with a handshake that
+  recomputes the function's fingerprint and refuses if the code it would run
+  is not the code the driver meant. It runs on this machine, which is the
+  point: everything is exercised in CI with no network involved.
+- Code sync. The driver describes its project as a manifest -- tracked files
+  plus untracked ones that are not ignored -- and the worker unpacks an
+  immutable source tree named by the manifest hash and imports from that.
+  Build artefacts are never shipped, whatever platform names them.
+- A readiness phase, once per host rather than once per input, and an audit
+  after importing that every user module actually came from the source tree.
+- A worker holds no cache. Its store is the driver's store, reached over the
+  connection: every value, trace and run-log record it produces goes to the
+  driver, every lookup asks the driver, and a `@pure_local` call runs on the
+  driver. A batch's results exist in one place however many machines ran it.
+- A worker's environment is an allowlist of what a process needs to start,
+  plus `VALUEKIT_*`. Nothing else of the driver's crosses.
 
 ## 0.3.1 — 2026-08-27
 
@@ -141,8 +188,8 @@ batch still runs in local processes.
 
 ### Added
 
-- Lists, sets and dicts may be `@pure` arguments and cached return values, and
-  round-trip as themselves.
+- Lists, sets and dicts may be `@pure` arguments and cached return values,
+  and round-trip as themselves.
 
 ### Fixed
 

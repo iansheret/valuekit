@@ -24,9 +24,13 @@ seam makes that each backend's problem instead of a shared one.
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 import os
+import queue
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import connection as _mp_connection
 
 from .codec import SerializationError
@@ -116,11 +120,16 @@ class _LocalHandle:
     def recv(self) -> tuple | None:
         try:
             return self.conn.recv()
-        except EOFError:
+        except (EOFError, OSError):
             return None  # died without sending
 
     def poll(self) -> bool:
-        return bool(self.conn.poll())
+        try:
+            return bool(self.conn.poll())
+        except OSError:
+            # Windows reports a dead writer as BrokenPipeError rather than
+            # as end-of-file; either way there is nothing to read.
+            return False
 
     def kill(self) -> None:
         self.proc.kill()
@@ -186,45 +195,159 @@ class LocalBackend:
 # only how the process is launched differs.
 
 
+def _apply_queued(inbox: queue.Queue) -> None:
+    """Hand every chunk the reader threads have queued to its handle."""
+    while True:
+        try:
+            handle, chunk = inbox.get_nowait()
+        except queue.Empty:
+            return
+        handle.feed(chunk)
+
+
 class _PipeHandle:
     """One worker subprocess and the framed conversation with it.
 
-    Frames are drained without blocking and parsed out of a buffer, rather
-    than read on demand.  A worker speaks several times before it finishes
-    -- a greeting, then the result's objects -- so "the pipe is readable"
-    does not mean "the answer is here", and reading until it is would sit
-    inside a task that has already blown its deadline.
+    A thread per handle reads the worker's stdout with blocking reads and
+    queues each chunk on the backend's inbox; frames are then parsed out of
+    a buffer on the scheduler's thread.  A worker speaks several times
+    before it finishes -- a greeting, then the result's objects -- so "a
+    chunk arrived" does not mean "the answer is here", and reading until it
+    is would sit inside a task that has already blown its deadline.
+
+    Threads rather than ``select``: Windows cannot select on a pipe, and a
+    blocking read is the one primitive every platform gives a pipe.
+
+    The worker's store is this side's store, so the frames that arrive are
+    not only its answer: a trace to keep, a lookup to answer, a run-log
+    record to write, or a ``@pure_local`` call to make here.  Lookups are
+    answered on the scheduler's thread; a call runs on a pool thread, since
+    it may be a download, and replies when it is done.  ``seen`` names every
+    object either side has sent, so nothing crosses twice.
     """
 
-    __slots__ = ("proc", "objects", "_failure", "_buf", "_result", "_eof")
+    __slots__ = (
+        "proc", "objects", "seen", "_failure", "_buf", "_result", "_eof",
+        "_inbox", "_backend", "_lock",
+    )
 
-    def __init__(self, proc, failure: str | None = None):
+    def __init__(self, proc, inbox: queue.Queue, backend=None, failure: str | None = None):
         self.proc = proc
         self.objects: dict[str, bytes] = {}
+        self.seen: set[str] = set()
         self._failure = failure
         self._buf = b""
         self._result: tuple | None = None
         self._eof = False
+        self._inbox = inbox
+        self._backend = backend
+        self._lock = threading.Lock()  # stdin is written from two threads
         if proc is not None:
-            os.set_blocking(proc.stdout.fileno(), False)
+            threading.Thread(target=self._pump, daemon=True).start()
 
-    def fileno(self) -> int:
-        return self.proc.stdout.fileno()
+    # -- answering the worker ---------------------------------------------
+
+    def _send(self, tag: bytes, body: bytes = b"") -> None:
+        from . import wire
+
+        with self._lock:
+            try:
+                wire.write_frame(self.proc.stdin, tag, body)
+            except (OSError, ValueError):
+                pass  # the worker is gone; its result will say so
+
+    def _send_value(self, v, tag: bytes, body: bytes = b"") -> None:
+        """Send *v*'s objects and then the frame that names it, atomically
+        with respect to the other writer."""
+        from . import wire
+
+        with self._lock:
+            try:
+                root = wire.send_value(self.proc.stdin, v, self.seen)
+                wire.write_frame(self.proc.stdin, tag, body or bytes.fromhex(root))
+            except (OSError, ValueError):
+                pass
+
+    def _store(self):
+        return None if self._backend is None else self._backend._store
+
+    def _request(self, wire, tag: bytes, body: bytes) -> None:
+        from . import runlog
+        from .store import CacheMiss
+
+        store = self._store()
+        if tag == wire.TRACE:
+            fn_key, doc, *units = wire.unstrings(body)
+            if store is not None:
+                store.put_trace(fn_key, json.loads(doc), units)
+        elif tag == wire.GET_TRACES:
+            pairs = [] if store is None else store.get_traces(body.decode())
+            self._send(wire.TRACES, json.dumps(pairs).encode())
+        elif tag == wire.GET_VALUE:
+            try:
+                if store is None:
+                    raise CacheMiss("the driver has no cache directory")
+                v = store.get_value(body.hex())
+            except CacheMiss as e:
+                self._send(wire.VALUE, str(e).encode())
+            else:
+                self._send_value(v, wire.VALUE, b"")
+        elif tag == wire.EVENT:
+            record = json.loads(body)
+            runlog.record(store, record.pop("ev", "?"), **record)
+        elif tag == wire.CALL:
+            module, qualname, root = wire.unstrings(body)
+            args, kwargs = wire.unpack(root, self.objects, self._fallback())
+            self._backend._submit(self._run_call, wire, module, qualname, args, kwargs)
+        else:
+            raise wire.WireError(f"unexpected frame {tag!r}")
+
+    def _fallback(self):
+        store = self._store()
+        return None if store is None else store.get_value
+
+    def _run_call(self, wire, module: str, qualname: str, args, kwargs) -> None:
+        """On a pool thread: make the @pure_local call here and reply."""
+        from .worker import _resolve
+
+        try:
+            fn = _resolve(module, qualname)
+            value = fn(*args, **kwargs)
+            lookup = getattr(fn, "_valuekit_lookup", None)
+            found = lookup(*args, **kwargs) if lookup is not None else None
+            h = found[0] if found is not None else ""
+        except BaseException as e:
+            self._send(
+                wire.CALLED,
+                b"e" + wire.strings(type(e).__name__, str(e), traceback.format_exc()),
+            )
+            return
+        with self._lock:
+            try:
+                root = wire.send_value(self.proc.stdin, value, self.seen)
+                wire.write_frame(self.proc.stdin, wire.CALLED, b"o" + wire.strings(root, h))
+            except (OSError, ValueError):
+                pass
 
     # -- reading ---------------------------------------------------------
 
-    def drain(self) -> None:
-        """Take whatever has arrived and parse any complete frames."""
+    def _pump(self) -> None:
+        """Reader thread.  An empty chunk means the pipe closed."""
+        fd = self.proc.stdout.fileno()
+        while True:
+            try:
+                chunk = os.read(fd, 1 << 16)
+            except OSError:
+                chunk = b""
+            self._inbox.put((self, chunk))
+            if not chunk:
+                return
+
+    def feed(self, chunk: bytes) -> None:
+        """Take one chunk from the reader thread; parse any complete frames."""
         from . import wire
 
         if self._result is not None or self._eof:
-            return
-        try:
-            chunk = os.read(self.fileno(), 1 << 16)
-        except BlockingIOError:
-            return
-        except OSError as e:
-            self._result = ("err_str", "OSError", str(e), "")
             return
         if not chunk:
             self._eof = True
@@ -234,6 +357,10 @@ class _PipeHandle:
             self._parse(wire)
         except wire.WireError as e:
             self._result = ("err_str", "WireError", str(e), "")
+
+    def drain(self) -> None:
+        """Apply whatever has arrived, without blocking."""
+        _apply_queued(self._inbox)
 
     def _parse(self, wire) -> None:
         while self._result is None:
@@ -248,6 +375,11 @@ class _PipeHandle:
             self._buf = self._buf[9 + n :]
             if tag == wire.OBJECT:
                 wire.recv_object(body, self.objects)
+                self.seen.add(body[:20].hex())
+                store = self._store()
+                if store is not None:
+                    # The worker's results live here and nowhere else.
+                    wire.store_object(store, body)
             elif tag == wire.READY:
                 if body:
                     self._result = (
@@ -258,12 +390,15 @@ class _PipeHandle:
                     )
             elif tag == wire.RESULT:
                 if body[:1] == b"o":
-                    self._result = ("ok", wire.unpack(body[1:].hex(), self.objects))
+                    self._result = (
+                        "ok",
+                        wire.unpack(body[1:].hex(), self.objects, self._fallback()),
+                    )
                 else:
                     kind, text, tb = wire.unstrings(body[1:])
                     self._result = ("err_str", kind, text, tb)
             else:
-                raise wire.WireError(f"unexpected frame {tag!r}")
+                self._request(wire, tag, body)
 
     def settled(self) -> bool:
         """Whether there is an answer, or the worker has gone."""
@@ -323,15 +458,28 @@ class PipeBackend:
         from .codehash import function_fingerprint
         from .pure import _salt
 
+        from .pure import _current_store
+
         self._fn = fn
         self._cache_dir = cache_dir or ""
         self._python = python or sys.executable
-        # No PYTHONPATH: a worker resolves imports through its source tree, and
-        # handing over the driver's sys.path would let them resolve to the
-        # driver's live tree instead -- which on one machine would look like
-        # it worked while proving nothing.
-        self._env = dict(os.environ)
-        self._env.pop("PYTHONPATH", None)
+        self._store = _current_store()
+        # The worker keeps only the project's source tree, and is told where.
+        self._source_root = (
+            os.path.join(self._cache_dir, "source") if self._cache_dir else ""
+        )
+        # A worker gets the variables a process needs to start and nothing
+        # of the driver's: no PYTHONPATH (imports must resolve through the
+        # source tree, or the check that they did proves nothing), and no
+        # credentials, which a @pure_local call keeps on the driver.
+        self._env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.upper() in _WORKER_ENV or k.upper().startswith("VALUEKIT_")
+        }
+
+        self._inbox: queue.Queue = queue.Queue()
+        self._pool: ThreadPoolExecutor | None = None
 
         self._root = sync.sync_root(fn)
         self._entries = sync.manifest(
@@ -346,13 +494,19 @@ class PipeBackend:
             getattr(fn, "__module__", "") or "",
             getattr(fn, "__qualname__", "") or "",
             function_fingerprint(fn)[0],
-            self._cache_dir,
+            self._source_root,
             self._hash,
         )
         self._greeting = wire.strings(*self._ids, *self._roots)
 
     def default_workers(self) -> int:
         return os.cpu_count() or 1
+
+    def _submit(self, fn, *args) -> None:
+        """Run a worker's @pure_local call on a thread of this process."""
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
+        self._pool.submit(fn, *args)
 
     def _spawn(self, extra: list[str], quiet: bool = True):
         import subprocess
@@ -446,10 +600,10 @@ class PipeBackend:
         from . import wire
 
         proc = self._spawn([])
-        handle = _PipeHandle(proc)
+        handle = _PipeHandle(proc, self._inbox, self)
         try:
             wire.write_frame(proc.stdin, wire.HELLO, self._greeting)
-            root = wire.send_value(proc.stdin, x, set())
+            root = wire.send_value(proc.stdin, x, handle.seen)
             wire.write_frame(proc.stdin, wire.TASK, bytes.fromhex(root))
         except SerializationError as e:
             # A value the wire cannot carry is the caller's problem, not a
@@ -463,18 +617,30 @@ class PipeBackend:
         return handle
 
     def wait(self, handles: list, timeout: float | None) -> list:
-        import select
-
         settled = [h for h in handles if h.settled()]
         if settled:
             return settled  # already answered; do not block on the others
         try:
-            readable, _, _ = select.select(handles, [], [], timeout)
-        except (OSError, ValueError):
-            return [h for h in handles if h.settled()]
-        for h in readable:
-            h.drain()
+            handle, chunk = self._inbox.get(timeout=timeout)
+        except queue.Empty:
+            return []
+        handle.feed(chunk)
+        _apply_queued(self._inbox)  # whatever else arrived meanwhile
         return [h for h in handles if h.settled()]
 
     def close(self) -> None:
-        pass
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
+
+
+# What a worker process needs from the environment to start and to find
+# its interpreter's own files; everything else stays with the driver.
+_WORKER_ENV = frozenset(
+    {
+        "PATH", "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL",
+        "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "WINDIR",
+        "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "USERNAME", "USER",
+        "PYTHONHOME", "PYTHONUTF8", "PYTHONIOENCODING", "VIRTUAL_ENV",
+    }
+)

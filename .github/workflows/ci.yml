@@ -47,15 +47,12 @@ jobs:
       - name: Run tests
         run: python -m pytest -ra --durations=10
 
-  # Informational only. Windows behaviour is genuinely unverified: store.py
-  # reloads arrays as memmaps and Windows locks mapped files, so os.replace
-  # over a live memmap and rmtree of a cache directory may fail; parallel.py
-  # also formats proc.kill() exit codes that differ from POSIX. Gather data
-  # without gating the release.
+  # Gating. The store never appends and treats "target already exists" as a
+  # completed write, which is what Windows needs: appends are not atomic
+  # there and a mapped file cannot be replaced.
   test-windows:
-    name: windows-latest / py${{ matrix.python-version }} (informational)
+    name: windows-latest / py${{ matrix.python-version }}
     runs-on: windows-latest
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

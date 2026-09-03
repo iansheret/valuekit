@@ -188,6 +188,14 @@ def record(store: Any, ev: str, **fields: Any) -> None:
     """
     global _writer, _writer_root
     try:
+        emit = getattr(store, "emit", None)
+        if emit is not None:
+            # A worker whose store is the driver's: the record goes there,
+            # into the driver's own run file.
+            record = {"ev": ev, "t": time.time()}
+            record.update(fields)
+            emit(json.loads(json.dumps(record, default=_unrepresentable)))
+            return
         root = getattr(store, "root", None)
         if root is None:
             return

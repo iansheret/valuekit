@@ -39,20 +39,25 @@ are always tracked.
 from ._version import __version__
 from .values import freeze, content_hash, register_type
 from .map import ImmutableMap
-from .store import SerializationError
-from .pure import pure, set_cache_dir, clear_cache
+from .store import SerializationError, CacheMiss
+from .pure import pure, pure_local, log, set_cache_dir, clear_cache
 from .parallel import run_all, BatchResult
+from .batches import batch
 
 __all__ = [
+    "batch",
     "ImmutableMap",
     "freeze",
     "content_hash",
     "register_type",
     "pure",
+    "pure_local",
+    "log",
     "set_cache_dir",
     "clear_cache",
     "run_all",
     "BatchResult",
     "SerializationError",
+    "CacheMiss",
     "__version__",
 ]

@@ -13,17 +13,24 @@ task would report it against whichever input happened to go first.  Getting
 that wrong would break the one property `run_all` is built around: every
 failure recorded against the input that caused it.
 
-    driver -> SYNC    salt, ids, manifest hash, import roots
+    driver -> SYNC    salt, ids, source root, manifest hash, import roots
     worker -> WANT    empty if the source tree is already here, else send it
     driver -> TREE    the tarball, only if wanted
     worker -> READY   empty if admitted, else why not
 
-    driver -> HELLO   salt, module, qualname, fingerprint, cache, source id
+    driver -> HELLO   salt, module, qualname, fingerprint, source root, source id
     worker -> READY   empty if admitted, else why not
     driver -> OBJECT* the input's object graph
     driver -> TASK    the input's root hash
+    ...               store traffic: the worker's cache is the driver's
     worker -> OBJECT* the result's object graph
     worker -> RESULT  ok and a root hash, or a failure
+
+A worker holds no cache.  Its store is a :class:`~valuekit.remotestore.WireStore`,
+which sends every value, trace and run-log record to the driver and asks the
+driver for every lookup, so a batch's results exist in one place however
+many machines ran it.  The only thing written here is the source tree, at
+the root the driver named.
 
 Three checks guard the result, and they are deliberately independent.  The
 source tree decides what is on ``sys.path``; the *audit* then confirms that what
@@ -49,6 +56,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from . import runlog, sync, wire
+from .remotestore import WireStore
 
 __all__ = ["main", "serve", "serve_ready"]
 
@@ -61,9 +69,9 @@ def _resolve(module: str, qualname: str):
     return obj
 
 
-def source_dir(cache_dir: str, manifest_hash: str) -> Path:
-    """Where a synced source tree lives: beside objects/ and runs/."""
-    return Path(cache_dir) / "source" / manifest_hash
+def source_dir(source_root: str, manifest_hash: str) -> Path:
+    """Where a synced source tree lives, under the root the driver named."""
+    return Path(source_root) / manifest_hash
 
 
 def _install(source: Path, roots: list[str]) -> None:
@@ -152,16 +160,16 @@ def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
         wire.write_frame(tx, wire.READY, b"expected a sync request")
         return 1
     parts = wire.unstrings(body)
-    salt, module, qualname, fingerprint, cache_dir, mhash = parts[:6]
+    salt, module, qualname, fingerprint, source_root, mhash = parts[:6]
     roots = [r for r in parts[6:] if r]
 
-    reason = _refuse_early(salt, cache_dir)
+    reason = _refuse_early(salt, source_root)
     if reason:
         wire.write_frame(tx, wire.WANT, b"")  # nothing will be sent
         wire.write_frame(tx, wire.READY, reason.encode("utf-8"))
         return 1
 
-    source = source_dir(cache_dir, mhash)
+    source = source_dir(source_root, mhash)
     complete = source / ".complete"
     wire.write_frame(tx, wire.WANT, b"" if complete.exists() else b"send")
     if not complete.exists():
@@ -177,9 +185,6 @@ def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
             )
             return 1
 
-    from .pure import set_cache_dir
-
-    set_cache_dir(cache_dir)
     _install(source, roots)
 
     reason = _admit(salt, module, qualname, fingerprint)
@@ -191,16 +196,17 @@ def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
     return 1 if reason else 0
 
 
-def _refuse_early(salt: str, cache_dir: str) -> str:
+def _refuse_early(salt: str, source_root: str) -> str:
     from .pure import _salt
 
     mine = _salt()
     if mine != salt:
         return f"driver is {salt}, this worker is {mine}"
-    if not cache_dir:
+    if not source_root:
         return (
-            "this worker has no cache directory, so it has nowhere to keep a "
-            "copy of the project. Configure one with set_cache_dir()."
+            "this worker was given nowhere to keep a copy of the project. The "
+            "driver names the place from its cache directory; configure one "
+            "with set_cache_dir()."
         )
     return sync.check_extraction_supported()
 
@@ -273,12 +279,12 @@ def serve(rx: BinaryIO, tx: BinaryIO) -> int:
         wire.write_frame(tx, wire.READY, b"expected a greeting")
         return 1
     parts = wire.unstrings(body)
-    salt, module, qualname, fingerprint, cache_dir, mhash = parts[:6]
+    salt, module, qualname, fingerprint, source_root, mhash = parts[:6]
     roots = [r for r in parts[6:] if r]
 
     # The source tree has to be on the path before _admit, which imports.
     if mhash:
-        source = source_dir(cache_dir, mhash)
+        source = source_dir(source_root, mhash)
         if not (source / ".complete").exists():
             wire.write_frame(tx, wire.READY, b"the source tree is missing")
             return 1
@@ -289,46 +295,48 @@ def serve(rx: BinaryIO, tx: BinaryIO) -> int:
     if reason:
         return 1
 
-    if cache_dir:
-        from .pure import set_cache_dir
+    from .pure import _current_store, set_store
 
-        set_cache_dir(cache_dir)
-
-    objects: dict[str, bytes] = {}
-    root = None
-    while True:
-        frame = wire.read_frame(rx)
-        if frame is None:
-            return 0  # cancelled before the task arrived
-        tag, body = frame
-        if tag == wire.OBJECT:
-            wire.recv_object(body, objects)
-        elif tag == wire.TASK:
-            root = body.hex()
-            break
-        else:
-            raise wire.WireError(f"unexpected frame {tag!r}")
-
-    fn = _resolve(module, qualname)
+    store = WireStore(rx, tx)
+    previous = _current_store()  # serve() runs in-process in tests
+    set_store(store)
     try:
-        x = wire.unpack(root, objects)
-    except Exception as e:
-        _send_error(tx, type(e).__name__, f"the input could not be read: {e}")
-        return 1
+        root = None
+        while True:
+            frame = wire.read_frame(rx)
+            if frame is None:
+                return 0  # cancelled before the task arrived
+            tag, body = frame
+            if tag == wire.OBJECT:
+                store.receive(body)
+            elif tag == wire.TASK:
+                root = body.hex()
+                break
+            else:
+                raise wire.WireError(f"unexpected frame {tag!r}")
 
-    try:
-        value = fn(x)
-    except BaseException as e:
-        _send_error(tx, type(e).__name__, str(e), traceback.format_exc())
-        return 1
+        fn = _resolve(module, qualname)
+        try:
+            x = store.unpack(root)
+        except Exception as e:
+            _send_error(tx, type(e).__name__, f"the input could not be read: {e}")
+            return 1
 
-    try:
-        out = wire.send_value(tx, value, set())
-    except Exception as e:
-        _send_error(tx, type(e).__name__, f"the result could not be sent back: {e}")
-        return 1
-    wire.write_frame(tx, wire.RESULT, b"o" + bytes.fromhex(out))
-    return 0
+        try:
+            value = fn(x)
+        except BaseException as e:
+            _send_error(tx, type(e).__name__, str(e), traceback.format_exc())
+            return 1
+
+        try:
+            out = store.put_value(value)
+        except Exception as e:
+            _send_error(tx, type(e).__name__, f"the result could not be sent back: {e}")
+            return 1
+        wire.write_frame(tx, wire.RESULT, b"o" + bytes.fromhex(out))
+        return 0
+    finally:
+        set_store(previous)
 
 
 def _send_error(tx: BinaryIO, kind: str, text: str, tb: str = "") -> None:

@@ -28,7 +28,7 @@ from valuekit import parallel
 from valuekit import sync
 from valuekit import wire
 from valuekit.codehash import _classify, function_fingerprint
-from valuekit.store import LocalStore, CacheMiss, SerializationError
+from valuekit.store import LocalStore, CacheMiss, SerializationError, trace_hash
 from valuekit.values import encode_key, decode_key
 from valuekit import pure as _pure_mod  # module alias for store poking
 from valuekit import debughook
@@ -714,30 +714,109 @@ class TestStore:
         s.put_trace("k", dict(t))
         assert len(s.get_traces("k")) == 1
 
-    def test_concurrent_trace_appends_are_not_lost(self, tmp_path):
-        # The failure mode of a read-modify-write trace file: parallel
-        # writers dropping each other's traces. Appends must all survive.
-        from concurrent.futures import ThreadPoolExecutor
+    def test_concurrent_trace_writes_survive_across_processes(self, tmp_path):
+        # Parallel writers used to drop each other's traces on Windows,
+        # where an O_APPEND write is a seek followed by a write. Every trace
+        # is now its own content-named file, so there is nothing shared to
+        # lose. Real processes, not threads: the CRT behaviour is per file
+        # descriptor and threads in one process did not show it reliably.
+        script = (
+            "import sys\n"
+            "from valuekit.store import LocalStore\n"
+            "root, i = sys.argv[1], int(sys.argv[2])\n"
+            "s = LocalStore(root)\n"
+            "for j in range(50):\n"
+            "    s.put_trace('k', {'fn': 'f', 'deps': {'x': {'kind': 'value',"
+            " 'hash': f'{i}-{j}'}}, 'result': '0' * 40})\n"
+        )
+        procs = [
+            subprocess.Popen([sys.executable, "-c", script, str(tmp_path), str(i)])
+            for i in range(8)
+        ]
+        assert [p.wait() for p in procs] == [0] * 8
+        got = LocalStore(tmp_path).get_traces("k")
+        assert len(got) == 400
+        assert all(h == trace_hash(t) for h, t in got)
 
-        stores = [LocalStore(tmp_path) for _ in range(4)]
-
-        def write(i):
-            stores[i % 4].put_trace(
-                "k", {"fn": "f", "deps": {"x": {"kind": "value", "hash": str(i)}},
-                      "result": "0" * 40}
-            )
-
-        with ThreadPoolExecutor(8) as ex:
-            list(ex.map(write, range(32)))
-        assert len(LocalStore(tmp_path).get_traces("k")) == 32
-
-    def test_torn_trace_line_skipped(self, tmp_path):
+    def test_put_trace_returns_hash_and_get_traces_pairs(self, tmp_path):
         s = LocalStore(tmp_path)
         t = {"fn": "f", "deps": {}, "result": "0" * 40}
-        s.put_trace("k", t)
-        with open(s._trace_path("k"), "a") as f:
-            f.write('{"fn": "g", "trunc')  # simulates a crash mid-append
-        assert s.get_traces("k") == [t]
+        h = s.put_trace("k", t)
+        assert h == trace_hash(t)
+        assert (tmp_path / "traces" / "k" / f"{h}.json").exists()
+        assert s.get_traces("k") == [(h, t)]
+
+    def test_corrupt_trace_file_skipped(self, tmp_path):
+        # A file that does not parse, and one whose bytes do not hash to its
+        # name (a torn write, or an edit), are both ignored: a miss at worst.
+        s = LocalStore(tmp_path)
+        t = {"fn": "f", "deps": {}, "result": "0" * 40}
+        h = s.put_trace("k", t)
+        d = tmp_path / "traces" / "k"
+        (d / f"{'1' * 40}.json").write_bytes(b'{"fn": "g", "trunc')
+        (d / f"{'2' * 40}.json").write_bytes(b'{"fn": "g", "deps": {}}')
+        assert s.get_traces("k") == [(h, t)]
+
+    def test_get_traces_newest_first(self, tmp_path):
+        s = LocalStore(tmp_path)
+        old = {"fn": "f", "deps": {}, "result": "0" * 40}
+        new = {"fn": "f", "deps": {}, "result": "1" * 40}
+        h_old = s.put_trace("k", old)
+        h_new = s.put_trace("k", new)
+        d = tmp_path / "traces" / "k"
+        os.utime(d / f"{h_old}.json", (1_000_000, 1_000_000))
+        os.utime(d / f"{h_new}.json", (2_000_000, 2_000_000))
+        assert [h for h, _ in s.get_traces("k")] == [h_new, h_old]
+
+    def test_listing_sees_another_stores_write(self, tmp_path):
+        # The listing is cached per store on the directory's mtime, which
+        # any process's write moves.
+        a = LocalStore(tmp_path)
+        b = LocalStore(tmp_path)
+        t1 = {"fn": "f", "deps": {}, "result": "0" * 40}
+        t2 = {"fn": "f", "deps": {}, "result": "1" * 40}
+        a.put_trace("k", t1)
+        assert len(a.get_traces("k")) == 1
+        b.put_trace("k", t2)
+        assert len(a.get_traces("k")) == 2
+
+    def test_atomic_write_onto_existing_target_is_success(self, tmp_path, monkeypatch):
+        # Windows refuses to replace a file another process has mapped. The
+        # target is content-addressed, so if it exists the write is done.
+        from valuekit import store as store_mod
+
+        target = tmp_path / "x.bin"
+        target.write_bytes(b"same")
+        real = os.replace
+
+        def refusing(src, dst):
+            if os.path.exists(dst):
+                raise PermissionError("Access is denied")
+            real(src, dst)
+
+        monkeypatch.setattr(os, "replace", refusing)
+        store_mod._atomic_write(target, b"same")
+        assert target.read_bytes() == b"same"
+        assert not list(tmp_path.glob(".tmp-*"))
+
+    def test_drop_dependents_removes_directory_and_deps(self, tmp_path):
+        s = LocalStore(tmp_path)
+        s.put_trace("k", {"fn": "f", "deps": {}, "result": "0" * 40}, units=["u1"])
+        s.put_trace("j", {"fn": "g", "deps": {}, "result": "0" * 40}, units=["u2"])
+        s.drop_dependents({"u1"}, None)
+        assert not (tmp_path / "traces" / "k").exists()
+        assert not (tmp_path / "traces" / "k.deps").exists()
+        assert s.get_traces("k") == []
+        assert len(s.get_traces("j")) == 1
+
+    def test_drop_dependents_by_value_hash_scans_directories(self, tmp_path):
+        s = LocalStore(tmp_path)
+        s.put_trace("k", {"fn": "f", "deps": {"x": {"kind": "value", "hash": "a" * 40}},
+                          "result": "0" * 40})
+        s.put_trace("j", {"fn": "g", "deps": {}, "result": "0" * 40})
+        s.drop_dependents(set(), "a" * 40)
+        assert s.get_traces("k") == []
+        assert len(s.get_traces("j")) == 1
 
     def test_immutable_map_pickles(self, tmp_path):
         import pickle
@@ -2162,6 +2241,248 @@ class TestNestedPure:
 
 
 
+@pure
+def _fib(n):
+    # Module level: a recursive reference through a closure cell is not
+    # walkable by the fingerprint, and recursion through a global is the
+    # documented shape.
+    return n if n < 2 else _fib(n - 1) + _fib(n - 2)
+
+
+def _trace_of(cache, f):
+    """The newest stored trace of *f*, as ``(hash, doc)``."""
+    got = LocalStore(cache).get_traces(f._valuekit_identity()[0])
+    assert got, "no trace stored"
+    return got[0]
+
+
+class TestBindings:
+    """What a computation binds -- nested calls and log() -- lives in its
+    trace, so a hit needs nothing replayed."""
+
+    def test_nested_calls_recorded_in_order_with_their_hashes(self, cache):
+        @pure
+        def a(x):
+            return x + 1
+
+        @pure
+        def b(x):
+            return x * 2
+
+        @pure
+        def outer(x):
+            return a(b(a(x)))
+
+        assert outer(1) == 5
+        _, t = _trace_of(cache, outer)
+        a_key = a._valuekit_identity()[0]
+        b_key = b._valuekit_identity()[0]
+        a_hashes = {h for h, _ in LocalStore(cache).get_traces(a_key)}
+        (hb, _), = LocalStore(cache).get_traces(b_key)
+        assert [c[:2] for c in t["calls"]] == [
+            [a.__qualname__, a_key], [b.__qualname__, b_key], [a.__qualname__, a_key]
+        ]
+        assert t["calls"][1][2] == hb
+        assert {t["calls"][0][2], t["calls"][2][2]} == a_hashes
+        assert t["logs"] == []
+
+    def test_a_hit_records_the_trace_it_matched(self, cache):
+        n = []
+
+        @pure
+        def inner(x):
+            n.append(x)
+            return x + 1
+
+        @pure
+        def outer(x):
+            return inner(x)
+
+        inner(1)
+        h_inner, _ = _trace_of(cache, inner)
+        outer(1)
+        assert n == [1]  # the inner call inside outer was a hit
+        _, t = _trace_of(cache, outer)
+        assert t["calls"] == [[inner.__qualname__, inner._valuekit_identity()[0], h_inner]]
+        assert len(LocalStore(cache).get_traces(inner._valuekit_identity()[0])) == 1
+
+    def test_log_records_values_in_order(self, cache):
+        @pure
+        def f(x):
+            vk.log("a", x)
+            vk.log("b", np.arange(3.0) * x)
+            return x
+
+        f(2)
+        _, t = _trace_of(cache, f)
+        assert [name for name, _ in t["logs"]] == ["a", "b"]
+        s = LocalStore(cache)
+        assert s.get_value(t["logs"][0][1]) == 2
+        np.testing.assert_array_equal(s.get_value(t["logs"][1][1]), [0.0, 2.0, 4.0])
+
+    def test_log_outside_a_call_raises_with_a_store_and_noops_without(self, tmp_path):
+        vk.set_cache_dir(tmp_path)
+        with pytest.raises(RuntimeError, match="outside"):
+            vk.log("x", 1)
+        vk.set_cache_dir(None)
+        vk.log("x", 1)  # nothing configured: nothing happens
+
+    def test_log_of_a_map_depends_on_all_of_it(self, cache):
+        n = []
+
+        @pure
+        def f(m):
+            vk.log("m", m)
+            n.append(1)
+            return 1
+
+        m = ImmutableMap({"a": 1, "b": 2})
+        f(m)
+        f(m | {"b": 3})  # a key f never read: but the log observed the whole map
+        assert len(n) == 2
+
+    def test_log_in_a_forced_run_writes_nothing(self, cache, monkeypatch):
+        monkeypatch.setenv("VALUEKIT_ALWAYS_RUN", "1")
+
+        @pure
+        def f(x):
+            vk.log("a", np.arange(1000.0) * x)
+            return x
+
+        assert f(1) == 1  # log() neither raises nor writes
+        assert not list((cache / "objects").rglob("*.npy"))
+        assert LocalStore(cache).get_traces(f._valuekit_identity()[0]) == []
+
+    def test_log_in_a_tainted_miss_is_discarded(self, cache, monkeypatch):
+        import bdb
+
+        dbg = bdb.Bdb()
+        monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
+
+        @pure
+        def inner(x):
+            return x * 2
+
+        fname, lo, _ = inner._valuekit_identity()[1][0]
+        armed = [True]
+
+        @pure
+        def outer(x):
+            vk.log("before", x)
+            if armed[0]:
+                armed[0] = False
+                dbg.set_break(fname, lo + 1)
+            return inner(x) + 1
+
+        assert outer(3) == 7
+        assert LocalStore(cache).get_traces(outer._valuekit_identity()[0]) == []
+
+    def test_cached_returns_the_stored_result_without_executing(self, cache):
+        n = []
+
+        @pure
+        def f(x):
+            n.append(x)
+            return x + 1
+
+        with pytest.raises(CacheMiss):
+            f.cached(1)
+        f(1)
+        assert f.cached(1) == 2
+        assert n == [1]
+        with pytest.raises(CacheMiss):
+            f.cached(2)
+        assert n == [1]
+
+    def test_cached_without_a_store_raises(self):
+        @pure
+        def f(x):
+            return x
+
+        with pytest.raises(CacheMiss):
+            f.cached(1)
+
+    def test_cached_inside_a_miss_is_recorded_as_a_call(self, cache):
+        @pure
+        def inner(x):
+            return x + 1
+
+        @pure
+        def outer(x):
+            return inner.cached(x)
+
+        inner(1)
+        h_inner, _ = _trace_of(cache, inner)
+        outer(1)
+        _, t = _trace_of(cache, outer)
+        assert t["calls"][0][2] == h_inner
+
+    def test_lookup_returns_the_matched_hash_or_none(self, cache):
+        @pure
+        def f(x):
+            return x
+
+        assert f._valuekit_lookup(1) is None
+        f(1)
+        h, t = _trace_of(cache, f)
+        assert f._valuekit_lookup(1) == (h, t)
+        assert f._valuekit_lookup(2) is None
+
+    def test_pure_local_memoises_identically_and_is_flagged(self, cache):
+        n = []
+
+        def body(x):
+            n.append(x)
+            return x + 1
+
+        f = pure(body)
+        g = vk.pure_local(body)
+        assert f._valuekit_local is False and g._valuekit_local is True
+        f(1)
+        assert g(1) == 2 and n == [1]  # same code, same key: a hit
+        vk.clear_cache(g)
+        assert g(1) == 2 and n == [1, 1]
+
+    def test_recursion_records_the_calls_it_made(self, cache):
+        _fib(3)
+        key = _fib._valuekit_identity()[0]
+        traces = {h: t for h, t in LocalStore(cache).get_traces(key)}
+        (top,) = [t for t in traces.values() if t["deps"]["n"]["hash"] == content_hash(3)]
+        assert [c[:2] for c in top["calls"]] == [[_fib.__qualname__, key]] * 2
+        assert all(c[2] in traces for c in top["calls"])
+
+    def test_threads_record_only_their_own_calls(self, cache):
+        import threading
+
+        barrier = threading.Barrier(2)
+
+        @pure
+        def inner(x):
+            barrier.wait(timeout=5)  # both outers are mid-execution together
+            return x + 1
+
+        @pure
+        def outer(x):
+            return inner(x)
+
+        threads = [threading.Thread(target=outer, args=(x,)) for x in (1, 2)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        s = LocalStore(cache)
+        inner_x = {h: t["deps"]["x"]["hash"] for h, t in s.get_traces(inner._valuekit_identity()[0])}
+        outers = s.get_traces(outer._valuekit_identity()[0])
+        assert len(outers) == 2
+        for _, t in outers:
+            [(_, _, h)] = t["calls"]
+            assert inner_x[h] == t["deps"]["x"]["hash"]
+
+    def test_valuekit_itself_is_never_user_code(self):
+        kind, marker = _classify("valuekit.pure", sys.modules["valuekit.pure"].__file__)
+        assert kind == codehash._PKG and marker == "pkg:valuekit"
+
+
 class TestDebugHook:
     def test_no_debugger_no_forcing(self):
         assert debughook.breakpoints_force([("/x.py", 1, 10)]) is False
@@ -2246,8 +2567,28 @@ def _write_batch_module(tmp_path):
     log = tmp_path / "runs.log"
     mod = tmp_path / "vk_batch_mod.py"
     mod.write_text(
-        "from valuekit import pure\n"
+        "from valuekit import pure, pure_local, log as vklog\n"
+        "import numpy as np\n"
         f"LOG = {str(log)!r}\n"
+        "@pure_local\n"
+        "def here(x):\n"
+        "    import os\n"
+        "    vklog('where', os.getpid())\n"
+        "    return os.getpid()\n"
+        "@pure\n"
+        "def via_local(x):\n"
+        "    return here(x)\n"
+        "@pure\n"
+        "def env_var(name):\n"
+        "    import os\n"
+        "    return os.environ.get(name, 'absent')\n"
+        "@pure\n"
+        "def with_log(sid):\n"
+        "    vklog('twice', sid * 2)\n"
+        "    vklog('twice', sid * 3)\n"
+        "    vklog('parity', sid % 2)\n"
+        "    vklog('arr', np.arange(3.0) * sid)\n"
+        "    return sid\n"
         "def _note(tag):\n"
         "    with open(LOG, 'a') as f:\n"
         "        f.write(tag + '\\n')\n"
@@ -2261,13 +2602,16 @@ def _write_batch_module(tmp_path):
         "    if sid == 3:\n"
         "        raise ValueError('bad calibration in scenario 3')\n"
         "    return x + 1\n"
+        "@pure\n"
         "def process(sid):\n"
         "    return analyse(sid, load(sid))\n"
+        "@pure\n"
         "def hard_death(x):\n"
         "    import os\n"
         "    if x == 1:\n"
         "        os._exit(1)\n"
         "    return x * 2\n"
+        "@pure\n"
         "def quick_or_hang(sid):\n"
         "    import time\n"
         "    x = load(sid)\n"
@@ -2426,6 +2770,7 @@ class TestRunAll:
             calls.append(x)  # visible only if executed in THIS process
             return x + 1
 
+        @pure
         def batch(x):
             return step(x)
 
@@ -2445,6 +2790,188 @@ class TestRunAll:
 # The cache's whole promise is that it can stay on, and none of it is
 # visible from outside: a step that ought to hit and silently does not looks
 # exactly like a slow one. These assert what the event stream records.
+
+
+class TestBatches:
+    """run_all records what it produced under a name; valuekit.batch reads
+    it back without importing or running the pipeline."""
+
+    def test_run_all_requires_a_memoised_function(self, cache):
+        def plain(x):
+            return x
+
+        with pytest.raises(TypeError, match="@pure"):
+            vk.run_all(plain, [1])
+
+    def test_a_batch_is_recorded_and_readable(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        vk.run_all(m.process, [1, 2, 3, 4], max_workers=2)
+        b = vk.batch("process")
+        assert (b.name, b.fn, b.n) == ("process", "process", 4)
+        assert b.fingerprint == m.process._valuekit_identity()[0]
+        assert b.inputs == [1, 2, 3, 4]
+        assert b.complete and b.pending == []
+        assert b.failures == [(3, "ValueError", "bad calibration in scenario 3")]
+        assert [r.input for r in b.rows] == [1, 2, 4]
+        row = b[1]
+        assert row.result == 11
+        assert row.names() == ["load", "analyse"]
+        assert row["load"] == 10 and row["analyse"] == 11
+        assert [c.fn for c in row.calls] == ["load", "analyse"]
+        assert b.column("load") == [10, 20, None, 40]
+        with pytest.raises(KeyError, match="failed"):
+            b[3]
+        with pytest.raises(KeyError, match="not an input"):
+            b[99]
+        with pytest.raises(KeyError, match="not bound"):
+            row["nothing"]
+
+    def test_cached_inputs_skip_workers_and_are_still_recorded(self, cache, tmp_path):
+        m, counts = _write_batch_module(tmp_path)
+        vk.run_all(m.process, [1, 2], max_workers=2)
+        first = vk.batch("process")
+        n = len(counts())
+        vk.run_all(m.process, [1, 2], max_workers=2)
+        assert len(counts()) == n  # nothing executed anywhere
+        second = vk.batch("process")
+        assert second._path != first._path  # a new batch under the same name
+        assert [r.input for r in second.rows] == [1, 2]
+        assert second[2].trace_hash == first[2].trace_hash  # the same traces
+        assert [p.name for p in first._path.parent.iterdir() if p.is_dir()] == [
+            second._path.name
+        ]  # the older record is gone
+
+    def test_batch_names(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        vk.run_all(m.process, [1], name="nightly")
+        assert vk.batch("nightly").fn == "process"
+        with pytest.raises(LookupError):
+            vk.batch("process")
+        with pytest.raises(LookupError):
+            vk.batch("nightly", cache_dir=tmp_path / "elsewhere")
+
+    def test_logged_values_are_read_by_name(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        vk.run_all(m.with_log, [1, 2, 3, 4], max_workers=2)
+        b = vk.batch("with_log")
+        assert b[2]["twice"] == [4, 6]  # bound twice: a list, in order
+        assert b[2]["parity"] == 0
+        np.testing.assert_array_equal(b[3]["arr"], [0.0, 3.0, 6.0])
+        assert b[1].names() == ["twice", "parity", "arr"]
+        # A name bound in a nested call is found from the root row too.
+        vk.run_all(m.process, [1], max_workers=1)
+        assert vk.batch("process")[1]["load"] == 10
+        assert vk.batch("process")[1].names() == ["load", "analyse"]
+        groups = b.by("parity")
+        assert {k: [r.input for r in rows] for k, rows in groups.items()} == {
+            0: [2, 4], 1: [1, 3]
+        }
+        assert b.column("parity") == [1, 0, 1, 0]
+
+    def test_a_batch_is_readable_while_it_runs(self, cache, tmp_path):
+        import threading
+
+        m, _ = _write_batch_module(tmp_path)
+        done = []
+        th = threading.Thread(
+            target=lambda: done.append(
+                vk.run_all(m.quick_or_hang, [7, 9], max_workers=2, timeout=4)
+            )
+        )
+        th.start()
+        b = None
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                b = vk.batch("quick_or_hang")
+            except LookupError:
+                time.sleep(0.1)
+                continue
+            if 7 not in b.pending:
+                break
+            time.sleep(0.1)
+        assert b is not None and not b.complete  # input 9 is still hanging
+        assert b[7].result == 70
+        th.join()
+        b.refresh()
+        assert b.complete
+        assert [(x, kind) for x, kind, _ in b.failures] == [(9, "TimeoutError")]
+
+    def test_a_batch_inside_a_pure_function_is_recorded_as_calls(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+
+        @pure
+        def driver(n):
+            return vk.run_all(m.process, list(range(1, n + 1))).values
+
+        assert driver(2) == [11, 21]
+        _, t = _trace_of(cache, driver)
+        key = m.process._valuekit_identity()[0]
+        assert [c[:2] for c in t["calls"]] == [["process", key]] * 2
+        assert {c[2] for c in t["calls"]} == {r.trace_hash for r in vk.batch("process")}
+
+
+class TestSweep:
+    def _module(self, tmp_path, body_of_f):
+        mod = tmp_path / "vk_sweep_mod.py"
+        mod.write_text(
+            "from valuekit import pure\n"
+            "import numpy as np\n"
+            "@pure\n"
+            f"def f(x):\n    return {body_of_f}\n"
+            "@pure\n"
+            "def g(x):\n    return (x, np.arange(4.0) * x)\n"
+        )
+        sys.modules.pop("vk_sweep_mod", None)
+        if str(tmp_path) not in sys.path:
+            sys.path.insert(0, str(tmp_path))
+        import importlib
+
+        return importlib.import_module("vk_sweep_mod")
+
+    def test_sweep_removes_what_the_current_code_cannot_reach(self, cache, tmp_path):
+        from valuekit import sweep
+
+        m = self._module(tmp_path, "np.arange(1000.0) * x")
+        vk.run_all(m.f, [1, 2], max_workers=1)
+        vk.run_all(m.g, [1], max_workers=1)
+        old_key = m.f._valuekit_identity()[0]
+        g_key = m.g._valuekit_identity()[0]
+        n_objects = len([p for p in (cache / "objects").rglob("*") if p.is_file()])
+
+        m = self._module(tmp_path, "np.arange(1000.0) * x + 1")  # f edited
+        counts = sweep.sweep(cache, ["vk_sweep_mod"], dry_run=True)
+        assert counts["traces"] == 2 and counts["batches"] == 1
+        assert (cache / "traces" / old_key).exists()  # a dry run removes nothing
+
+        counts = sweep.sweep(cache, ["vk_sweep_mod"])
+        assert counts == {"functions": 2, "traces": 2, "batches": 1, "objects": counts["objects"]}
+        assert counts["objects"] >= 2  # f's two old result arrays, at least
+        assert not (cache / "traces" / old_key).exists()
+        assert not (cache / "traces" / f"{old_key}.deps").exists()
+        assert (cache / "traces" / g_key).exists()
+        with pytest.raises(LookupError):
+            vk.batch("f")
+        b = vk.batch("g")
+        np.testing.assert_array_equal(b[1].result[1], [0.0, 1.0, 2.0, 3.0])  # still readable
+        assert len([p for p in (cache / "objects").rglob("*") if p.is_file()]) < n_objects
+
+        vk.run_all(m.f, [1], max_workers=1)  # the edited f runs and records afresh
+        assert vk.batch("f")[1].result[1] == 2.0
+        sys.modules.pop("vk_sweep_mod", None)
+
+    def test_sweep_command(self, cache, tmp_path):
+        from valuekit import sweep
+
+        self._module(tmp_path, "x")
+        out = subprocess.run(
+            [sys.executable, "-m", "valuekit.sweep", "--cache", str(cache), "--dry-run",
+             "vk_sweep_mod"],
+            cwd=tmp_path, capture_output=True, text=True,
+        )
+        assert out.returncode == 0, out.stderr
+        assert "2 live functions" in out.stdout
+        sys.modules.pop("vk_sweep_mod", None)
 
 
 def _records(cache_dir, ev=None):
@@ -2700,7 +3227,7 @@ class TestWire:
             wire.unpack(root, objs)
 
 
-def _hello(fn, salt=None, fingerprint=None, cache_dir="", mhash=""):
+def _hello(fn, salt=None, fingerprint=None, source_root="", mhash=""):
     from valuekit.pure import _salt
 
     # An empty manifest hash means "no source tree": the worker imports the way
@@ -2710,7 +3237,7 @@ def _hello(fn, salt=None, fingerprint=None, cache_dir="", mhash=""):
         fn.__module__,
         fn.__qualname__,
         fingerprint or function_fingerprint(fn)[0],
-        cache_dir,
+        source_root,
         mhash,
     )
 
@@ -2811,13 +3338,31 @@ class TestPipeBackend:
         vk.run_all(m.process, [1, 2])
         assert len(counts()) == n  # second round: all hits, zero executions
 
-    def test_workers_report_themselves_as_workers(self, cache, tmp_path):
-        # A subprocess worker is not a multiprocessing child, so it cannot be
-        # recognised from the process tree and has to say so.
+    def test_workers_write_nothing_and_report_through_the_driver(self, cache, tmp_path):
+        # A worker's store is the driver's: its hits, misses, traces and
+        # values all arrive here, and it opens no run file of its own.
         m, _ = _write_batch_module(tmp_path)
         vk.run_all(m.process, [1, 2])
         roles = [e["role"] for _, e in _records(cache, "run")]
-        assert roles.count("driver") == 1 and roles.count("worker") == 2
+        assert roles == ["driver"]
+        misses = [e["fn"] for _, e in _records(cache, "miss")]
+        assert sorted(misses) == ["analyse", "analyse", "load", "load", "process", "process"]
+        assert LocalStore(cache).get_traces(m.load._valuekit_identity()[0])
+
+    def test_a_pure_local_call_in_a_worker_runs_on_the_driver(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.via_local, [1, 2])
+        assert r.values == [os.getpid()] * 2  # this process, not a worker
+        b = vk.batch("via_local")
+        assert b[1]["where"] == os.getpid()
+        assert b[1]["here"] == os.getpid()
+        # The driver stored the call's trace; the worker's row names it.
+        assert LocalStore(cache).get_traces(m.here._valuekit_identity()[0])
+
+    def test_the_worker_environment_is_an_allowlist(self, cache, tmp_path, monkeypatch):
+        m, _ = _write_batch_module(tmp_path)
+        monkeypatch.setenv("VK_UNRELATED_SECRET", "hunter2")
+        assert vk.run_all(m.env_var, ["VK_UNRELATED_SECRET"]).values == ["absent"]
 
     def test_a_timeout_kills_one_input_and_spares_the_rest(self, cache, tmp_path):
         # A worker speaks before it finishes -- a greeting, then the result's
@@ -2860,7 +3405,10 @@ class TestPipeBackend:
 # would look like it worked while proving nothing.
 
 
-def _project(tmp_path, body="def work(x):\n    return x + 100\n", extra=None):
+_WORK = "from valuekit import pure\n@pure\ndef work(x):\n    return x + 100\n"
+
+
+def _project(tmp_path, body=_WORK, extra=None):
     """A small project tree with a marker file, as a real one would have."""
     root = tmp_path / "proj"
     root.mkdir(exist_ok=True)
@@ -2935,7 +3483,7 @@ class TestSync:
         root = _project(tmp_path)
         first = sync.manifest_hash(sync.manifest(str(root)))
         assert first == sync.manifest_hash(sync.manifest(str(root)))
-        (root / "vk_sync_mod.py").write_text("def work(x):\n    return x + 999\n")
+        (root / "vk_sync_mod.py").write_text("from valuekit import pure\n@pure\ndef work(x):\n    return x + 999\n")
         assert sync.manifest_hash(sync.manifest(str(root))) != first
 
     def test_content_is_hashed_even_when_mtime_and_size_do_not_move(
@@ -2950,7 +3498,7 @@ class TestSync:
         before = os.stat(f)
         first = sync.manifest_hash(sync.manifest(str(root)))
 
-        f.write_text("def work(x):\n    return x + 999\n")  # same length
+        f.write_text("from valuekit import pure\n@pure\ndef work(x):\n    return x + 999\n")  # same length
         os.utime(f, ns=(before.st_atime_ns, before.st_mtime_ns))
         after = os.stat(f)
         assert after.st_size == before.st_size
@@ -3020,7 +3568,7 @@ class TestSourceTree:
         m = _load(root)
         assert vk.run_all(m.work, [1]).values == [101]
         (root / "vk_sync_mod.py").write_text(
-            "def work(x):\n    return x + 999999\n"  # a different length: a
+            "from valuekit import pure\n@pure\ndef work(x):\n    return x + 999999\n"  # a different length: a
         )                                            # same-length edit within
         m = _load(root)                              # one second reloads the
         assert vk.run_all(m.work, [1]).values == [1000000]  # stale .pyc
@@ -3048,7 +3596,9 @@ class TestSourceTree:
         # mistaken for a finished source tree.
         half = cache / "source" / backend._hash
         half.mkdir(parents=True)
-        (half / "vk_sync_mod.py").write_text("def work(x):\n    return 'WRONG'\n")
+        (half / "vk_sync_mod.py").write_text(
+            "from valuekit import pure\n@pure\ndef work(x):\n    return 'WRONG'\n"
+        )
         backend.ensure_ready()
         assert vk.run_all(m.work, [1]).values == [101]
 
@@ -3064,8 +3614,8 @@ class TestSourceTree:
             m = _load(
                 _project(
                     tmp_path,
-                    body="import vk_sync_mod_far\n"
-                    "def work(x):\n    return vk_sync_mod_far.helper(x)\n",
+                    body="from valuekit import pure\nimport vk_sync_mod_far\n"
+                    "@pure\ndef work(x):\n    return vk_sync_mod_far.helper(x)\n",
                 )
             )
             with pytest.raises(RuntimeError, match="outside its project"):

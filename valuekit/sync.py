@@ -58,6 +58,9 @@ __all__ = [
 # unconditionally: a project that commits its .so files should still not ship
 # them to a machine that may not share this one's architecture.
 _SKIP_SUFFIXES = tuple(EXTENSION_SUFFIXES) + (
+    # Named explicitly as well: the manifest must be the same on every
+    # platform, and EXTENSION_SUFFIXES lists only this platform's.
+    ".so", ".pyd",
     ".o", ".a", ".obj", ".lib", ".dylib", ".dll", ".pyc", ".pyo",
 )
 _SKIP_DIRS = frozenset(

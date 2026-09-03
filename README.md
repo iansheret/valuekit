@@ -3,7 +3,9 @@
 Disk memoisation for pure functions, plus an immutable map for the
 pipeline data they run over. Both apply the same idea: pipeline data as
 immutable *values*, identified by content. The two parts are independent;
-use either without the other.
+use either without the other. On top of them: a batch runner, a record of
+what each batch produced that analysis code reads by name, and a monitor
+for watching a run from another process.
 
 The usual ways of caching a pipeline fail in one of two directions. If the
 key is too coarse (a file path, a manual version tag), results go stale silently and hits stop
@@ -27,6 +29,7 @@ enters the cache.
 from valuekit import pure, set_cache_dir
 
 set_cache_dir("~/.cache/mypipeline")     # nothing is cached until this is called
+                                         # (and deleted whole is always safe)
 
 @pure
 def calculate_geometry(obs, config):
@@ -128,6 +131,44 @@ Decoration emits no warnings. Side effects in a `@pure` function (logging,
 progress bars, metrics) are permitted by the contract precisely because
 they will not happen on a hit; whether that is acceptable is the user's
 decision.
+
+`step.cached(obs, cfg)` returns the stored result for those arguments
+without executing, or raises `CacheMiss`. It is the lookup half of a call,
+for code that wants to know what has been computed without computing.
+
+## `@pure_local`
+
+A `@pure` function's result depends on its arguments and its definition and
+nothing else. Most pipelines also have a few functions whose result depends
+on something outside the program: a file on this machine, a database, a
+download that needs this machine's credentials. `@pure_local` memoises such
+a function exactly as `@pure` does, on a different promise: that the thing
+it reads, as seen through these arguments, never changes. The same
+arguments give the same value, now and later.
+
+```python
+@pure_local
+def fetch_session(session_id):
+    return download(session_id, token=os.environ["TOKEN"])   # bytes, or arrays
+
+@pure
+def process(session_id):
+    return analyse(fetch_session(session_id))
+```
+
+If the promise cannot be made for a source that does change, put the
+version in the arguments (a date, a commit, an etag), where it is tracked
+like everything else; `clear_cache(fetch_session)` says "what this function
+sees has changed". Effects that do not reach the result, such as a scratch
+file or a download cache, are permitted, since on a hit none of them
+happen. The result must be a value, never a path: a path from this machine
+means nothing on another.
+
+Because the function reads an environment, it runs only on the machine that
+has that environment, the one driving the pipeline. A batch running
+elsewhere sends such calls back here and receives the value. Expect a
+pipeline to have a handful of these at the top and `@pure` everywhere else;
+`@pure_local` is not the way out when `@pure` feels strict.
 
 ## The immutable map
 
@@ -283,26 +324,51 @@ miss rather than being rebuilt into something it no longer means.
 Caching a type is not the same as freezing it, so a dataclass still cannot
 go into an `ImmutableMap` without a `freeze_fn`.
 
-Writes are atomic; directories can be shared between processes; a missing
-or corrupt entry is treated as a miss. Deleting the cache is always safe. A
-call that raises caches nothing. There is no eviction in this version: the
-cache is a directory, so check its size with `du -sh` and delete it when it
-grows too large.
+Every file is named by the hash of its content, traces included, and is
+written whole: two processes writing the same entry write the same bytes
+under the same name, so directories can be shared between any number of
+processes, on Windows as well as POSIX, with nothing to coordinate. A
+missing or corrupt entry is treated as a miss. Deleting the cache is always
+safe. A call that raises caches nothing.
+
+### Retention
+
+Nothing is removed for being old. A result whose function has not changed
+is current whatever its age, and it is what `valuekit.batch` reads. What
+can go is everything the current code can no longer reach:
+
+```
+python -m valuekit.sweep mypipeline.steps mypipeline.batches
+```
+
+imports the named modules, takes the fingerprint of every `@pure` and
+`@pure_local` function they define, and deletes the traces and batch
+records of every other fingerprint, then every object that no remaining
+trace or batch names. Name every module whose results you want kept; a
+function that is not imported reads as gone. `--dry-run` reports without
+deleting, and `--cache` names the directory when the modules do not
+configure one.
 
 ## Parallelism
 
-``run_all(fn, inputs)`` runs a module-level function over a batch of
-inputs in parallel and returns a ``BatchResult`` of per-input outcomes, in
-input order. Each input runs in its own process, spawned per task with at
-most ``max_workers`` at once. Isolation is the point: a timeout kills
-exactly one process, a segfault loses exactly one input, and neither
-affects the other inputs or the capacity available to the rest of the
-batch. The cost is one process start per input (roughly 0.4 s including a
-numpy import). Starts overlap across workers, and for inputs that take
-seconds or more the cost does not matter; for very small inputs, batch
-them inside ``fn``. Each worker takes the parent's cache directory and
-shares the cache: value writes are idempotent and trace writes are atomic
-appends, so concurrent writers cannot drop each other's results.
+``run_all(fn, inputs)`` runs a module-level ``@pure`` (or ``@pure_local``)
+function over a batch of inputs in parallel and returns a ``BatchResult``
+of per-input outcomes, in input order. An input whose result is already
+cached is answered without a worker. Each other input runs in its own
+process, spawned per task with at most ``max_workers`` at once. Isolation
+is the point: a timeout kills exactly one process, a segfault loses exactly
+one input, and neither affects the other inputs or the capacity available
+to the rest of the batch. The cost is one process start per input (roughly
+0.4 s including a numpy import). Starts overlap across workers, and for
+inputs that take seconds or more the cost does not matter; for very small
+inputs, batch them inside ``fn``. Each worker takes the parent's cache
+directory and shares the cache; every write is a content-named file, so
+concurrent writers cannot drop each other's results.
+
+The batch is recorded under a name, ``name=`` or the function's qualified
+name by default, for `valuekit.batch` to read (next section). A function
+that is not decorated is refused: the record is made by the function that
+produced the results.
 
 Every input is processed, and every failure is recorded against the input
 that caused it. An exception raised by ``fn`` carries the string-form
@@ -366,6 +432,60 @@ set_cache_dir(os.environ.get("VALUEKIT_CACHE"))   # None disables caching
 
 Nothing is cached until `set_cache_dir` is called: importing valuekit has no
 effect on its own.
+
+## Reading what a batch produced
+
+Analysis code runs in a notebook or a separate script, often while the
+batch is still going, and should neither import the pipeline nor run any of
+it. It opens the batch by name:
+
+```python
+b = valuekit.batch("process")        # the newest batch of process()
+b[7]                                 # the row for input 7
+b[7].result                          # what process(7) returned
+b[7]["detrend"]                      # what detrend returned inside it
+b[7]["residuals"]                    # a value the function logged
+b.column("rms")                      # one value per input, in input order
+b.by("order")                        # rows grouped by a logged parameter
+b.failures                           # (input, exception type, message)
+b.pending                            # inputs with no outcome yet
+```
+
+A computation binds names to values, and a row is indexed by those names.
+Two things bind a name. A memoised call made inside the function binds its
+function name to its result, with no action needed: `b[7]["detrend"]` works
+because `process` called `detrend`. And `log(name, value)` binds a name
+explicitly, for a value the function does not return:
+
+```python
+from valuekit import log
+
+@pure
+def analyse(obs, cfg):
+    log("order", cfg["order"])          # a parameter worth grouping by
+    residuals = fit(obs, cfg)
+    log("residuals", residuals)         # an intermediate worth plotting
+    return summarise(residuals)
+```
+
+A name is found at any depth, so `b[7]["residuals"]` does not care which
+step logged it; `row.calls` narrows to one step when that matters. A name
+bound more than once gives a list, in order. Logged values must be
+storable, like results, and arrays come back as memory maps. `log` outside a
+memoised call raises when a cache is configured, since a dropped log is
+worse than a refused one, and does nothing when none is.
+
+Bindings are recorded in the call's trace, beside its result. Nothing is
+replayed on a hit and nothing needs re-running: the trace a hit finds
+already carries what the run that recorded it bound. The batch record names
+each input's root trace and the fingerprint the batch ran under, so a batch
+cannot mix results from two versions of the code, and the only question
+across a code change is whether the batch has been re-run since. One file
+is written per finished input, so a batch is readable the moment its first
+input finishes; `b.refresh()` picks up the rest.
+
+Batch records and the run log go in the cache directory with everything
+else, so there is nothing to configure and nothing recorded without a cache.
 
 ## Watching a run
 

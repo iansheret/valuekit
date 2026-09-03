@@ -208,6 +208,12 @@ def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
         return _STD, "std:builtins"
     if top == "__main__":
         return _USER, "__main__"
+    if top == "valuekit":
+        # This library is never user code, wherever it is installed from: a
+        # user function naming ``log`` or ``ImmutableMap`` must not hash
+        # their module-level state.  CACHE_EPOCH, not a version marker,
+        # says when a valuekit change invalidates caches.
+        return _PKG, "pkg:valuekit"
     if top and top in sys.stdlib_module_names:
         return _STD, f"std:{top}"
     if filename is None and top:
