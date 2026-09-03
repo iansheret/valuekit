@@ -69,9 +69,37 @@ def _resolve(module: str, qualname: str):
     return obj
 
 
+# Greeting fields after the six fixed ones: the import roots, then this
+# marker, then the driver's native-extension digests as (module, digest)
+# pairs.  See codehash._ext_overrides for why a worker takes them on.
+EXT_MARK = "--ext--"
+
+
+def _tail(parts: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Split a greeting's trailing fields into import roots and overrides."""
+    if EXT_MARK in parts:
+        at = parts.index(EXT_MARK)
+        roots, pairs = parts[:at], parts[at + 1 :]
+    else:
+        roots, pairs = parts, []
+    overrides = {pairs[i]: pairs[i + 1] for i in range(0, len(pairs) - 1, 2)}
+    return [r for r in roots if r], overrides
+
+
+def _take_overrides(overrides: dict[str, str]) -> None:
+    from . import codehash
+
+    codehash._ext_overrides.update(overrides)
+
+
+
 def source_dir(source_root: str, manifest_hash: str) -> Path:
-    """Where a synced source tree lives, under the root the driver named."""
-    return Path(source_root) / manifest_hash
+    """Where a synced source tree lives, under the root the driver named.
+
+    ``~`` is expanded here, on the machine the tree lives on: the driver
+    names the root as configured, without knowing this machine's home.
+    """
+    return Path(os.path.expanduser(source_root)) / manifest_hash
 
 
 def _install(source: Path, roots: list[str]) -> None:
@@ -161,7 +189,7 @@ def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
         return 1
     parts = wire.unstrings(body)
     salt, module, qualname, fingerprint, source_root, mhash = parts[:6]
-    roots = [r for r in parts[6:] if r]
+    roots, overrides = _tail(parts[6:])
 
     reason = _refuse_early(salt, source_root)
     if reason:
@@ -186,6 +214,7 @@ def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
             return 1
 
     _install(source, roots)
+    _take_overrides(overrides)
 
     reason = _admit(salt, module, qualname, fingerprint)
     if not reason:
@@ -280,7 +309,7 @@ def serve(rx: BinaryIO, tx: BinaryIO) -> int:
         return 1
     parts = wire.unstrings(body)
     salt, module, qualname, fingerprint, source_root, mhash = parts[:6]
-    roots = [r for r in parts[6:] if r]
+    roots, overrides = _tail(parts[6:])
 
     # The source tree has to be on the path before _admit, which imports.
     if mhash:
@@ -289,6 +318,7 @@ def serve(rx: BinaryIO, tx: BinaryIO) -> int:
             wire.write_frame(tx, wire.READY, b"the source tree is missing")
             return 1
         _install(source, roots)
+    _take_overrides(overrides)
 
     reason = _admit(salt, module, qualname, fingerprint)
     wire.write_frame(tx, wire.READY, reason.encode("utf-8"))

@@ -82,15 +82,36 @@ records more than it did.
   installed from, so a function naming `log` or `ImmutableMap` does not hash
   the library's module state.
 
-### Remote execution (not yet reachable by users)
+### Running on other machines
 
-Groundwork for running a batch somewhere other than this machine. `run_all`
-keeps its signature apart from `name=`, and every batch still runs in local
-processes unless a private hook selects the pipe backend.
+- A batch can run on hosts declared in a TOML file named by `VALUEKIT_HOSTS`,
+  over ssh. One connection per host carries every task: a host process
+  (`python -m valuekit.host`) starts a worker per task and multiplexes their
+  streams, so a thousand inputs cost one ssh handshake. The host process
+  exits, killing its workers, when the connection closes.
+- Where work goes is a mode, one word in `<cache>/placement`: `local`,
+  `remote` (as little here as possible) or `all`. The driver re-reads it each
+  time it starts a task, so a switch mid-batch moves the next task. The
+  monitor shows the requested mode beside the mode the driver has applied,
+  and sets it on a keystroke; `--mode` sets it from a script. That file is
+  the only thing the monitor writes.
+- A host that fails readiness is dropped with the reason recorded once and the
+  batch continues; a host whose connection drops fails the inputs running
+  there and takes no more. `remote` mode with no reachable host runs locally
+  and records why.
+- The monitor gains a `hosts` block: capacity, running, finished and failed
+  per place, and whether each host was reached.
+- A worker fingerprints as the driver does: the driver sends the digests of
+  the native extensions its own fingerprint hashed, and the worker uses them
+  in place of its own, so keys match across machines and architectures.
+- Scheduling waits on one inbox fed by threads, for local processes and host
+  connections alike; there is no `select`, and no platform-specific waiting.
+
+### Remote execution groundwork
 
 - Scheduling is separated from where work runs. `run_all` keeps the admission
-  limit, deadlines, input ordering and failure attribution; a backend starts,
-  waits for and kills a unit of work.
+  limit, deadlines, input ordering and failure attribution; a backend starts
+  and kills a unit of work and reports on it.
 - The value codec is free functions parameterised by how a child value is
   reached, so the same pickle-free format serves a directory on disk and a
   connection to a peer. A peer's object frames carry the same bytes the

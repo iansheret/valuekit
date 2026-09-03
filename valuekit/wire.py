@@ -56,6 +56,26 @@ VALUE = b"\x0e"  # driver -> worker: empty once sent, or why not
 CALL = b"\x0f"  # worker -> driver: run this @pure_local call here
 CALLED = b"\x10"  # driver -> worker: its result root and trace hash, or error
 
+# Between the driver and a host process (valuekit.host), which runs one
+# worker per task and carries each worker's stream as a numbered channel.
+HOST = b"\x11"  # host -> driver: on start, its salt and CPU count
+OPEN = b"\x12"  # driver -> host: channel id, then "ready" or "task"
+DATA = b"\x13"  # both: channel id, then bytes of that worker's stdin or stdout
+CLOSE = b"\x14"  # driver -> host: channel id; close the worker's stdin
+KILL = b"\x15"  # driver -> host: channel id; kill the worker
+EXIT = b"\x16"  # host -> driver: channel id, exit code, stderr tail
+
+
+def channel(body: bytes) -> tuple[int, bytes]:
+    """Split a host-frame body into its channel id and the rest."""
+    if len(body) < 4:
+        raise WireError("truncated channel frame")
+    return int.from_bytes(body[:4], "little"), body[4:]
+
+
+def channelled(ch: int, rest: bytes = b"") -> bytes:
+    return ch.to_bytes(4, "little") + rest
+
 
 class WireError(Exception):
     """The connection said something impossible. Never a cache miss."""

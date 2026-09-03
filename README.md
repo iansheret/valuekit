@@ -487,6 +487,63 @@ input finishes; `b.refresh()` picks up the rest.
 Batch records and the run log go in the cache directory with everything
 else, so there is nothing to configure and nothing recorded without a cache.
 
+## Running on other machines
+
+A batch can run on any machine you can reach with ssh, with nothing on
+that machine but Python, numpy, valuekit, and your project's dependencies.
+The cache stays here: every value, trace and run-log record a remote worker
+produces is sent back over the connection, every lookup asks this machine,
+and `@pure_local` calls run here. Nothing you compute elsewhere has to be
+fetched, and the remote machine keeps no results. From the analysis code's
+point of view a batch that ran on three machines is indistinguishable from
+one that ran on this one.
+
+Hosts are declared once, in a TOML file named by `VALUEKIT_HOSTS`:
+
+```toml
+[local]
+workers = 8                                   # optional; default: CPU count
+
+[hosts.mac]
+ssh = "ian@mac.local"                         # anything ssh accepts
+python = "/Users/ian/.venvs/vk/bin/python"    # an interpreter with valuekit installed
+workers = 8                                   # optional; default: the host's CPU count
+source_root = "~/.cache/valuekit/source"      # optional; this is the default
+```
+
+Login must work without a prompt (`ssh mac.local true`), which means a key
+and, on macOS, Remote Login switched on; on Windows the OpenSSH Server
+feature. Your project is sent to the host as a source tree (tracked files
+plus untracked files that are not ignored, never build artefacts) and
+imported from there, after a check that what was imported really came from
+it and that the function's fingerprint matches. Dependencies are the host's
+own business, exactly as numpy is: install them there. A native extension
+you build yourself must be built on the host too, by a build backend that
+rebuilds on import (scikit-build-core with `editable.rebuild`, or
+meson-python); its binary differs from yours, and that is expected. The
+host fingerprints with your binary's digest in place of its own, so its
+keys are your keys.
+
+Where work goes is a *mode*, one word in `<cache>/placement`:
+
+| mode | this machine | hosts |
+|---|---|---|
+| `local` (default) | everything | nothing |
+| `remote` | nothing, unless no host is reachable | everything |
+| `all` | full capacity | full capacity |
+
+Switch it from the monitor (below) or with `python -m valuekit.monitor
+--mode remote <cache-dir>`. The driver re-reads the mode each time it
+starts a task, so a switch during a batch applies to the next task; tasks
+already running finish where they are. A host that cannot be reached or
+prepared is dropped with the reason recorded once, and the batch continues
+elsewhere. A host whose connection drops mid-batch fails the inputs that
+were running there, attributed to those inputs, and takes no more.
+
+`run_all` takes no argument about any of this. Where a computation ran must
+not be able to affect its result, so it cannot be named in code where a
+fingerprint could reach it.
+
 ## Watching a run
 
 A cache that works is silent, which makes it hard to tell from one that
@@ -498,11 +555,17 @@ actually happening, from a separate process:
 $ python -m valuekit.monitor ~/.cache/mypipeline
 
 runs: 1 live, 9 workers, 0 finished
+mode: all  (applied: all)        l local  r remote  a all  q quit
 
   pid 97702    process_scenarios.py         up 2.7s
 
+hosts
+  place             capacity  running   done  failed  state
+  mac                      8        6      3       0  ready
+  local                    4        3      2       1
+
 batches
-  process                  [################........] 8/12  2.7s  1 failed
+  nightly                  [################........] 8/12  2.7s  1 failed
 
 this run
   function                        hits  misses    rate  forced  errors      time
@@ -517,9 +580,13 @@ The hit rate is the number to look at. Everything else is context for it.
 
 Start it whenever you like, including twenty minutes into a long run — it
 reads what has been recorded so far rather than needing to have been
-watching from the beginning. It only reads, so nothing it does can affect
-the run. Run it over ssh on the machine doing the work if that is where the
-work is.
+watching from the beginning. Watching has no effect on the run. The one
+thing the monitor writes is the placement mode, on a keystroke: `l`, `r`
+and `a` set `local`, `remote` and `all`. The header shows the mode asked
+for and, beside it, the mode the running driver has applied; they differ
+until the driver next starts a task. The `hosts` block shows each place's
+capacity under the applied mode, what is running and finished there, and
+whether the host was reached.
 
 The run log goes in `runs/` inside the cache directory, one file per process, and
 nothing is recorded until `set_cache_dir` has been called — the same rule as

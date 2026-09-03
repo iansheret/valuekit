@@ -560,7 +560,57 @@ def _using_global(name, obj):
     return ns["f"]
 
 
+_NATIVE = _NativeCallable()
+
+
+def _ext_user(x):
+    # Module level so a worker handshake can resolve it by name.
+    return _NATIVE(x)
+
+
 class TestNativeExtensions:
+    def test_the_walk_reports_the_extensions_it_hashed(self, fake_extension):
+        from valuekit.codehash import fingerprint_details
+
+        mod, path = fake_extension
+        fn = _using_global("solve", _NativeCallable())
+        h, _, _, extensions = fingerprint_details(fn)
+        assert h == _fp(fn)
+        assert list(extensions) == ["_fake_ext"]
+        assert f"ext:_fake_ext={extensions['_fake_ext']}" == _classify(
+            mod.__name__, mod.__file__
+        )[1]
+
+    def test_an_override_stands_in_for_the_binary(self, fake_extension, monkeypatch):
+        from valuekit.codehash import fingerprint_details
+
+        monkeypatch.setattr(codehash, "_ext_overrides", {})
+        fn = _using_global("solve", _NativeCallable())
+        before = _fp(fn)
+        codehash._ext_overrides["_fake_ext"] = "0" * 40
+        assert _fp(fn) != before
+        assert fingerprint_details(fn)[3] == {"_fake_ext": "0" * 40}
+        codehash._ext_overrides.clear()
+        assert _fp(fn) == before
+
+    def test_a_worker_fingerprints_as_the_driver_does(self, fake_extension, monkeypatch):
+        # The driver's binary differs from this "worker's"; the greeting
+        # carries the driver's digest, and the worker's key then matches.
+        from valuekit.worker import EXT_MARK
+
+        monkeypatch.setattr(codehash, "_ext_overrides", {})
+        mine = function_fingerprint(_ext_user)[0]
+        codehash._ext_overrides["_fake_ext"] = "0" * 40
+        theirs = function_fingerprint(_ext_user)[0]
+        codehash._ext_overrides.clear()
+        assert theirs != mine
+        assert "differs here" in _handshake(_hello(_ext_user, fingerprint=theirs))
+        greeting = _hello(_ext_user, fingerprint=theirs) + wire.strings(
+            EXT_MARK, "_fake_ext", "0" * 40
+        )
+        assert _handshake(greeting) == ""
+        assert codehash._ext_overrides == {"_fake_ext": "0" * 40}
+
     def test_binary_contents_identify_the_extension(self, fake_extension):
         mod, path = fake_extension
         kind, marker = _classify(mod.__name__, mod.__file__)
@@ -2583,6 +2633,11 @@ def _write_batch_module(tmp_path):
         "    import os\n"
         "    return os.environ.get(name, 'absent')\n"
         "@pure\n"
+        "def slow(x):\n"
+        "    import time\n"
+        "    time.sleep(1.5)\n"
+        "    return x\n"
+        "@pure\n"
         "def with_log(sid):\n"
         "    vklog('twice', sid * 2)\n"
         "    vklog('twice', sid * 3)\n"
@@ -2909,6 +2964,269 @@ class TestBatches:
         key = m.process._valuekit_identity()[0]
         assert [c[:2] for c in t["calls"]] == [["process", key]] * 2
         assert {c[2] for c in t["calls"]} == {r.trace_hash for r in vk.batch("process")}
+
+
+class TestPlacement:
+    def test_no_hosts_file_means_local_only(self, monkeypatch):
+        from valuekit import placement
+
+        monkeypatch.delenv("VALUEKIT_HOSTS", raising=False)
+        hosts = placement.load_hosts()
+        assert hosts.hosts == () and hosts.local == (os.cpu_count() or 1)
+
+    def test_hosts_file_parses_with_defaults(self, tmp_path):
+        from valuekit import placement
+
+        p = tmp_path / "hosts.toml"
+        p.write_text(
+            "[local]\nworkers = 3\n"
+            "[hosts.mac]\nssh = 'ian@mac.local'\npython = '/usr/bin/python3'\n"
+            "[hosts.pc]\nssh = 'pc'\npython = 'py'\nworkers = 2\nsource_root = 'D:/vk'\n"
+        )
+        hosts = placement.load_hosts(p)
+        assert hosts.local == 3
+        mac, pc = hosts.hosts
+        assert (mac.name, mac.ssh, mac.python, mac.workers) == ("mac", "ian@mac.local", "/usr/bin/python3", None)
+        assert mac.source_root == placement.DEFAULT_SOURCE_ROOT
+        assert (pc.workers, pc.source_root) == (2, "D:/vk")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "[hosts.mac]\npython = 'p'\n",  # no ssh
+            "[hosts.mac]\nssh = 'm'\npython = 'p'\nworkers = -1\n",
+            "[local]\nworkers = true\n",
+            "not toml at all [[[",
+        ],
+    )
+    def test_malformed_hosts_file_names_the_file(self, tmp_path, text):
+        from valuekit import placement
+
+        p = tmp_path / "hosts.toml"
+        p.write_text(text)
+        with pytest.raises(RuntimeError, match="hosts.toml"):
+            placement.load_hosts(p)
+
+    def test_mode_file(self, tmp_path):
+        from valuekit import placement
+
+        assert placement.read_mode(tmp_path) == "local"
+        assert placement.read_mode(None) == "local"
+        placement.write_mode(tmp_path, "remote")
+        assert placement.read_mode(tmp_path) == "remote"
+        (tmp_path / "placement").write_text("nonsense\n")
+        assert placement.read_mode(tmp_path) == "local"
+        with pytest.raises(ValueError):
+            placement.write_mode(tmp_path, "everywhere")
+
+    def test_capacities_per_mode(self):
+        from valuekit.placement import capacities
+
+        remote = {"mac": 8, "pc": 4}
+        assert capacities("local", 6, remote) == {"mac": 0, "pc": 0, "local": 6}
+        assert capacities("all", 6, remote) == {"mac": 8, "pc": 4, "local": 6}
+        assert capacities("remote", 6, remote) == {"mac": 8, "pc": 4, "local": 0}
+        # As little as possible locally means everything locally when there
+        # is nowhere else.
+        assert capacities("remote", 6, {}) == {"local": 6}
+        assert capacities("remote", 6, {"mac": 0}) == {"mac": 0, "local": 6}
+
+    def test_worker_env_is_an_allowlist(self, monkeypatch):
+        from valuekit.placement import worker_env
+
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
+        monkeypatch.setenv("VALUEKIT_CACHE", "y")
+        monkeypatch.setenv("PYTHONPATH", "z")
+        env = worker_env()
+        assert "AWS_SECRET_ACCESS_KEY" not in env and "PYTHONPATH" not in env
+        assert env["VALUEKIT_CACHE"] == "y" and "PATH" in env
+
+
+class TestPlacementScheduling:
+    """Where tasks go: capacities per place, remote hosts first, the mode
+    file re-read at every start, and a host that fails or dies dropped."""
+
+    def _local_workers(self, tmp_path, monkeypatch, n):
+        p = tmp_path / "hosts.toml"
+        p.write_text(f"[local]\nworkers = {n}\n")
+        monkeypatch.setenv("VALUEKIT_HOSTS", str(p))
+
+    def test_mode_all_fills_remote_places_first(self, cache, tmp_path, monkeypatch):
+        from valuekit import placement
+
+        monkeypatch.setattr(
+            parallel, "_host_commands", {"h1": (_HOST_CMD, 1), "h2": (_HOST_CMD, 1)}
+        )
+        self._local_workers(tmp_path, monkeypatch, 4)
+        placement.write_mode(cache, "all")
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.slow, [1, 2, 3, 4, 5, 6])
+        assert r.failures == []
+        by_host = {}
+        for _, e in _records(cache, "outcome"):
+            by_host.setdefault(e["host"], []).append(e["i"])
+        assert set(by_host) == {"h1", "h2", "local"}
+        assert len(by_host["h1"]) >= 1 and len(by_host["h2"]) >= 1
+        [(_, p)] = _records(cache, "placement")
+        assert p["mode"] == "all" and p["capacities"] == {"h1": 1, "h2": 1, "local": 4}
+        assert sorted(e["name"] for _, e in _records(cache, "host")) == ["h1", "h2"]
+        assert all(e["ok"] for _, e in _records(cache, "host"))
+
+    def test_mode_remote_keeps_local_idle(self, cache, tmp_path, monkeypatch):
+        from valuekit import placement
+
+        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
+        placement.write_mode(cache, "remote")
+        m, _ = _write_batch_module(tmp_path)
+        assert vk.run_all(m.process, [1, 2, 4, 5]).failures == []
+        assert {e["host"] for _, e in _records(cache, "outcome")} == {"h1"}
+        [(_, p)] = _records(cache, "placement")
+        assert p["capacities"]["local"] == 0 and p["capacities"]["h1"] == 2
+
+    def test_remote_mode_with_no_host_runs_locally_and_says_so(self, cache, tmp_path, monkeypatch):
+        from valuekit import placement
+
+        monkeypatch.setattr(parallel, "_host_commands", {})
+        placement.write_mode(cache, "remote")
+        m, _ = _write_batch_module(tmp_path)
+        assert vk.run_all(m.process, [1]).values == [11]
+        [(_, p)] = _records(cache, "placement")
+        assert p["mode"] == "remote" and list(p["capacities"]) == ["local"]
+        assert p["capacities"]["local"] > 0
+
+    def test_switching_the_mode_mid_batch_moves_later_tasks(self, cache, tmp_path, monkeypatch):
+        import threading
+
+        from valuekit import placement
+
+        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
+        self._local_workers(tmp_path, monkeypatch, 1)
+        placement.write_mode(cache, "local")
+        m, _ = _write_batch_module(tmp_path)
+        threading.Timer(2.0, lambda: placement.write_mode(cache, "remote")).start()
+        r = vk.run_all(m.slow, [1, 2, 3, 4, 5, 6, 7, 8])
+        assert r.failures == []
+        outcomes = [e for _, e in _records(cache, "outcome")]
+        hosts = [e["host"] for e in sorted(outcomes, key=lambda e: e["t"])]
+        assert hosts[0] == "local" and hosts[-1] == "h1"
+        # One event when the mode changes (the host still preparing, so local
+        # keeps its capacity), another when the host joins and local drops.
+        events = [e for _, e in _records(cache, "placement")]
+        assert [e["mode"] for e in events] == ["local", "remote", "remote"]
+        assert events[0]["capacities"]["local"] == 1
+        assert events[-1]["capacities"] == {"h1": 2, "local": 0}
+
+    def test_a_host_that_dies_fails_its_inputs_and_the_batch_continues(
+        self, cache, tmp_path, monkeypatch
+    ):
+        import threading
+
+        from valuekit import backend as backend_mod
+        from valuekit import placement
+
+        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
+        placement.write_mode(cache, "remote")
+        launched = []
+        real_launch = backend_mod.HostBackend._launch
+
+        def spying_launch(self):
+            launched.append(self)
+            return real_launch(self)
+
+        monkeypatch.setattr(backend_mod.HostBackend, "_launch", spying_launch)
+        m, _ = _write_batch_module(tmp_path)
+
+        def kill_host():
+            if launched:
+                launched[0]._proc.kill()
+
+        threading.Timer(3.0, kill_host).start()
+        r = vk.run_all(m.slow, [1, 2, 3, 4, 5, 6])
+        failed = [x for x, _ in r.failures]
+        assert 1 <= len(failed) <= 2  # what was running on the host when it died
+        assert all("closed" in str(e) for _, e in r.failures)
+        hosts = {e["host"] for _, e in _records(cache, "outcome") if e["ok"]}
+        assert hosts == {"local"} or hosts == {"h1", "local"}
+        assert any(
+            e["name"] == "h1" and not e["ok"] and "closed" in e["reason"]
+            for _, e in _records(cache, "host")
+        )
+        modes = [(e["mode"], e["capacities"]["local"] > 0) for _, e in _records(cache, "placement")]
+        assert modes[0] == ("remote", False) and modes[-1] == ("remote", True)
+
+
+class TestMonitor:
+    def _state(self, events):
+        from valuekit import monitor
+
+        st = monitor._State()
+        for e in events:
+            st.apply("run.jsonl", {"t": time.time(), **e})
+        return st
+
+    def test_state_folds_placement_hosts_and_per_host_counts(self):
+        st = self._state(
+            [
+                {"ev": "run", "pid": 1, "role": "driver", "argv": ["drive.py"]},
+                {"ev": "host", "id": 1, "name": "mac", "ok": True, "capacity": 8},
+                {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
+                {"ev": "placement", "id": 1, "mode": "all", "capacities": {"mac": 8, "pc": 0, "local": 4}},
+                {"ev": "batch", "id": 1, "fn": "process", "name": "nightly", "n": 3},
+                {"ev": "start", "id": 1, "i": 0, "host": "mac"},
+                {"ev": "start", "id": 1, "i": 1, "host": "mac"},
+                {"ev": "start", "id": 1, "i": 2, "host": "local"},
+                {"ev": "outcome", "id": 1, "i": 0, "ok": True, "host": "mac"},
+                {"ev": "outcome", "id": 1, "i": 2, "ok": False, "host": "local", "exc": "ValueError"},
+            ]
+        )
+        applied = st.applied(st.current())
+        assert applied["mode"] == "all" and applied["capacities"]["mac"] == 8
+        assert st.per_host["run.jsonl"]["mac"] == {"running": 1, "done": 1, "failed": 0}
+        assert st.per_host["run.jsonl"]["local"] == {"running": 0, "done": 1, "failed": 1}
+        assert st.hosts[("run.jsonl", "pc")]["ok"] is False
+
+    def test_render_shows_the_mode_and_the_hosts(self):
+        from valuekit import monitor
+
+        st = self._state(
+            [
+                {"ev": "run", "pid": 1, "role": "driver", "argv": ["drive.py"]},
+                {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
+                {"ev": "placement", "id": 1, "mode": "all", "capacities": {"mac": 8, "pc": 0, "local": 4}},
+                {"ev": "start", "id": 1, "i": 0, "host": "mac"},
+            ]
+        )
+        text = "\n".join(monitor._render(st, 120, requested="remote", configured=("mac", "pc"), keys=True))
+        assert "mode: remote  (applied: all)" in text
+        assert "l local  r remote  a all  q quit" in text
+        mac = next(l for l in text.splitlines() if l.strip().startswith("mac"))
+        assert mac.split() == ["mac", "8", "1", "0", "0", "not", "tried"]
+        pc = next(l for l in text.splitlines() if l.strip().startswith("pc"))
+        assert "dropped: ssh failed" in pc
+        local = next(l for l in text.splitlines() if l.strip().startswith("local"))
+        assert local.split()[:2] == ["local", "4"]
+        # With no driver yet, the applied mode is unknown and nothing is claimed.
+        assert "(applied: -)" in "\n".join(monitor._render(monitor._State(), 80, requested="local"))
+
+    def test_keys_write_the_mode_file(self, tmp_path):
+        from valuekit import monitor, placement
+
+        assert monitor._apply_key(tmp_path, None) is True
+        assert monitor._apply_key(tmp_path, "r") is True
+        assert placement.read_mode(tmp_path) == "remote"
+        assert monitor._apply_key(tmp_path, "A") is True
+        assert placement.read_mode(tmp_path) == "all"
+        assert monitor._apply_key(tmp_path, "x") is True  # unknown keys do nothing
+        assert placement.read_mode(tmp_path) == "all"
+        assert monitor._apply_key(tmp_path, "q") is False
+
+    def test_mode_flag_writes_and_exits(self, tmp_path, capsys):
+        from valuekit import monitor, placement
+
+        assert monitor.main(["--mode", "remote", str(tmp_path)]) == 0
+        assert placement.read_mode(tmp_path) == "remote"
+        assert monitor.main(["--mode", "sideways", str(tmp_path)]) == 2
+        assert monitor.main(["--mode"]) == 2
 
 
 class TestSweep:
@@ -3294,12 +3612,41 @@ class TestWorkerHandshake:
         assert "cannot import" in _handshake(body)
 
 
-class TestPipeBackend:
-    @pytest.fixture(autouse=True)
-    def _use_pipes(self, monkeypatch):
-        from valuekit.backend import PipeBackend
+_HOST_CMD = [sys.executable, "-m", "valuekit.host"]
 
-        monkeypatch.setattr(parallel, "_backend_factory", PipeBackend)
+
+def _host_backend(fn, cache, name="h1", inbox=None):
+    """A HostBackend over a host process launched on this machine."""
+    import queue
+    from valuekit.backend import HostBackend
+
+    return HostBackend(
+        fn, str(cache), inbox or queue.Queue(), name, list(_HOST_CMD), str(cache / "source")
+    )
+
+
+def _settle(handle, inbox, timeout=30):
+    """Feed *handle* from *inbox* until it has an answer or the time is up."""
+    import queue
+
+    deadline = time.monotonic() + timeout
+    while not handle.settled() and time.monotonic() < deadline:
+        try:
+            h, payload = inbox.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        h.feed(payload)
+
+
+class TestPipeBackend:
+    """Batches through a host process on this machine, in remote mode."""
+
+    @pytest.fixture(autouse=True)
+    def _use_host(self, monkeypatch, cache):
+        from valuekit import placement
+
+        monkeypatch.setattr(parallel, "_host_commands", {"h1": _HOST_CMD})
+        placement.write_mode(cache, "remote")
 
     def test_results_come_back_in_input_order(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
@@ -3530,10 +3877,11 @@ class TestSync:
 
 class TestSourceTree:
     @pytest.fixture(autouse=True)
-    def _use_pipes(self, monkeypatch):
-        from valuekit.backend import PipeBackend
+    def _use_host(self, monkeypatch, cache):
+        from valuekit import placement
 
-        monkeypatch.setattr(parallel, "_backend_factory", PipeBackend)
+        monkeypatch.setattr(parallel, "_host_commands", {"h1": _HOST_CMD})
+        placement.write_mode(cache, "remote")
         yield
         for name in [k for k in sys.modules if k.startswith("vk_sync_mod")]:
             del sys.modules[name]
@@ -3545,23 +3893,23 @@ class TestSourceTree:
         assert len(trees) == 1 and (trees[0] / "vk_sync_mod.py").exists()
 
     def test_the_worker_imports_the_source_tree_not_the_live_tree(self, cache, tmp_path):
-        from valuekit.backend import PipeBackend
+        import queue
 
         root = _project(tmp_path)
         m = _load(root)
-        backend = PipeBackend(m.work, str(cache))
-        backend.ensure_ready()
+        inbox = queue.Queue()
+        backend = _host_backend(m.work, cache, inbox=inbox)
+        assert backend.ensure_ready() == ""
         # Delete the source outright. If the worker were resolving imports
         # against the live tree this cannot survive.
         (root / "vk_sync_mod.py").unlink()
         handle = backend.start(7)
-        deadline = time.monotonic() + 30
-        while not handle.settled() and time.monotonic() < deadline:
-            backend.wait([handle], 0.2)
+        _settle(handle, inbox)
         try:
             assert handle.recv() == ("ok", 107)
         finally:
             handle.reap()
+            backend.close()
 
     def test_an_edit_produces_a_new_source_tree_and_the_new_answer(self, cache, tmp_path):
         root = _project(tmp_path)
@@ -3575,23 +3923,22 @@ class TestSourceTree:
         assert len(list((cache / "source").iterdir())) == 2  # both kept, immutable
 
     def test_an_unchanged_tree_is_not_resent(self, cache, tmp_path):
-        from valuekit.backend import PipeBackend
-
         m = _load(_project(tmp_path))
-        PipeBackend(m.work, str(cache)).ensure_ready()
+        first = _host_backend(m.work, cache)
+        assert first.ensure_ready() == ""
+        first.close()
         before = (cache / "source").stat().st_mtime_ns
         # A second backend over the same tree finds the source tree already there
         # and asks for nothing.
-        second = PipeBackend(m.work, str(cache))
-        second.ensure_ready()
+        second = _host_backend(m.work, cache)
+        assert second.ensure_ready() == ""
+        second.close()
         assert (cache / "source").stat().st_mtime_ns == before
         assert len(list((cache / "source").iterdir())) == 1
 
     def test_a_half_built_source_tree_is_never_adopted(self, cache, tmp_path):
-        from valuekit.backend import PipeBackend
-
         m = _load(_project(tmp_path))
-        backend = PipeBackend(m.work, str(cache))
+        backend = _host_backend(m.work, cache)
         # A directory with the right name but no .complete marker must not be
         # mistaken for a finished source tree.
         half = cache / "source" / backend._hash
@@ -3599,12 +3946,11 @@ class TestSourceTree:
         (half / "vk_sync_mod.py").write_text(
             "from valuekit import pure\n@pure\ndef work(x):\n    return 'WRONG'\n"
         )
-        backend.ensure_ready()
+        assert backend.ensure_ready() == ""
+        backend.close()
         assert vk.run_all(m.work, [1]).values == [101]
 
-    def test_a_dependency_outside_the_project_is_refused_before_dispatch(
-        self, cache, tmp_path
-    ):
+    def test_a_dependency_outside_the_project_drops_the_host(self, cache, tmp_path):
         outside = tmp_path / "sibling"
         outside.mkdir()
         (outside / "vk_sync_mod_far.py").write_text("def helper(x):\n    return x\n")
@@ -3618,8 +3964,13 @@ class TestSourceTree:
                     "@pure\ndef work(x):\n    return vk_sync_mod_far.helper(x)\n",
                 )
             )
-            with pytest.raises(RuntimeError, match="outside its project"):
-                vk.run_all(m.work, [1])
+            # The host is refused before any worker starts, once, as a fact
+            # about the host; the batch then runs where it can.
+            assert vk.run_all(m.work, [1]).values == [1]
+            [(_, host)] = _records(cache, "host")
+            assert host["ok"] is False and "outside its project" in host["reason"]
+            [(_, outcome)] = _records(cache, "outcome")
+            assert outcome["host"] == "local"
         finally:
             sys.path.remove(str(outside))
             sys.modules.pop("vk_sync_mod_far", None)
@@ -3632,12 +3983,12 @@ class TestSourceTree:
         monkeypatch.delattr(sync.tarfile, "data_filter", raising=False)
         assert "3.11.4" in sync.check_extraction_supported()
 
-    def test_readiness_failure_is_one_error_not_one_per_input(self, cache, tmp_path):
-        from valuekit.backend import PipeBackend
-
+    def test_readiness_failure_is_one_reason_not_one_per_input(self, cache, tmp_path):
         m = _load(_project(tmp_path))
-        backend = PipeBackend(m.work, str(cache))
-        backend._ids = ("wrong-salt",) + backend._ids[1:]
-        backend._greeting = wire.strings(*backend._ids, *backend._roots)
-        with pytest.raises(RuntimeError, match="wrong-salt"):
-            backend.ensure_ready()
+        backend = _host_backend(m.work, cache)
+        parts = wire.unstrings(backend._greeting)
+        backend._greeting = wire.strings("wrong-salt", *parts[1:])
+        reason = backend.ensure_ready()
+        backend.close()
+        assert "wrong-salt" in reason
+        assert backend.ensure_ready() == reason  # remembered, not retried

@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import types
 from importlib.machinery import EXTENSION_SUFFIXES
 from typing import Any, Callable
@@ -188,6 +189,28 @@ def _extension_digest(filename: str) -> str | None:
     return _ext_digests[key]
 
 
+# A worker fingerprints as the driver would.  Two machines never hold the
+# same compiled binary, so the driver sends the digests its own walk saw and
+# the worker uses them in place of its own; every key computed there then
+# equals the driver's, and the handshake and the traces need no second form.
+# Empty on the driver, where each walk records what it hashed.
+_ext_overrides: dict[str, str] = {}
+_walk = threading.local()  # .extensions: what the walk in progress has seen
+
+
+def _ext_identity(module_name: str | None, filename: str) -> str | None:
+    """The digest that stands for a live extension, and a note of it."""
+    digest = _ext_overrides.get(module_name or "")
+    if digest is None:
+        digest = _extension_digest(filename)
+        if digest is None:
+            return None
+    seen = getattr(_walk, "extensions", None)
+    if seen is not None and module_name:
+        seen[module_name] = digest
+    return digest
+
+
 def _extension_marker(module_name: str | None) -> str | None:
     """Return the marker for *module_name* if it names a native extension.
 
@@ -222,7 +245,7 @@ def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
     if filename and _is_live_extension(filename, top):
         # An extension rebuilt in place under a fixed version: only its
         # contents identify it.
-        ext_digest = _extension_digest(filename)
+        ext_digest = _ext_identity(module_name, filename)
         if ext_digest is not None:
             return _PKG, f"ext:{module_name}={ext_digest}"
     if filename and ("site-packages" in filename or "dist-packages" in filename):
@@ -491,9 +514,29 @@ def function_fingerprint(
     @pure, which captures it at decoration time, before any debugger patches
     bytecode).
     """
-    w = _Walker()
-    w.add_function(fn, code=code)  # type: ignore[arg-type]
-    return w.h.hexdigest(), w.spans, sorted(w.units)
+    h, spans, units, _ = fingerprint_details(fn, code=code)
+    return h, spans, units
+
+
+def fingerprint_details(
+    fn: Callable,
+    *,
+    code: types.CodeType | None = None,
+) -> tuple[str, list[tuple[str, int, int]], list[str], dict[str, str]]:
+    """:func:`function_fingerprint` plus the native extensions the walk
+    hashed, as module name to digest: what a driver sends a worker so that
+    the worker's fingerprints come out equal to its own."""
+    outer = getattr(_walk, "extensions", None)
+    _walk.extensions = {}
+    try:
+        w = _Walker()
+        w.add_function(fn, code=code)  # type: ignore[arg-type]
+        seen = _walk.extensions
+    finally:
+        _walk.extensions = outer
+        if outer is not None:
+            outer.update(seen)  # a function hashed as a value inside a walk
+    return w.h.hexdigest(), w.spans, sorted(w.units), seen
 
 
 # ---------------------------------------------------------------------------

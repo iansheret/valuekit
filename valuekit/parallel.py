@@ -63,12 +63,16 @@ driver, not inside it).
 
 from __future__ import annotations
 
+import os
+import queue
+import sys
+import threading
 import time
 from collections import deque
 from typing import Any, Callable, Iterable, Iterator
 
-from . import runlog
-from .backend import LocalBackend
+from . import placement, runlog
+from .backend import HostBackend, LocalBackend
 from .batches import BatchWriter
 from .codehash import function_fingerprint
 from .debughook import breakpoints_force
@@ -76,18 +80,19 @@ from .store import CacheMiss, LocalStore
 
 __all__ = ["run_all", "BatchResult", "Outcome"]
 
-_POLL = 0.2  # seconds between timeout checks while tasks are running
+_POLL = 0.2  # seconds between checks of deadlines and of the mode file
 
 # Distinguishes concurrent batches within one process in the run log;
 # the run file already carries the pid, so a counter is identifier enough.
 _batch_seq = 0
 
-# Which backend a batch runs on.  Private and local-only for now: choosing
-# where work happens is a deployment question, so when it becomes settable
-# it will be settable from configuration, never from the call site -- a
-# host list in code could reach a fingerprint, and where a computation ran
-# must not be able to affect its result.
-_backend_factory = LocalBackend
+# Where work happens is configuration (the hosts file and the mode file),
+# never a call-site argument: a host list in code could reach a fingerprint,
+# and where a computation ran must not be able to affect its result.  This
+# private hook stands in for the hosts file in tests: a name to the command
+# that launches a host process, or to ``(command, workers)``; a host with no
+# capacity given reports its own.
+_host_commands: dict[str, Any] | None = None
 
 
 class Outcome:
@@ -187,14 +192,15 @@ class _RemoteTraceback(Exception):
 
 
 class _Task:
-    __slots__ = ("x", "idx", "handle", "deadline", "timed_out")
+    __slots__ = ("x", "idx", "handle", "deadline", "timed_out", "where")
 
-    def __init__(self, x, idx, handle, deadline):
+    def __init__(self, x, idx, handle, deadline, where: str):
         self.x = x
         self.idx = idx
         self.handle = handle
         self.deadline = deadline
         self.timed_out = False
+        self.where = where
 
 
 def _harvest(t: _Task, msg, name: str, timeout) -> Outcome:
@@ -284,6 +290,102 @@ def _cached(fn, x) -> Outcome | None:
         return None
 
 
+class _Places:
+    """The backends a batch may run on, and how many tasks each may hold.
+
+    Remote hosts come from the hosts file (or the test hook); readiness
+    runs on a thread per host and a host counts only once it is ready.  The
+    mode file is re-read every time capacities are asked for, so a switch
+    made while the batch runs applies to the next task started.
+    """
+
+    def __init__(self, fn, cache_dir: str | None, inbox: queue.Queue, store, batch: int):
+        self.local = LocalBackend(fn, cache_dir, inbox)
+        self.hosts: list[HostBackend] = []
+        self._states: dict[str, str] = {}  # name -> pending | ready | failed
+        self._store = store
+        self._batch = batch
+        self._cache_dir = cache_dir
+        self._applied: tuple | None = None
+        config = placement.load_hosts()
+        self.local_workers = config.local
+        if _host_commands is not None:
+            source_root = os.path.join(cache_dir, "source") if cache_dir else ""
+            for name, spec in _host_commands.items():
+                command, workers = spec if isinstance(spec, tuple) else (spec, None)
+                self.hosts.append(
+                    HostBackend(
+                        fn, cache_dir, inbox, name, list(command), source_root, workers
+                    )
+                )
+        else:
+            for h in config.hosts:
+                command = [
+                    "ssh", "-T", "-o", "BatchMode=yes", h.ssh,
+                    f"{h.python} -m valuekit.host",
+                ]
+                self.hosts.append(
+                    HostBackend(
+                        fn, cache_dir, inbox, h.name, command, h.source_root, h.workers
+                    )
+                )
+
+    def all(self) -> list:
+        return [*self.hosts, self.local]
+
+    def prepare(self, wait: bool) -> None:
+        """Run readiness for every host not yet tried; block if *wait*."""
+        threads = []
+        for b in self.hosts:
+            if b.name in self._states:
+                continue
+            self._states[b.name] = "pending"
+            t = threading.Thread(target=self._prepare_one, args=(b,), daemon=True)
+            t.start()
+            threads.append(t)
+        if wait:
+            for t in threads:
+                t.join()
+
+    def _prepare_one(self, b: HostBackend) -> None:
+        reason = b.ensure_ready()
+        self._states[b.name] = "failed" if reason else "ready"
+        runlog.record(
+            self._store, "host", id=self._batch, name=b.name, ok=not reason,
+            reason=reason or None, capacity=b.capacity,
+        )
+
+    def capacities(self) -> tuple[str, dict[str, int]]:
+        """The mode in force and each place's capacity under it."""
+        mode = placement.read_mode(self._cache_dir)
+        if mode != "local" and self.hosts:
+            self.prepare(wait=False)  # a switch after the start: hosts join as they become ready
+        remote = {}
+        for b in self.hosts:
+            if b.name not in self._states:
+                continue  # never asked, under a local mode
+            usable = self._states[b.name] == "ready" and not b.dead
+            remote[b.name] = (b.capacity or 0) if usable else 0
+            if b.dead and self._states[b.name] == "ready":
+                self._states[b.name] = "failed"
+                runlog.record(
+                    self._store, "host", id=self._batch, name=b.name, ok=False,
+                    reason="the connection closed", capacity=b.capacity,
+                )
+        caps = placement.capacities(mode, self.local_workers, remote)
+        if (mode, caps) != self._applied:
+            self._applied = (mode, caps)
+            runlog.record(self._store, "placement", id=self._batch, mode=mode, capacities=caps)
+        return mode, caps
+
+    def close(self) -> None:
+        for b in self.all():
+            try:
+                b.close()
+            except Exception:
+                pass
+
+
 def run_all(
     fn: Callable[[Any], Any],
     inputs: Iterable[Any],
@@ -362,70 +464,92 @@ def run_all(
     record = _Record(store, fn, name, batch, inputs)
 
     outcomes: list[Outcome | None] = [None] * len(inputs)
-    queue = deque()
+    pending = deque()
     for i, x in enumerate(inputs):
         o = _cached(fn, x) if store is not None else None
         if o is None:
-            queue.append((i, x))
+            pending.append((i, x))
         else:
             outcomes[i] = o
             record.outcome(i, o)
-    if not queue:
+    if not pending:
         runlog.record(store, "end", id=batch)
         return BatchResult(o for o in outcomes if o is not None)
 
-    backend = _backend_factory(fn, cache_dir)
+    inbox: queue.Queue = queue.Queue()
+    places = _Places(fn, cache_dir, inbox, store, batch)
 
-    # Whatever a backend must do once before it can take work -- syncing the
+    # Whatever a host must do once before it can take work -- syncing the
     # project, checking the environment -- happens here, before any input is
-    # claimed. A failure is a fact about the host, so it is raised as one
-    # rather than recorded identically against every input.
-    ensure_ready = getattr(backend, "ensure_ready", None)
-    if ensure_ready is not None:
-        ensure_ready()
-
-    workers = max_workers or backend.default_workers()
-
-    # A deadline needs checking even while nothing is ready to read; a
-    # backend may also want waking periodically for its own reasons.
-    intervals = [
-        p
-        for p in (_POLL if timeout is not None else None, backend.poll_interval)
-        if p is not None
-    ]
-    poll = min(intervals) if intervals else None
+    # claimed, so that a failure is recorded once as a fact about the host
+    # rather than against every input that would have gone there.
+    if placement.read_mode(cache_dir) != "local":
+        places.prepare(wait=True)
 
     running: list[_Task] = []
+    busy: dict[str, int] = {}  # place name -> tasks running there
 
-    def _start(idx: int, x: Any) -> None:
+    def _start(backend, idx: int, x: Any) -> None:
         handle = backend.start(x)
         deadline = time.monotonic() + timeout if timeout is not None else None
-        running.append(_Task(x, idx, handle, deadline))
+        running.append(_Task(x, idx, handle, deadline, backend.name))
+        busy[backend.name] = busy.get(backend.name, 0) + 1
+        runlog.record(store, "start", id=batch, i=idx, host=backend.name)
+
+    def _admit() -> None:
+        _, caps = places.capacities()
+        total = max_workers or sum(caps.values())
+        for backend in places.all():
+            while (
+                pending
+                and len(running) < total
+                and busy.get(backend.name, 0) < caps.get(backend.name, 0)
+            ):
+                _start(backend, *pending.popleft())
+
+    def _drain(block: bool) -> None:
+        """Feed handles whatever the backends have delivered."""
+        try:
+            handle, payload = inbox.get(timeout=_POLL if block else 0)
+        except queue.Empty:
+            return
+        handle.feed(payload)
+        while True:
+            try:
+                handle, payload = inbox.get_nowait()
+            except queue.Empty:
+                return
+            handle.feed(payload)
 
     try:
-        while queue or running:
-            while queue and len(running) < workers:
-                _start(*queue.popleft())
+        while pending or running:
+            _admit()
             if not running:
+                if pending:
+                    raise RuntimeError(
+                        "no place can run this batch: every capacity is zero"
+                    )
                 break
-            ready = backend.wait([t.handle for t in running], timeout=poll)
+            _drain(block=True)
             now = time.monotonic()
             for t in list(running):
                 msg = None
-                if t.handle in ready:
+                if t.handle.settled():
                     msg = t.handle.recv()
                 elif t.deadline is not None and now >= t.deadline:
                     t.handle.kill()
-                    if t.handle.poll():  # finished just before the kill landed
+                    _drain(block=False)
+                    if t.handle.settled():  # finished just before the kill landed
                         msg = t.handle.recv()
                     t.timed_out = msg is None
                 else:
                     continue
                 running.remove(t)
+                busy[t.where] -= 1
                 t.handle.reap()
                 o = _harvest(t, msg, qualname, timeout)
                 outcomes[t.idx] = o
-                record.outcome(t.idx, o)
+                record.outcome(t.idx, o, host=t.where)
     finally:
         # Covers KeyboardInterrupt: no orphans.
         for t in running:
@@ -433,7 +557,7 @@ def run_all(
                 t.handle.kill()
             except Exception:
                 pass
-        backend.close()
+        places.close()
         # In the finally, not after the return: an interrupted batch is
         # exactly the one whose final state is worth having.
         runlog.record(store, "end", id=batch)

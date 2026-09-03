@@ -3,12 +3,21 @@
 Reads the run-log files :mod:`valuekit.runlog` writes under ``<cache>/runs/``
 and redraws a summary a few times a second.  It is a separate process with
 its own lifetime, so it can be started twenty minutes into a run, left open
-across several, or run over ssh on the machine doing the work.  It only
-reads: nothing it does can affect a run.
+across several, or run over ssh on the machine doing the work.  Watching
+has no effect on a run: nothing here is read by the pipeline.
 
 The number to look at is the hit rate.  It is the one thing the library
 promises and the one thing that is otherwise invisible -- a step that ought
 to be hitting and silently is not looks exactly like a slow step.
+
+The monitor also shows where work is going and lets you change it.  The
+placement *mode* (see :mod:`valuekit.placement`) is one word in a file in
+the cache directory; keys ``l``, ``r`` and ``a`` write ``local``, ``remote``
+or ``all`` there, and that file is the only thing the monitor ever writes.
+The driver reads it whenever it starts a task and records the mode it is
+applying, so the header shows both the mode asked for and the mode in
+force; they differ until the next task starts, or while no driver is
+running.  ``--mode <mode>`` writes the file and exits, for scripts.
 
 The cache directory is taken as an argument, falling back to
 ``$VALUEKIT_CACHE``.  There is no remembered location, because remembering
@@ -24,9 +33,13 @@ import sys
 import time
 from pathlib import Path
 
+from . import placement
+
 _REFRESH = 0.5  # seconds between redraws
 _LIVE_AFTER = 5.0  # a run with no record for longer than this reads as idle
 _MAX_FAILURES = 8
+
+_KEYS = {"l": "local", "r": "remote", "a": "all"}
 
 
 def _fmt_dur(seconds: float) -> str:
@@ -49,6 +62,9 @@ class _State:
         self.fns: dict[str, dict] = {}
         self.batches: dict[tuple, dict] = {}
         self.failures: list[tuple] = []
+        self.placement: dict[str, dict] = {}  # source -> the latest placement event
+        self.hosts: dict[tuple, dict] = {}  # (source, host) -> readiness
+        self.per_host: dict[str, dict[str, dict]] = {}  # source -> host -> counts
 
     def apply(self, source: str, e: dict) -> None:
         ev = e.get("ev")
@@ -89,7 +105,16 @@ class _State:
             }
             return
 
+        if ev == "start":
+            self._host_counts(source, e.get("host", "local"))["running"] += 1
+            return
+
         if ev == "outcome":
+            counts = self._host_counts(source, e.get("host", "local"))
+            counts["running"] = max(0, counts["running"] - 1)
+            counts["done"] += 1
+            if not e.get("ok", True):
+                counts["failed"] += 1
             b = self.batches.get((source, e.get("id")))
             if b is not None:
                 b["done"] += 1
@@ -104,6 +129,27 @@ class _State:
             b = self.batches.get((source, e.get("id")))
             if b is not None:
                 b["ended"] = t
+            return
+
+        if ev == "placement":
+            self.placement[source] = {
+                "mode": e.get("mode", "?"),
+                "capacities": e.get("capacities") or {},
+                "t": t,
+            }
+            return
+
+        if ev == "host":
+            self.hosts[(source, e.get("name", "?"))] = {
+                "ok": bool(e.get("ok")),
+                "reason": e.get("reason") or "",
+                "capacity": e.get("capacity"),
+            }
+
+    def _host_counts(self, source: str, host: str) -> dict:
+        return self.per_host.setdefault(source, {}).setdefault(
+            host, {"running": 0, "done": 0, "failed": 0}
+        )
 
     def _fail(self, t: float, what: str, exc: str, source: str) -> None:
         self.failures.append((t, what, exc, source))
@@ -127,6 +173,11 @@ class _State:
         # quietly spoil the rate.
         since = max(r["started"] for r in drivers)
         return {s for s, r in self.runs.items() if r["started"] >= since}
+
+    def applied(self, scope: set[str]) -> dict | None:
+        """The newest placement event among *scope*, or None."""
+        found = [p for s, p in self.placement.items() if s in scope]
+        return max(found, key=lambda p: p["t"]) if found else None
 
 
 class _Tail:
@@ -166,7 +217,13 @@ class _Tail:
                     state.apply(p.name, e)
 
 
-def _render(state: _State, width: int) -> list[str]:
+def _render(
+    state: _State,
+    width: int,
+    requested: str | None = None,
+    configured: tuple[str, ...] = (),
+    keys: bool = False,
+) -> list[str]:
     now = time.time()
     out: list[str] = []
 
@@ -176,6 +233,16 @@ def _render(state: _State, width: int) -> list[str]:
     idle = len(state.runs) - len(live)
     extra = f", {workers} worker{'s' if workers != 1 else ''}" if workers else ""
     out.append(f"runs: {len(drivers)} live{extra}, {idle} finished")
+
+    scope = state.current()
+    applied = state.applied(scope)
+
+    if requested is not None:
+        in_force = applied["mode"] if applied else "-"
+        line = f"mode: {requested}  (applied: {in_force})"
+        if keys:
+            line += "        l local  r remote  a all  q quit"
+        out.append(line)
     out.append("")
 
     for r in sorted(drivers, key=lambda r: r["started"]):
@@ -186,7 +253,43 @@ def _render(state: _State, width: int) -> list[str]:
     if drivers:
         out.append("")
 
-    scope = state.current()
+    # Every place that is configured, applied, or has done anything.
+    names: list[str] = []
+    for name in (
+        *configured,
+        *(applied["capacities"] if applied else ()),
+        *(h for s, h in state.hosts if s in scope),
+        *(h for s in scope for h in state.per_host.get(s, ())),
+    ):
+        if name not in names and name != "local":
+            names.append(name)
+    if names or applied:
+        out.append("hosts")
+        out.append(f"  {'place':<16}{'capacity':>10}{'running':>9}{'done':>7}{'failed':>8}  state")
+        for name in (*names, "local"):
+            cap = applied["capacities"].get(name) if applied else None
+            counts = {"running": 0, "done": 0, "failed": 0}
+            for s in scope:
+                c = state.per_host.get(s, {}).get(name)
+                if c:
+                    for k in counts:
+                        counts[k] += c[k]
+            ready = next(
+                (h for (s, n), h in state.hosts.items() if s in scope and n == name), None
+            )
+            if name == "local":
+                status = ""
+            elif ready is None:
+                status = "not tried"
+            elif ready["ok"]:
+                status = "ready"
+            else:
+                status = f"dropped: {ready['reason'].splitlines()[0][:40]}"
+            out.append(
+                f"  {name:<16}{'-' if cap is None else cap:>10}"
+                f"{counts['running']:>9}{counts['done']:>7}{counts['failed']:>8}  {status}"
+            )
+        out.append("")
 
     active = [
         b
@@ -253,31 +356,142 @@ def _render(state: _State, width: int) -> list[str]:
     return [line[:width] for line in out]
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
-    root = args[0] if args else os.environ.get("VALUEKIT_CACHE")
-    if not root:
-        print(
-            "usage: python -m valuekit.monitor <cache-dir>\n"
-            "       (or set VALUEKIT_CACHE)\n\n"
-            "The cache directory is the one passed to set_cache_dir(); the run\n"
-            "log is written under its runs/ subdirectory. Nothing is recorded for\n"
-            "a program that never configures a cache.",
-            file=sys.stderr,
-        )
-        return 2
+# ---------------------------------------------------------------------------
+# keys
+# ---------------------------------------------------------------------------
 
-    runs = Path(os.path.expanduser(root)) / "runs"
+
+class _Keys:
+    """Non-blocking single keystrokes from the terminal, if it is one.
+
+    Windows reads the console directly; POSIX puts the terminal in cbreak
+    mode for the monitor's lifetime and restores it on exit.  Neither is
+    used when stdin is not a terminal.
+    """
+
+    def __init__(self) -> None:
+        self._restore = None
+        self._posix = False
+        try:
+            self.enabled = sys.stdin.isatty()
+        except Exception:
+            self.enabled = False
+        if not self.enabled:
+            return
+        if os.name == "nt":
+            return
+        try:
+            import termios
+            import tty
+
+            fd = sys.stdin.fileno()
+            self._restore = (fd, termios.tcgetattr(fd))
+            tty.setcbreak(fd)
+            self._posix = True
+        except Exception:
+            self.enabled = False
+
+    def poll(self) -> str | None:
+        if not self.enabled:
+            return None
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                return msvcrt.getwch() if msvcrt.kbhit() else None
+            import select
+
+            ready, _, _ = select.select([sys.stdin], [], [], 0)
+            return sys.stdin.read(1) if ready else None
+        except Exception:
+            return None
+
+    def close(self) -> None:
+        if self._restore is not None:
+            try:
+                import termios
+
+                fd, attrs = self._restore
+                termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+            except Exception:
+                pass
+
+
+def _apply_key(root: Path, key: str | None) -> bool:
+    """Act on one keystroke; return False when the key asks to quit."""
+    if key is None:
+        return True
+    if key in ("q", "\x03"):
+        return False
+    mode = _KEYS.get(key.lower())
+    if mode is not None:
+        try:
+            placement.write_mode(root, mode)
+        except OSError:
+            pass
+    return True
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+
+def _usage() -> None:
+    print(
+        "usage: python -m valuekit.monitor [--mode local|remote|all] <cache-dir>\n"
+        "       (or set VALUEKIT_CACHE)\n\n"
+        "The cache directory is the one passed to set_cache_dir(); the run\n"
+        "log is written under its runs/ subdirectory. Nothing is recorded for\n"
+        "a program that never configures a cache. --mode writes the placement\n"
+        "mode and exits; without it, keys l, r and a set the mode while watching.",
+        file=sys.stderr,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    mode = None
+    if "--mode" in args:
+        at = args.index("--mode")
+        try:
+            mode = args[at + 1]
+        except IndexError:
+            _usage()
+            return 2
+        del args[at : at + 2]
+    root = args[0] if args else os.environ.get("VALUEKIT_CACHE")
+    if not root or mode is not None and mode not in placement.MODES:
+        _usage()
+        return 2
+    root_path = Path(os.path.expanduser(root))
+
+    if mode is not None:
+        placement.write_mode(root_path, mode)
+        print(f"placement mode for {root_path}: {mode}")
+        return 0
+
+    runs = root_path / "runs"
     tail = _Tail(runs)
     state = _State()
     tty = sys.stdout.isatty()
+    keys = _Keys()
+    try:
+        configured = tuple(h.name for h in placement.load_hosts().hosts)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        configured = ()
     print(f"watching {runs}", file=sys.stderr)
 
     try:
         while True:
+            if not _apply_key(root_path, keys.poll()):
+                return 0
             tail.poll(state)
             width, height = shutil.get_terminal_size((100, 40))
-            lines = _render(state, width)
+            lines = _render(
+                state, width, placement.read_mode(root_path), configured, keys.enabled
+            )
             if tty:
                 # Home the cursor and clear to end of screen, rather than
                 # clearing first: no flicker between frames.
@@ -289,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(_REFRESH)
     except KeyboardInterrupt:
         return 0
+    finally:
+        keys.close()
 
 
 if __name__ == "__main__":
