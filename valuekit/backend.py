@@ -30,6 +30,13 @@ on a host holds no cache: its store is this process's store, so the frames
 that arrive on a channel are not only its answer but a trace to keep, a
 lookup to answer, a run-log record to write, or a ``@pure_local`` call to
 make here.
+
+The connection is a :class:`Link`: two byte streams and how they ended,
+nothing more.  :class:`ProcessLink` is a child process's pipes, whether the
+child is a Python here or ``ssh`` to one elsewhere; what runs at the far end
+is the bootstrap (:mod:`valuekit.bootstrap`), which turns the project into
+an environment there and starts the host process in it.  A different
+transport later is another ``Link`` and touches nothing above it.
 """
 
 from __future__ import annotations
@@ -43,11 +50,11 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Protocol
+from typing import Any, BinaryIO, Callable, Protocol
 
 from .codec import SerializationError
 
-__all__ = ["Backend", "Handle", "LocalBackend", "HostBackend"]
+__all__ = ["Backend", "Handle", "Link", "ProcessLink", "LocalBackend", "HostBackend"]
 
 
 class Handle(Protocol):
@@ -70,6 +77,14 @@ class Handle(Protocol):
 
     def death(self) -> str:
         """A phrase describing how it died, for the failure message."""
+
+    def lost(self) -> bool:
+        """Whether the place went away with the work neither done nor failed.
+
+        A worker that exits, however badly, has failed its input; a
+        connection that closes under a worker has said nothing about the
+        input at all, and the scheduler may run it elsewhere.
+        """
 
 
 class Backend(Protocol):
@@ -162,6 +177,9 @@ class _LocalHandle:
             f"exit code {self.proc.exitcode}; a segfault or an "
             f"out-of-memory kill?"
         )
+
+    def lost(self) -> bool:
+        return False  # this machine does not go away
 
 
 class LocalBackend:
@@ -434,6 +452,14 @@ class _Handle:
         self._backend._send(wire.CLOSE, wire.channelled(self.ch))
         self._backend._forget(self.ch)
 
+    def lost(self) -> bool:
+        return (
+            self._eof
+            and self._exit is None
+            and self._result is None
+            and self._failure is None
+        )
+
     def death(self) -> str:
         tail = self._stderr.decode("utf-8", "replace").strip()
         if self._exit is None:
@@ -444,109 +470,49 @@ class _Handle:
 
 
 # ---------------------------------------------------------------------------
-# a host: one connection, many channels
+# a link: bytes to and from a process somewhere
 # ---------------------------------------------------------------------------
 
 
-class HostBackend:
-    """Workers on one host, over one connection to its host process.
+class Link(Protocol):
+    """A byte stream each way to a process on a host, and how it ended.
 
-    *command* launches the host process: for a remote machine an ssh
-    invocation, for this machine the interpreter itself.  Either way what
-    is at the other end is ``python -m valuekit.host``, and everything after
-    the launch is the same.
+    Everything above this -- channels, the host greeting, tasks -- is
+    written against these two streams and nothing else, so what carries
+    them (a pipe to a child, an ssh session, later a socket) is the one
+    thing a new kind of host has to provide.
     """
 
-    def __init__(
-        self,
-        fn,
-        cache_dir: str | None,
-        inbox: queue.Queue,
-        name: str,
-        command: list[str],
-        source_root: str,
-        workers: int | None = None,
-    ):
-        from . import sync, wire
-        from .codehash import fingerprint_details
-        from .pure import _current_store, _salt
-        from .worker import EXT_MARK
+    rx: BinaryIO
+    tx: BinaryIO
 
-        self.name = name
-        self.capacity = workers
-        self.dead = False
-        self.failure: str | None = None
-        self._fn = fn
-        self._cache_dir = cache_dir or ""
-        self._inbox = inbox
-        self._command = command
-        self._store = _current_store()
-        self._proc: subprocess.Popen | None = None
-        self._out_lock = threading.Lock()
-        self._channels: dict[int, _Handle] = {}
-        self._next = 1
+    def close(self) -> None:
+        """End the conversation and let the far end go."""
+
+    def failure(self) -> str:
+        """What the far end said on stderr and how it exited, or "" if it
+        has not ended.  For a failure message; never a reason on its own."""
+
+
+class ProcessLink:
+    """A process on this machine, or on another through ssh: its stdin and
+    stdout are the link, its stderr is kept for the failure message."""
+
+    def __init__(self, command: list[str]):
+        self.command = command
+        self.proc = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.rx: BinaryIO = self.proc.stdout  # type: ignore[assignment]
+        self.tx: BinaryIO = self.proc.stdin  # type: ignore[assignment]
         self._stderr = bytearray()
-        self._pool: ThreadPoolExecutor | None = None
-        self._ready = False
-
-        self._root = sync.sync_root(fn)
-        self._entries = sync.manifest(
-            self._root, exclude=[self._cache_dir] if self._cache_dir else []
-        )
-        self._hash = sync.manifest_hash(self._entries)
-        self._roots = sync.import_roots(self._root)
-        fingerprint, _, _, extensions = fingerprint_details(fn)
-        self._greeting = wire.strings(
-            _salt(),
-            getattr(fn, "__module__", "") or "",
-            getattr(fn, "__qualname__", "") or "",
-            fingerprint,
-            source_root,
-            self._hash,
-            *self._roots,
-            EXT_MARK,
-            *(part for pair in extensions.items() for part in pair),
-        )
-
-    # -- the connection ---------------------------------------------------------
-
-    def _launch(self) -> str:
-        """Start the host process and read its greeting; "" or why not."""
-        from . import wire
-        from .pure import _salt
-
-        try:
-            self._proc = subprocess.Popen(
-                self._command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except OSError as e:
-            return f"cannot start {' '.join(self._command)}: {e}"
         threading.Thread(target=self._drain_stderr, daemon=True).start()
-        frame = wire.read_frame(self._proc.stdout)
-        if frame is None or frame[0] != wire.HOST:
-            self._proc.wait()
-            return self._why("the host process said nothing")
-        salt, cpus = wire.unstrings(frame[1])[:2]
-        if salt != _salt():
-            self._kill_proc()
-            return f"driver is {_salt()}, host {self.name!r} is {salt}"
-        if self.capacity is None:
-            self.capacity = max(1, int(cpus))
-        threading.Thread(target=self._read, daemon=True).start()
-        return ""
-
-    def _why(self, fallback: str) -> str:
-        tail = bytes(self._stderr).decode("utf-8", "replace").strip()
-        code = self._proc.returncode if self._proc is not None else None
-        if code == 255:
-            fallback = f"ssh to host {self.name!r} failed"
-        return f"{fallback}:\n{tail}" if tail else fallback
 
     def _drain_stderr(self) -> None:
-        fd = self._proc.stderr.fileno()
+        fd = self.proc.stderr.fileno()  # type: ignore[union-attr]
         while True:
             try:
                 chunk = os.read(fd, 1 << 16)
@@ -557,13 +523,147 @@ class HostBackend:
             self._stderr += chunk
             del self._stderr[: -(64 << 10)]
 
+    def failure(self) -> str:
+        code = self.proc.poll()
+        tail = bytes(self._stderr).decode("utf-8", "replace").strip()
+        if code is None:
+            return tail
+        what = f"exit code {code}"
+        if code == 255 and self.command and self.command[0] == "ssh":
+            what = "ssh could not connect"
+        return f"{what}:\n{tail}" if tail else what
+
+    def close(self) -> None:
+        # Closing stdin is what tells a host process to exit; killing is
+        # for one that does not.
+        for stream in (self.tx, self.rx):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# a host: one connection, many channels
+# ---------------------------------------------------------------------------
+
+
+class HostBackend:
+    """Workers on one host, over one connection to its host process.
+
+    *connect* opens a :class:`Link` to a Python on the host: for a remote
+    machine an ssh invocation, for this machine an interpreter here.  The
+    bootstrap (:mod:`valuekit.bootstrap`) then turns that into a host
+    process running in the project's own environment, and everything after
+    that is the same wherever the host is.
+    """
+
+    def __init__(
+        self,
+        project,
+        cache_dir: str | None,
+        inbox: queue.Queue,
+        name: str,
+        connect: Callable[[], Link],
+        source_root: str,
+        workers: int | None = None,
+    ):
+        from . import wire
+        from .codehash import function_fingerprint
+        from .pure import _current_store, _salt
+
+        fn = project.fn
+        self.name = name
+        self.capacity = workers
+        self.dead = False
+        self.failure: str | None = None
+        self._project = project
+        self._cache_dir = cache_dir or ""
+        self._inbox = inbox
+        self._connect = connect
+        self._store = _current_store()
+        self._link: Link | None = None
+        self._source_root = source_root
+        self.pid: int | None = None  # the host process, once it has greeted
+        self._out_lock = threading.Lock()
+        self._channels: dict[int, _Handle] = {}
+        self._next = 1
+        self._pool: ThreadPoolExecutor | None = None
+        self._ready = False
+
+        self._greeting = wire.strings(
+            _salt(),
+            getattr(fn, "__module__", "") or "",
+            getattr(fn, "__qualname__", "") or "",
+            function_fingerprint(fn)[0],
+            project.tree_id,
+            *project.roots,
+        )
+
+    # -- the connection ---------------------------------------------------------
+
+    def _launch(self) -> str:
+        """Connect, bring the host up, and read its greeting; "" or why not."""
+        import sys
+
+        from . import bootstrap, wire
+        from .pure import _salt
+
+        try:
+            self._link = self._connect()
+        except OSError as e:
+            return f"cannot connect to host {self.name!r}: {e}"
+        try:
+            reason = bootstrap.offer(
+                self._link.rx,
+                self._link.tx,
+                self._source_root,
+                self._project.tree_id,
+                f"{sys.version_info.major}.{sys.version_info.minor}",
+                self._project.pack,
+            )
+        except (OSError, ValueError) as e:
+            reason = f"the connection to host {self.name!r} broke: {e}"
+        if reason:
+            reason = self._why(reason)
+            self._link.close()
+            return reason
+        try:
+            frame = wire.read_frame(self._link.rx)
+        except (wire.WireError, OSError, ValueError):
+            frame = None
+        if frame is None or frame[0] != wire.HOST:
+            reason = self._why("the host process said nothing")
+            self._link.close()
+            return reason
+        salt, cpus, pid = (wire.unstrings(frame[1]) + ["", "", ""])[:3]
+        if salt != _salt():
+            self._link.close()
+            return f"driver is {_salt()}, host {self.name!r} is {salt}"
+        if self.capacity is None:
+            self.capacity = max(1, int(cpus))
+        self.pid = int(pid) if pid.isdigit() else None
+        threading.Thread(target=self._read, daemon=True).start()
+        return ""
+
+    def _why(self, fallback: str) -> str:
+        detail = self._link.failure() if self._link is not None else ""
+        return f"{fallback}:\n{detail}" if detail else fallback
+
     def _read(self) -> None:
         """Reader thread: demultiplex the host's frames onto handles."""
         from . import wire
 
         while True:
             try:
-                frame = wire.read_frame(self._proc.stdout)
+                frame = wire.read_frame(self._link.rx)
             except (wire.WireError, OSError, ValueError):
                 frame = None
             if frame is None:
@@ -589,11 +689,11 @@ class HostBackend:
     def _send(self, tag: bytes, body: bytes) -> None:
         from . import wire
 
-        if self._proc is None:
+        if self._link is None:
             return
         with self._out_lock:
             try:
-                wire.write_frame(self._proc.stdin, tag, body)
+                wire.write_frame(self._link.tx, tag, body)
             except (OSError, ValueError):
                 pass  # the host is gone; the reader thread reports it
 
@@ -612,30 +712,27 @@ class HostBackend:
     # -- readiness ---------------------------------------------------------------
 
     def ensure_ready(self) -> str:
-        """Sync and verify this host once, before any input is dispatched.
+        """Bring this host up and verify it once, before it takes any input.
 
         Returns "" when the host can take work, else why not.  A failure
         is a fact about the host, recorded once rather than against every
-        input that would have gone there.
+        input that would have gone there.  The connection carries the
+        project over and builds its environment; a readiness worker then
+        imports the function from it and checks what it got.
         """
-        from . import sync, wire
+        from . import wire
 
         if self._ready:
             return ""
         if self.failure is not None:
             return self.failure
-        reason = self._preflight() or self._launch()
+        reason = self._project.refusal() or self._launch()
         if reason:
             self.failure = reason
             return reason
         handle = self._open(b"ready", queue.Queue())
         try:
-            handle._write_frame(wire.SYNC, self._greeting)
-            frame = handle.wait_frame(timeout=120)
-            if frame is None or frame[0] != wire.WANT:
-                return self._fail(handle, "the worker said nothing")
-            if frame[1]:
-                handle._write_frame(wire.TREE, sync.pack_tree(self._root, self._entries))
+            handle._write_frame(wire.HELLO, self._greeting)
             frame = handle.wait_frame(timeout=600)
             if frame is None or frame[0] != wire.READY:
                 return self._fail(handle, "the worker never reported")
@@ -650,34 +747,6 @@ class HostBackend:
         tail = handle._stderr.decode("utf-8", "replace").strip()
         self.failure = f"{reason}:\n{tail}" if tail else reason
         return self.failure
-
-    def _preflight(self) -> str:
-        """Refuse a dependency the source tree could never contain.
-
-        Only the outside-the-project case is checked here, because it is the
-        only one the worker cannot explain for itself: it would report
-        "cannot import X" without being able to say that X lives in a sibling
-        checkout the driver never offered to send.
-        """
-        from . import sync
-        from .codehash import function_fingerprint
-
-        try:
-            spans = function_fingerprint(self._fn)[1]
-        except Exception:
-            return ""
-        root = os.path.realpath(self._root)
-        outside = [f for f in sync.user_span_files(spans) if not sync._under(f, root)]
-        if outside:
-            listed = "\n  ".join(sorted(outside))
-            return (
-                f"{getattr(self._fn, '__qualname__', self._fn)} depends on user "
-                f"code outside its project at {root}, which cannot be sent to a "
-                f"worker:\n  {listed}\n"
-                "Move it into the project, or install it as a package so both "
-                "machines resolve it the same way."
-            )
-        return ""
 
     # -- tasks ---------------------------------------------------------------------
 
@@ -707,24 +776,9 @@ class HostBackend:
             handle._failure = f"could not send the task: {e}"
         return handle
 
-    def _kill_proc(self) -> None:
-        if self._proc is None:
-            return
-        for stream in (self._proc.stdin, self._proc.stdout):
-            try:
-                stream.close()
-            except Exception:
-                pass
-        try:
-            self._proc.wait(timeout=5)
-        except Exception:
-            try:
-                self._proc.kill()
-            except Exception:
-                pass
-
     def close(self) -> None:
-        self._kill_proc()  # closing stdin is what tells the host to exit
+        if self._link is not None:
+            self._link.close()
         if self._pool is not None:
             self._pool.shutdown(wait=False)
             self._pool = None

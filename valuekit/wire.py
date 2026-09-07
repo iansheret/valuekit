@@ -36,15 +36,12 @@ __all__ = ["WireError", "read_frame", "write_frame", "pack", "unpack"]
 # refused rather than acted on.
 MAX_FRAME = 1 << 31
 
-HELLO = b"\x01"  # driver -> worker: ids, source root, source id, import roots
+HELLO = b"\x01"  # driver -> worker: ids, tree id, import roots
 READY = b"\x02"  # worker -> driver: empty if admitted, else the reason
 OBJECT = b"\x03"  # either way: one content-addressed object
 TASK = b"\x04"  # driver -> worker: the root hash of the input
 RESULT = b"\x05"  # worker -> driver: ok or error
 EVENT = b"\x06"  # worker -> driver: one run-log record
-SYNC = b"\x07"  # driver -> worker: manifest hash and import roots
-WANT = b"\x08"  # worker -> driver: empty if it has the source tree already
-TREE = b"\x09"  # driver -> worker: the project tree, packed
 
 # The worker's store is the driver's store.  These carry a worker's store
 # calls to the driver and the answers back; a worker holds nothing itself.
@@ -58,7 +55,7 @@ CALLED = b"\x10"  # driver -> worker: its result root and trace hash, or error
 
 # Between the driver and a host process (valuekit.host), which runs one
 # worker per task and carries each worker's stream as a numbered channel.
-HOST = b"\x11"  # host -> driver: on start, its salt and CPU count
+HOST = b"\x11"  # host -> driver: on start, its salt, CPU count and pid
 OPEN = b"\x12"  # driver -> host: channel id, then "ready" or "task"
 DATA = b"\x13"  # both: channel id, then bytes of that worker's stdin or stdout
 CLOSE = b"\x14"  # driver -> host: channel id; close the worker's stdin

@@ -71,8 +71,8 @@ import time
 from collections import deque
 from typing import Any, Callable, Iterable, Iterator
 
-from . import placement, runlog
-from .backend import HostBackend, LocalBackend
+from . import bootstrap, placement, runlog, sync
+from .backend import HostBackend, LocalBackend, ProcessLink
 from .batches import BatchWriter
 from .codehash import function_fingerprint
 from .debughook import breakpoints_force
@@ -90,8 +90,8 @@ _batch_seq = 0
 # never a call-site argument: a host list in code could reach a fingerprint,
 # and where a computation ran must not be able to affect its result.  This
 # private hook stands in for the hosts file in tests: a name to the command
-# that launches a host process, or to ``(command, workers)``; a host with no
-# capacity given reports its own.
+# that runs a Python 3 to bootstrap with, or to ``(command, workers)``; a host
+# with no capacity given reports its own.
 _host_commands: dict[str, Any] | None = None
 
 
@@ -290,6 +290,10 @@ def _cached(fn, x) -> Outcome | None:
         return None
 
 
+def _launcher(command: list[str]):
+    return lambda: ProcessLink(command)
+
+
 class _Places:
     """The backends a batch may run on, and how many tasks each may hold.
 
@@ -307,26 +311,33 @@ class _Places:
         self._batch = batch
         self._cache_dir = cache_dir
         self._applied: tuple | None = None
+        self._closed = False
         config = placement.load_hosts()
         self.local_workers = config.local
         if _host_commands is not None:
+            project = sync.Project(fn) if _host_commands else None
             source_root = os.path.join(cache_dir, "source") if cache_dir else ""
             for name, spec in _host_commands.items():
                 command, workers = spec if isinstance(spec, tuple) else (spec, None)
                 self.hosts.append(
                     HostBackend(
-                        fn, cache_dir, inbox, name, list(command), source_root, workers
+                        project, cache_dir, inbox, name,
+                        _launcher([*command, "-c", bootstrap.STAGE0]),
+                        source_root, workers,
                     )
                 )
         else:
+            # One project for every host: the tree is walked once per batch.
+            project = sync.Project(fn) if config.hosts else None
             for h in config.hosts:
                 command = [
                     "ssh", "-T", "-o", "BatchMode=yes", h.ssh,
-                    f"{h.python} -m valuekit.host",
+                    bootstrap.remote_command(h.python),
                 ]
                 self.hosts.append(
                     HostBackend(
-                        fn, cache_dir, inbox, h.name, command, h.source_root, h.workers
+                        project, cache_dir, inbox, h.name, _launcher(command),
+                        h.source_root, h.workers,
                     )
                 )
 
@@ -350,16 +361,27 @@ class _Places:
     def _prepare_one(self, b: HostBackend) -> None:
         reason = b.ensure_ready()
         self._states[b.name] = "failed" if reason else "ready"
+        if self._closed:
+            return  # the batch ended first; nothing to report it to
         runlog.record(
             self._store, "host", id=self._batch, name=b.name, ok=not reason,
             reason=reason or None, capacity=b.capacity,
         )
 
+    def pending(self) -> bool:
+        """Whether any host is still preparing, and so may yet take work."""
+        return any(s == "pending" for s in self._states.values())
+
     def capacities(self) -> tuple[str, dict[str, int]]:
-        """The mode in force and each place's capacity under it."""
+        """The mode in force and each place's capacity under it.
+
+        Readiness is started here, never waited for: this machine's workers
+        start at once and a host joins when it is ready, whether the mode
+        named it from the start or a switch mid-batch brought it in.
+        """
         mode = placement.read_mode(self._cache_dir)
         if mode != "local" and self.hosts:
-            self.prepare(wait=False)  # a switch after the start: hosts join as they become ready
+            self.prepare(wait=False)
         remote = {}
         for b in self.hosts:
             if b.name not in self._states:
@@ -372,13 +394,14 @@ class _Places:
                     self._store, "host", id=self._batch, name=b.name, ok=False,
                     reason="the connection closed", capacity=b.capacity,
                 )
-        caps = placement.capacities(mode, self.local_workers, remote)
+        caps = placement.capacities(mode, self.local_workers, remote, self.pending())
         if (mode, caps) != self._applied:
             self._applied = (mode, caps)
             runlog.record(self._store, "placement", id=self._batch, mode=mode, capacities=caps)
         return mode, caps
 
     def close(self) -> None:
+        self._closed = True
         for b in self.all():
             try:
                 b.close()
@@ -479,15 +502,9 @@ def run_all(
     inbox: queue.Queue = queue.Queue()
     places = _Places(fn, cache_dir, inbox, store, batch)
 
-    # Whatever a host must do once before it can take work -- syncing the
-    # project, checking the environment -- happens here, before any input is
-    # claimed, so that a failure is recorded once as a fact about the host
-    # rather than against every input that would have gone there.
-    if placement.read_mode(cache_dir) != "local":
-        places.prepare(wait=True)
-
     running: list[_Task] = []
     busy: dict[str, int] = {}  # place name -> tasks running there
+    moved: set[int] = set()  # inputs already run again after losing their host
 
     def _start(backend, idx: int, x: Any) -> None:
         handle = backend.start(x)
@@ -525,11 +542,14 @@ def run_all(
         while pending or running:
             _admit()
             if not running:
-                if pending:
+                if not pending:
+                    break
+                if not places.pending():
                     raise RuntimeError(
                         "no place can run this batch: every capacity is zero"
                     )
-                break
+                _drain(block=True)  # a host is on its way; wait for it
+                continue
             _drain(block=True)
             now = time.monotonic()
             for t in list(running):
@@ -547,6 +567,15 @@ def run_all(
                 running.remove(t)
                 busy[t.where] -= 1
                 t.handle.reap()
+                if msg is None and not t.timed_out and t.handle.lost():
+                    # The host went away; the input is not done, not
+                    # failed.  Run it again elsewhere, once: an input that
+                    # takes a host down each time is a failure after all.
+                    if t.idx not in moved:
+                        moved.add(t.idx)
+                        pending.appendleft((t.idx, t.x))
+                        runlog.record(store, "requeue", id=batch, i=t.idx, host=t.where)
+                        continue
                 o = _harvest(t, msg, qualname, timeout)
                 outcomes[t.idx] = o
                 record.outcome(t.idx, o, host=t.where)

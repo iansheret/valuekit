@@ -20,11 +20,14 @@ underneath it, and re-running an unchanged tree costs one comparison.  It
 lives under the cache directory, beside ``objects/`` and ``runs/``: the cache
 directory is where valuekit writes, and nothing is written until one is named.
 
-Nothing here trusts that the sync worked.  :mod:`valuekit.worker` audits what
-it actually imported afterwards, and the fingerprint handshake checks the
-result again -- because a source tree on ``sys.path`` can still lose to an
-editable install's meta-path finder, and a silent wrong answer is the one
-outcome worth any amount of machinery to avoid.
+What happens to the tree on the host -- unpacking it, building the
+environment the project's lock file describes, starting the host process
+inside it -- is :mod:`valuekit.bootstrap`'s.  Nothing here trusts that any
+of it worked: :mod:`valuekit.worker` audits what it actually imported
+afterwards, and the fingerprint handshake checks the result again --
+because a source tree on ``sys.path`` can still lose to an editable
+install's meta-path finder, and a silent wrong answer is the one outcome
+worth any amount of machinery to avoid.
 """
 
 from __future__ import annotations
@@ -44,11 +47,13 @@ from .values import _frame, _new_hasher
 
 __all__ = [
     "SyncError",
+    "Project",
     "manifest",
     "manifest_hash",
+    "tree_id",
+    "find_root",
     "sync_root",
     "pack_tree",
-    "extract_tree",
     "import_roots",
     "user_span_files",
     "is_environment",
@@ -163,8 +168,17 @@ def user_span_files(spans: Iterable[tuple[str, int, int]]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def find_root(path: str) -> str | None:
+    """The project directory enclosing *path*, by its nearest marker, or None."""
+    here = Path(os.path.realpath(path)).parent
+    for candidate in (here, *here.parents):
+        if (candidate / "pyproject.toml").exists() or (candidate / ".git").exists():
+            return str(candidate)
+    return None
+
+
 def sync_root(fn: Any) -> str:
-    """The project directory enclosing *fn*, by its nearest marker."""
+    """The project directory enclosing *fn*: its nearest marker, else its directory."""
     mod = sys.modules.get(getattr(fn, "__module__", "") or "")
     fname = getattr(mod, "__file__", None)
     if not fname:
@@ -173,11 +187,93 @@ def sync_root(fn: Any) -> str:
             "its module has no file. Define it in a module, not a notebook or "
             "an exec'd string."
         )
-    here = Path(os.path.realpath(fname)).parent
-    for candidate in (here, *here.parents):
-        if (candidate / "pyproject.toml").exists() or (candidate / ".git").exists():
-            return str(candidate)
-    return str(here)
+    return find_root(fname) or str(Path(os.path.realpath(fname)).parent)
+
+
+def _cache_dirs() -> list[str]:
+    """The current store's directory, if it has one: never part of a tree.
+
+    A cache configured inside the project would otherwise be packed into the
+    source tree that lives beside it, and would move the tree's identity every
+    time a value was written.
+    """
+    from .pure import _current_store
+    from .store import LocalStore
+
+    store = _current_store()
+    return [str(store.root)] if isinstance(store, LocalStore) else []
+
+
+def tree_id(root: str) -> str:
+    """The identity of the project at *root*: its manifest hash, right now.
+
+    Not memoised across calls: the manifest is what says whether the tree
+    changed, so a remembered answer is the one thing it must not be.  A
+    caller that needs it repeatedly within one operation keeps it for that
+    operation (the fingerprint walk does).
+    """
+    return manifest_hash(manifest(root, exclude=_cache_dirs()))
+
+
+class Project:
+    """The project a function belongs to, as it would be shipped.
+
+    Built once per batch and shared by every host: the manifest walk reads
+    every file in the tree, and the answer is the same for all of them.
+    ``tree_id`` names exactly this set of files at exactly these contents;
+    it is the name of the source tree on every host, and the identity that
+    stands for a native extension built from it (see :mod:`valuekit.codehash`).
+    """
+
+    def __init__(self, fn: Any):
+        self.fn = fn
+        self.root = sync_root(fn)
+        self.entries = manifest(self.root, exclude=_cache_dirs())
+        self.tree_id = manifest_hash(self.entries)
+        self.roots = import_roots(self.root)
+        self._packed: bytes | None = None
+
+    def pack(self) -> bytes:
+        """The tree as a tarball, built once."""
+        if self._packed is None:
+            self._packed = pack_tree(self.root, self.entries)
+        return self._packed
+
+    def refusal(self) -> str:
+        """Why no host could take this project, or "".
+
+        Refused here, before anything is sent: a tree without a lock file
+        valuekit knows, since no host could build its environment; and a
+        dependency in a sibling checkout the tree never contained, which
+        would surface on the host as "cannot import X", with nothing to say
+        that X lives somewhere the driver never offered to send.
+        """
+        from . import bootstrap
+        from .codehash import function_fingerprint
+
+        if bootstrap.lock_tool(rel for rel, _ in self.entries) is None:
+            known = ", ".join(bootstrap.KNOWN_LOCKS)
+            return (
+                f"the project at {self.root} has no lock file valuekit knows how "
+                f"to use ({known}), so a host could not build its environment. "
+                "Lock the project's dependencies with one of those tools."
+            )
+        try:
+            spans = function_fingerprint(self.fn)[1]
+        except Exception:
+            return ""
+        root = os.path.realpath(self.root)
+        outside = [f for f in user_span_files(spans) if not _under(f, root)]
+        if outside:
+            listed = "\n  ".join(sorted(outside))
+            return (
+                f"{getattr(self.fn, '__qualname__', self.fn)} depends on user "
+                f"code outside its project at {root}, which cannot be sent to a "
+                f"worker:\n  {listed}\n"
+                "Move it into the project, or install it as a package so both "
+                "machines resolve it the same way."
+            )
+        return ""
 
 
 def _file_digest(path: str) -> str | None:
@@ -363,7 +459,7 @@ def pack_tree(root: str, entries: list[tuple[str, str]]) -> bytes:
                     data = f.read()
             except OSError:
                 continue
-            info = tarfile.TarInfo(rel)
+            info = tarfile.TarInfo(rel.replace(os.sep, "/"))
             info.size = len(data)
             info.mtime = 0
             info.uid = info.gid = 0
@@ -371,24 +467,3 @@ def pack_tree(root: str, entries: list[tuple[str, str]]) -> bytes:
             info.mode = 0o755 if st.st_mode & 0o100 else 0o644
             tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
-
-
-def check_extraction_supported() -> str:
-    """"" if tar can be extracted safely here, else why not."""
-    if not hasattr(tarfile, "data_filter"):
-        return (
-            f"this worker runs Python {sys.version.split()[0]}, whose tarfile "
-            "cannot filter extraction safely (added in 3.11.4). Upgrade the "
-            "worker's interpreter."
-        )
-    return ""
-
-
-def extract_tree(data: bytes, dest: str) -> None:
-    """Extract a packed tree into *dest*, refusing anything that escapes it."""
-    reason = check_extraction_supported()
-    if reason:
-        raise SyncError(reason)
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tar:
-        # Always explicit: the safe filter is only the default from 3.14.
-        tar.extractall(dest, filter="data")

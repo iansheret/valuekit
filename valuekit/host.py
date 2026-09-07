@@ -8,7 +8,7 @@ channel, so a batch of a thousand inputs costs one ssh handshake rather than
 a thousand.  (The Windows ssh client has no connection sharing, which is
 what rules out a connection per task.)
 
-    host   -> HOST    salt, CPU count
+    host   -> HOST    salt, CPU count, pid
     driver -> OPEN    channel, "ready" | "task"     start a worker
     driver -> DATA    channel, bytes                 to that worker's stdin
     host   -> DATA    channel, bytes                 from that worker's stdout
@@ -16,7 +16,9 @@ what rules out a connection per task.)
     driver -> KILL    channel                        kill the worker
     host   -> EXIT    channel, exit code, stderr tail
 
-Workers are started with the allowlisted environment, as they are locally.
+Workers are started with the allowlisted environment, as they are locally;
+``VALUEKIT_TREE``, set by the bootstrap that started this process, passes
+through it and tells each worker which source tree it is in.
 This process exits when its stdin closes, after killing every worker it
 started: a dropped connection or a driver that died leaves nothing running.
 Bytes on a channel are passed through untouched; what they mean is between
@@ -92,7 +94,7 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
                 w.stderr += chunk
                 del w.stderr[:-_STDERR_TAIL]
 
-    send(wire.HOST, wire.strings(_salt(), str(os.cpu_count() or 1)))
+    send(wire.HOST, wire.strings(_salt(), str(os.cpu_count() or 1), str(os.getpid())))
     env = worker_env()
     try:
         while True:

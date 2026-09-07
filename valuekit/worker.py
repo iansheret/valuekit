@@ -2,43 +2,43 @@
 
 ``python -m valuekit.worker`` reads framed messages on stdin and writes them
 on stdout.  It comes in two shapes.  ``--ready`` makes one process per host
-that unpacks the project's source tree, imports from it, checks what it
-got, and exits; every later process then runs exactly one input against that
-finished source tree and exits, which is what keeps the isolation `run_all`
+that imports the function from the project's source tree, checks what it
+got, and exits; every later process then runs exactly one input against
+that same tree and exits, which is what keeps the isolation `run_all`
 already promises -- a segfault or a timeout costs one input and nothing else.
 
-Readiness is separate for a reason.  A sync failure, a missing dependency or
-a compile error is a fact about the *host*, and folding it into the first
-task would report it against whichever input happened to go first.  Getting
-that wrong would break the one property `run_all` is built around: every
-failure recorded against the input that caused it.
+Readiness is separate for a reason.  A missing dependency, a build error or
+a function that will not import is a fact about the *host*, and folding it
+into the first task would report it against whichever input happened to go
+first.  Getting that wrong would break the one property `run_all` is built
+around: every failure recorded against the input that caused it.
 
-    driver -> SYNC    salt, ids, source root, manifest hash, import roots
-    worker -> WANT    empty if the source tree is already here, else send it
-    driver -> TREE    the tarball, only if wanted
+    driver -> HELLO   salt, module, qualname, fingerprint, tree id, import roots
     worker -> READY   empty if admitted, else why not
-
-    driver -> HELLO   salt, module, qualname, fingerprint, source root, source id
-    worker -> READY   empty if admitted, else why not
-    driver -> OBJECT* the input's object graph
+    driver -> OBJECT* the input's object graph            (task workers only)
     driver -> TASK    the input's root hash
     ...               store traffic: the worker's cache is the driver's
     worker -> OBJECT* the result's object graph
     worker -> RESULT  ok and a root hash, or a failure
 
+The source tree is already here, and so is the environment it needs: the
+bootstrap (:mod:`valuekit.bootstrap`) received the tree and built the
+environment before this interpreter -- the environment's own -- started,
+and named the tree in ``VALUEKIT_TREE``.  The greeting says which tree the
+driver meant, and a worker in the wrong one refuses.
+
 A worker holds no cache.  Its store is a :class:`~valuekit.remotestore.WireStore`,
 which sends every value, trace and run-log record to the driver and asks the
 driver for every lookup, so a batch's results exist in one place however
-many machines ran it.  The only thing written here is the source tree, at
-the root the driver named.
+many machines ran it.
 
 Three checks guard the result, and they are deliberately independent.  The
-source tree decides what is on ``sys.path``; the *audit* then confirms that what
-was actually imported came from there, because a path entry can still lose to
-an editable install's meta-path finder; and the fingerprint handshake
-confirms the code means what the driver thinks.  The audit matters most: it
-is the difference between running the driver's code and running whatever the
-worker happened to have.
+source tree decides what is on ``sys.path``; the *audit* then confirms that
+what was actually imported came from there, because a path entry can still
+lose to some other finder on ``sys.meta_path``; and the fingerprint
+handshake confirms the code means what the driver thinks.  The audit
+matters most: it is the difference between running the driver's code and
+running whatever the worker happened to have.
 
 The transport carries values, never code.  What crosses is the fixed set of
 storable types -- a real narrowing of what a local worker accepts by pickle,
@@ -69,37 +69,34 @@ def _resolve(module: str, qualname: str):
     return obj
 
 
-# Greeting fields after the six fixed ones: the import roots, then this
-# marker, then the driver's native-extension digests as (module, digest)
-# pairs.  See codehash._ext_overrides for why a worker takes them on.
-EXT_MARK = "--ext--"
-
-
-def _tail(parts: list[str]) -> tuple[list[str], dict[str, str]]:
-    """Split a greeting's trailing fields into import roots and overrides."""
-    if EXT_MARK in parts:
-        at = parts.index(EXT_MARK)
-        roots, pairs = parts[:at], parts[at + 1 :]
-    else:
-        roots, pairs = parts, []
-    overrides = {pairs[i]: pairs[i + 1] for i in range(0, len(pairs) - 1, 2)}
-    return [r for r in roots if r], overrides
-
-
-def _take_overrides(overrides: dict[str, str]) -> None:
+def _take_identity(tree_id: str) -> None:
+    """A native extension here was built from the tree named *tree_id*, so
+    that is its identity, exactly as it is on the driver.  See
+    :mod:`valuekit.codehash`."""
     from . import codehash
 
-    codehash._ext_overrides.update(overrides)
+    codehash._source_id = tree_id or None
 
 
+def _tree(tree_id: str) -> tuple[Path | None, str]:
+    """The source tree this worker runs from, or why it cannot.
 
-def source_dir(source_root: str, manifest_hash: str) -> Path:
-    """Where a synced source tree lives, under the root the driver named.
-
-    ``~`` is expanded here, on the machine the tree lives on: the driver
-    names the root as configured, without knowing this machine's home.
+    Named by the bootstrap in the environment; the greeting says which tree
+    the driver meant, and they must agree.  No tree at all (an empty id and
+    nothing in the environment) means the tests' in-process worker, which
+    imports as this process does.
     """
-    return Path(os.path.expanduser(source_root)) / manifest_hash
+    here = os.environ.get("VALUEKIT_TREE", "")
+    if not tree_id and not here:
+        return None, ""
+    if not here:
+        return None, "this worker was started outside a source tree"
+    if os.path.basename(here) != tree_id:
+        return None, (
+            f"this worker is in tree {os.path.basename(here)[:12]}, the driver "
+            f"meant {tree_id[:12]}"
+        )
+    return Path(here), ""
 
 
 def _install(source: Path, roots: list[str]) -> None:
@@ -174,156 +171,50 @@ def _admit(salt: str, module: str, qualname: str, fingerprint: str) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# readiness: once per host
-# ---------------------------------------------------------------------------
+def _greet(rx: BinaryIO, tx: BinaryIO, audit: bool) -> tuple[bool, str]:
+    """Read the greeting, set the process up to run the function, and reply.
 
-
-def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
+    Returns whether to go on and the function's module and qualname joined
+    by a colon, for :func:`serve` to resolve.
+    """
     frame = wire.read_frame(rx)
     if frame is None:
-        return 0
+        return False, ""  # the driver went away before saying anything
     tag, body = frame
-    if tag != wire.SYNC:
-        wire.write_frame(tx, wire.READY, b"expected a sync request")
-        return 1
+    if tag != wire.HELLO:
+        wire.write_frame(tx, wire.READY, b"expected a greeting")
+        return False, ""
     parts = wire.unstrings(body)
-    salt, module, qualname, fingerprint, source_root, mhash = parts[:6]
-    roots, overrides = _tail(parts[6:])
+    salt, module, qualname, fingerprint, tree_id = parts[:5]
+    roots = [r for r in parts[5:] if r]
 
-    reason = _refuse_early(salt, source_root)
-    if reason:
-        wire.write_frame(tx, wire.WANT, b"")  # nothing will be sent
-        wire.write_frame(tx, wire.READY, reason.encode("utf-8"))
-        return 1
-
-    source = source_dir(source_root, mhash)
-    complete = source / ".complete"
-    wire.write_frame(tx, wire.WANT, b"" if complete.exists() else b"send")
-    if not complete.exists():
-        frame = wire.read_frame(rx)
-        if frame is None or frame[0] != wire.TREE:
-            wire.write_frame(tx, wire.READY, b"the project tree never arrived")
-            return 1
-        try:
-            unpack(frame[1], source)
-        except Exception as e:
-            wire.write_frame(
-                tx, wire.READY, f"could not unpack the project: {e}".encode()
-            )
-            return 1
-
-    _install(source, roots)
-    _take_overrides(overrides)
-
-    reason = _admit(salt, module, qualname, fingerprint)
+    source, reason = _tree(tree_id)
     if not reason:
+        # The tree goes on the path before _admit, which imports.
+        if source is not None:
+            _install(source, roots)
+        _take_identity(tree_id)
+        reason = _admit(salt, module, qualname, fingerprint)
+    if not reason and audit and source is not None:
         # After the import, and before the fingerprint is trusted: a
         # fingerprint that matches the wrong file is still the wrong file.
         reason = _audit(source)
     wire.write_frame(tx, wire.READY, reason.encode("utf-8"))
-    return 1 if reason else 0
+    return not reason, f"{module}:{qualname}"
 
 
-def _refuse_early(salt: str, source_root: str) -> str:
-    from .pure import _salt
-
-    mine = _salt()
-    if mine != salt:
-        return f"driver is {salt}, this worker is {mine}"
-    if not source_root:
-        return (
-            "this worker was given nowhere to keep a copy of the project. The "
-            "driver names the place from its cache directory; configure one "
-            "with set_cache_dir()."
-        )
-    return sync.check_extraction_supported()
-
-
-def unpack(data: bytes, source: Path) -> None:
-    """Unpack into a fresh directory, then move it into place.
-
-    Immutability of the name is not atomicity of the construction: two
-    drivers can race on one host, and a half-built tree must never be
-    adopted.  Hence a temporary directory, a marker written last, and a
-    rename -- with "someone else got there first" treated as success.
-    """
-    import shutil
-    import uuid
-
-    parent = source.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    prune(parent)
-    tmp = parent / f".tmp-{uuid.uuid4().hex}"
-    try:
-        tmp.mkdir()
-        sync.extract_tree(data, str(tmp))
-        (tmp / ".complete").write_bytes(b"")
-        try:
-            os.rename(tmp, source)
-        except OSError:
-            if (source / ".complete").exists():
-                shutil.rmtree(tmp, ignore_errors=True)  # someone else won
-            else:
-                # Something is in the way without the marker, so it is debris
-                # from a crash or a kill: it can never be adopted, and leaving
-                # it would block this source tree for good.
-                shutil.rmtree(source, ignore_errors=True)
-                os.rename(tmp, source)
-    except BaseException:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise
-
-
-_MAX_TREES = 10
-
-
-def prune(parent: Path) -> None:
-    """Drop the oldest source trees. Best effort; a live one is only wasted disk."""
-    try:
-        kept = sorted(
-            (p for p in parent.iterdir() if p.is_dir() and not p.name.startswith(".")),
-            key=lambda p: p.stat().st_mtime,
-        )
-    except OSError:
-        return
-    import shutil
-
-    for p in kept[: max(0, len(kept) - _MAX_TREES + 1)]:
-        shutil.rmtree(p, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# one task
-# ---------------------------------------------------------------------------
+def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
+    """Once per host: import the function from the tree and check it."""
+    ok, _ = _greet(rx, tx, audit=True)
+    return 0 if ok else 1
 
 
 def serve(rx: BinaryIO, tx: BinaryIO) -> int:
     """Run one task off *rx*, reporting on *tx*."""
-    frame = wire.read_frame(rx)
-    if frame is None:
-        return 0  # driver went away before saying anything
-    tag, body = frame
-    if tag != wire.HELLO:
-        wire.write_frame(tx, wire.READY, b"expected a greeting")
-        return 1
-    parts = wire.unstrings(body)
-    salt, module, qualname, fingerprint, source_root, mhash = parts[:6]
-    roots, overrides = _tail(parts[6:])
-
-    # The source tree has to be on the path before _admit, which imports.
-    if mhash:
-        source = source_dir(source_root, mhash)
-        if not (source / ".complete").exists():
-            wire.write_frame(tx, wire.READY, b"the source tree is missing")
-            return 1
-        _install(source, roots)
-    _take_overrides(overrides)
-
-    reason = _admit(salt, module, qualname, fingerprint)
-    wire.write_frame(tx, wire.READY, reason.encode("utf-8"))
-    if reason:
-        return 1
+    ok, target = _greet(rx, tx, audit=False)
+    if not ok:
+        return 0 if not target else 1
+    module, qualname = target.split(":", 1)
 
     from .pure import _current_store, set_store
 

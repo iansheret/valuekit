@@ -489,14 +489,27 @@ else, so there is nothing to configure and nothing recorded without a cache.
 
 ## Running on other machines
 
-A batch can run on any machine you can reach with ssh, with nothing on
-that machine but Python, numpy, valuekit, and your project's dependencies.
+A batch can run on any machine you can reach with ssh, as if this machine
+had that many more cores. The rule for what a machine needs is the rule
+for a person: if they could check your project out there and run it, so
+can valuekit. Concretely the host needs a Python 3 to start with, the tool
+your project locks its dependencies with, a compiler if you build an
+extension, and the network. Nothing of yours, valuekit included, is
+installed there beforehand: your project's own lock file says what the
+environment is, and the host builds it.
+
 The cache stays here: every value, trace and run-log record a remote worker
 produces is sent back over the connection, every lookup asks this machine,
 and `@pure_local` calls run here. Nothing you compute elsewhere has to be
 fetched, and the remote machine keeps no results. From the analysis code's
 point of view a batch that ran on three machines is indistinguishable from
 one that ran on this one.
+
+Your project has to be a *locked* project: its tree must carry a lock file
+from a tool valuekit knows how to invoke. Today that is `uv.lock`; a tree
+without one is refused before anything is sent, and the refusal names the
+lock files valuekit understands. The lock pins the Python version and every
+dependency, so what the host builds is what you have.
 
 Hosts are declared once, in a TOML file named by `VALUEKIT_HOSTS`:
 
@@ -506,39 +519,54 @@ workers = 8                                   # optional; default: CPU count
 
 [hosts.mac]
 ssh = "ian@mac.local"                         # anything ssh accepts
-python = "/Users/ian/.venvs/vk/bin/python"    # an interpreter with valuekit installed
+python = "python3"                            # optional; any Python 3 there ("python" on Windows)
 workers = 8                                   # optional; default: the host's CPU count
 source_root = "~/.cache/valuekit/source"      # optional; this is the default
 ```
 
 Login must work without a prompt (`ssh mac.local true`), which means a key
 and, on macOS, Remote Login switched on; on Windows the OpenSSH Server
-feature. Your project is sent to the host as a source tree (tracked files
-plus untracked files that are not ignored, never build artefacts) and
-imported from there, after a check that what was imported really came from
-it and that the function's fingerprint matches. Dependencies are the host's
-own business, exactly as numpy is: install them there. A native extension
-you build yourself must be built on the host too, by a build backend that
-rebuilds on import (scikit-build-core with `editable.rebuild`, or
-meson-python); its binary differs from yours, and that is expected. The
-host fingerprints with your binary's digest in place of its own, so its
-keys are your keys.
+feature. The lock tool must be on the PATH a *non-interactive* ssh session
+sees, which is shorter than your login shell's; valuekit also looks in
+`~/.local/bin` and `~/.cargo/bin`. A Windows host is reached through sshd's
+default shell: leave that as `cmd.exe`, because PowerShell in that role
+strips the quotes the bootstrap command needs.
+
+What happens on the host: your project is sent as a source tree (tracked
+files plus untracked files that are not ignored, never build artefacts)
+into `source_root`, the lock tool syncs it there (for uv, `uv sync
+--frozen`, for the same Python minor version you are running; uv fetches
+that interpreter if the host lacks it), and workers run in the environment
+that produced. A native extension is built on the host from the same
+sources, by the project's own build backend. Its binary differs from yours,
+and that is expected: an extension's identity in the fingerprint is the
+tree it was built from, which is the same everywhere. That does mean any
+edit in the project re-keys functions that reach an extension, and that
+the key describes the sources rather than the binary, so a build backend
+that rebuilds on import (scikit-build-core with `editable.rebuild`, or
+meson-python) is what keeps your own machine honest. Each version of the
+tree is kept immutable and synced once; an unchanged project costs one
+comparison.
 
 Where work goes is a *mode*, one word in `<cache>/placement`:
 
 | mode | this machine | hosts |
 |---|---|---|
-| `local` (default) | everything | nothing |
+| `all` (default) | full capacity | full capacity |
+| `local` | everything | nothing |
 | `remote` | nothing, unless no host is reachable | everything |
-| `all` | full capacity | full capacity |
 
-Switch it from the monitor (below) or with `python -m valuekit.monitor
---mode remote <cache-dir>`. The driver re-reads the mode each time it
-starts a task, so a switch during a batch applies to the next task; tasks
-already running finish where they are. A host that cannot be reached or
-prepared is dropped with the reason recorded once, and the batch continues
-elsewhere. A host whose connection drops mid-batch fails the inputs that
-were running there, attributed to those inputs, and takes no more.
+The default is `all`: a host in the hosts file is there to be used, the
+way a core is. Switch it from the monitor (below) or with `python -m
+valuekit.monitor --mode remote <cache-dir>`. The driver re-reads the mode
+each time it starts a task, so a switch during a batch applies to the next
+task; tasks already running finish where they are. Preparing a host never
+holds the batch back: this machine starts at once and a host joins when it
+is ready (under `remote`, this machine waits for it instead). A host that
+cannot be reached or prepared is dropped with the reason recorded once,
+and the batch continues elsewhere. A host whose connection drops mid-batch
+loses nothing: the inputs that were running there run again elsewhere,
+once, and the host takes no more.
 
 `run_all` takes no argument about any of this. Where a computation ran must
 not be able to affect its result, so it cannot be named in code where a

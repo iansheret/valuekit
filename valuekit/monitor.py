@@ -109,6 +109,13 @@ class _State:
             self._host_counts(source, e.get("host", "local"))["running"] += 1
             return
 
+        if ev == "requeue":
+            # The host went away under this input; it will start again
+            # elsewhere and be counted there.
+            counts = self._host_counts(source, e.get("host", "local"))
+            counts["running"] = max(0, counts["running"] - 1)
+            return
+
         if ev == "outcome":
             counts = self._host_counts(source, e.get("host", "local"))
             counts["running"] = max(0, counts["running"] - 1)

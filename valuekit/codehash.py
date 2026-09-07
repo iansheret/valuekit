@@ -9,7 +9,7 @@ its names resolve to.  The walk stops at boundaries:
   package invalidates; edits inside site-packages are invisible);
 * native extensions whose version cannot describe them -- anything installed
   from a local directory, editable or not, and so rebuilt in place --
-  contribute a content hash of the built binary;
+  contribute the identity of the project tree they were built from;
 * the standard library contributes ``std:<module>`` (the Python version is
   already part of the global salt);
 * user modules referenced *as modules* (``mymod.helper()``) contribute a hash
@@ -124,91 +124,93 @@ def _dist_version(top: str) -> str | None:
 # native extensions
 # ---------------------------------------------------------------------------
 #
-# A compiled extension has no source to walk and no code object to hash, so
-# the binary is its identity.  Hashing it is only necessary where the version
-# marker cannot stand in: a distribution installed from a released artefact
-# changes only through a reinstall, which moves its version, while one
-# installed from a local directory -- editable or not -- is rebuilt in place
-# under the same version, and so would go unnoticed.
+# A compiled extension has no source to walk and no code object to hash.
+# Where its version can stand for it -- a distribution installed from a
+# released artefact changes only through a reinstall, which moves the
+# version -- the version is its marker.  One built from a local directory,
+# editable or not, is rebuilt in place under the same version, so something
+# else has to identify it: the *project it was built from*, as the identity
+# of that tree (see :func:`valuekit.sync.tree_id`).
 #
-# The binary is also a stricter dependency than the sources it was built
-# from: it carries the compiler, its flags, and any library linked
-# statically into the result, none of which the sources mention.  And it is
-# the code that actually runs, so editing a source file without rebuilding
-# correctly changes nothing.
+# The sources rather than the binary, deliberately.  A batch may run on
+# several machines, and each builds its own binary from the same tree; the
+# tree is what they share, so a key computed anywhere equals a key computed
+# anywhere else, with nothing sent between them to make it so.  The cost is
+# coarseness -- any edit in the project re-keys every function that reaches
+# one of its extensions -- and a reliance on the build being current: the key
+# describes the sources, so a stale binary that no longer matches them runs
+# under a key it does not deserve.  A build backend that rebuilds on import
+# is what keeps that honest, and is what a project needs anyway to be
+# checked out and run.
+#
+# On a worker the tree's identity is known before anything is imported (it
+# is the name of the directory the tree was unpacked into), so it is set
+# once and no manifest is walked there.
 
-_ext_digests: dict[tuple, str] = {}
+_source_id: str | None = None  # set on a worker; None on the driver
+_walk = threading.local()  # .tree_ids: identities computed by the walk in progress
 
 
 def _is_extension_file(filename: str) -> bool:
     return filename.endswith(tuple(EXTENSION_SUFFIXES))
 
 
-def _is_dist_local(dist: Any) -> bool:
-    """Report whether *dist* was installed from a directory on this machine,
-    so that its version says nothing about its current contents."""
+def _dist_dir(dist: Any) -> str | None:
+    """The directory *dist* was installed from, or None if it was not.
+
+    Such an install -- editable or not -- is rebuilt in place under the same
+    version, so its version says nothing about its current contents.
+    """
     try:
         text = dist.read_text("direct_url.json")
+        info = json.loads(text) if text else {}
     except Exception:
-        return False
+        return None
+    if "dir_info" not in info:
+        return None
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+
     try:
-        return bool(text) and "dir_info" in json.loads(text)
-    except ValueError:
-        return False
+        return os.path.realpath(url2pathname(urlparse(info["url"]).path))
+    except Exception:
+        return None
 
 
 def _is_live_extension(filename: str, top: str) -> bool:
     """Report whether a file is an extension whose version cannot stand for
-    its contents, and so has to be hashed."""
+    its contents."""
     if not _is_extension_file(filename):
         return False
     dist = _distribution(top)
-    return dist is None or _is_dist_local(dist)
+    return dist is None or _dist_dir(dist) is not None
 
 
-def _extension_digest(filename: str) -> str | None:
-    """Content digest of a compiled extension, or None if it cannot be read.
+def _source_identity(filename: str, top: str) -> str:
+    """What stands for the live extension at *filename*.
 
-    Memoised on the file's identity, so a fingerprint pays for a given build
-    once per process.
+    The identity of the project it was built from, found through its
+    distribution's install directory, or failing that the nearest project
+    marker above the binary.  An extension with no project around it at all
+    is identified by its binary, which is all there is.
     """
-    try:
-        stat = os.stat(filename)
-    except OSError:
-        return None
-    key = (filename, stat.st_mtime_ns, stat.st_size)
-    if key not in _ext_digests:
-        h = _new_hasher()
-        try:
-            with open(filename, "rb") as f:
-                for block in iter(lambda: f.read(1 << 20), b""):
-                    h.update(block)
-        except OSError:
-            return None
-        _ext_digests[key] = h.hexdigest()
-    return _ext_digests[key]
+    if _source_id is not None:
+        return _source_id
+    from . import sync
 
-
-# A worker fingerprints as the driver would.  Two machines never hold the
-# same compiled binary, so the driver sends the digests its own walk saw and
-# the worker uses them in place of its own; every key computed there then
-# equals the driver's, and the handshake and the traces need no second form.
-# Empty on the driver, where each walk records what it hashed.
-_ext_overrides: dict[str, str] = {}
-_walk = threading.local()  # .extensions: what the walk in progress has seen
-
-
-def _ext_identity(module_name: str | None, filename: str) -> str | None:
-    """The digest that stands for a live extension, and a note of it."""
-    digest = _ext_overrides.get(module_name or "")
-    if digest is None:
-        digest = _extension_digest(filename)
-        if digest is None:
-            return None
-    seen = getattr(_walk, "extensions", None)
-    if seen is not None and module_name:
-        seen[module_name] = digest
-    return digest
+    dist = _distribution(top)
+    root = _dist_dir(dist) if dist is not None else None
+    if root is None:
+        root = sync.find_root(filename)
+    if root is None:
+        return sync._file_digest(filename) or "?"
+    ids = getattr(_walk, "tree_ids", None)
+    if ids is not None and root in ids:
+        return ids[root]
+    tid = sync.tree_id(root)
+    if ids is not None:
+        ids[root] = tid
+    return tid
 
 
 def _extension_marker(module_name: str | None) -> str | None:
@@ -222,6 +224,26 @@ def _extension_marker(module_name: str | None) -> str | None:
     if not filename or not _is_extension_file(filename):
         return None
     return _classify(module_name, filename)[1]
+
+
+def _is_installed(filename: str, top: str) -> bool:
+    """Whether a module file belongs to an installed package rather than to
+    the user's project.
+
+    By where it lives (the interpreter's own directories, as sysconfig and
+    site report them) or by what claims it (a released distribution, wherever
+    it was put).  Not by a ``site-packages`` substring: that misses ``pip
+    --target`` and vendored installs, and matches any project that happens to
+    live under a directory of that name.  A distribution installed from a
+    local directory claims nothing here: its files are the user's, edited in
+    place under a version that never moves.
+    """
+    from .sync import is_environment
+
+    if is_environment(filename):
+        return True
+    dist = _distribution(top)
+    return dist is not None and _dist_dir(dist) is None
 
 
 def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
@@ -243,12 +265,10 @@ def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
         mod = sys.modules.get(module_name or "")
         filename = getattr(mod, "__file__", None)
     if filename and _is_live_extension(filename, top):
-        # An extension rebuilt in place under a fixed version: only its
-        # contents identify it.
-        ext_digest = _ext_identity(module_name, filename)
-        if ext_digest is not None:
-            return _PKG, f"ext:{module_name}={ext_digest}"
-    if filename and ("site-packages" in filename or "dist-packages" in filename):
+        # An extension rebuilt in place under a fixed version: the project
+        # it was built from identifies it.
+        return _PKG, f"ext:{module_name}={_source_identity(filename, top)}"
+    if filename and _is_installed(filename, top):
         ver = _dist_version(top)
         return _PKG, f"pkg:{top}=={ver or '?'}"
     if filename is None:
@@ -314,7 +334,7 @@ class _Walker:
             return False
 
     def _add_value(self, label: str, v: Any) -> None:
-        """Content-hash a plain value, falling back to the binary of the
+        """Content-hash a plain value, falling back to the marker of the
         extension that defines it: a nanobind function or a Cython class has
         no other identity."""
         if self._try_digest(label, v):
@@ -476,7 +496,7 @@ class _Walker:
             if not isinstance(sub, types.ModuleType):
                 continue
             # Classify each submodule in its own right: a package may contain
-            # a compiled extension, which is identified by its binary rather
+            # a compiled extension, which is identified by its marker rather
             # than read as source.
             kind, marker = _classify(sub.__name__, getattr(sub, "__file__", None))
             if kind == _USER:
@@ -514,29 +534,19 @@ def function_fingerprint(
     @pure, which captures it at decoration time, before any debugger patches
     bytecode).
     """
-    h, spans, units, _ = fingerprint_details(fn, code=code)
-    return h, spans, units
-
-
-def fingerprint_details(
-    fn: Callable,
-    *,
-    code: types.CodeType | None = None,
-) -> tuple[str, list[tuple[str, int, int]], list[str], dict[str, str]]:
-    """:func:`function_fingerprint` plus the native extensions the walk
-    hashed, as module name to digest: what a driver sends a worker so that
-    the worker's fingerprints come out equal to its own."""
-    outer = getattr(_walk, "extensions", None)
-    _walk.extensions = {}
+    # A tree's identity is computed at most once per walk, however many of
+    # its extensions the walk reaches; a walk nested in another (a function
+    # hashed as a value) shares the outer one's.
+    outer = getattr(_walk, "tree_ids", None)
+    if outer is None:
+        _walk.tree_ids = {}
     try:
         w = _Walker()
         w.add_function(fn, code=code)  # type: ignore[arg-type]
-        seen = _walk.extensions
     finally:
-        _walk.extensions = outer
-        if outer is not None:
-            outer.update(seen)  # a function hashed as a value inside a walk
-    return w.h.hexdigest(), w.spans, sorted(w.units), seen
+        if outer is None:
+            _walk.tree_ids = None
+    return w.h.hexdigest(), w.spans, sorted(w.units)
 
 
 # ---------------------------------------------------------------------------

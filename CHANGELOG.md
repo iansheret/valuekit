@@ -85,27 +85,44 @@ records more than it did.
 ### Running on other machines
 
 - A batch can run on hosts declared in a TOML file named by `VALUEKIT_HOSTS`,
-  over ssh. One connection per host carries every task: a host process
+  over ssh, as if this machine had more cores. A host needs what a person
+  would need to check the project out and run it: a Python 3 to start with,
+  the project's lock tool, a compiler for an extension, and the network.
+  Nothing of the project's, valuekit included, is installed there first.
+- The project must be locked: its tree carries a lock file from a tool
+  valuekit can invoke (`uv.lock` today; the table has one row per tool). A
+  small stdlib-only bootstrap, sent over the connection, receives the tree,
+  runs the tool's sync in it (`uv sync --frozen`, for the driver's Python
+  minor) and starts the host process from the environment that produced. A
+  tree with no known lock is refused before anything is sent.
+- One connection per host carries every task: a host process
   (`python -m valuekit.host`) starts a worker per task and multiplexes their
   streams, so a thousand inputs cost one ssh handshake. The host process
   exits, killing its workers, when the connection closes.
-- Where work goes is a mode, one word in `<cache>/placement`: `local`,
-  `remote` (as little here as possible) or `all`. The driver re-reads it each
-  time it starts a task, so a switch mid-batch moves the next task. The
-  monitor shows the requested mode beside the mode the driver has applied,
-  and sets it on a keystroke; `--mode` sets it from a script. That file is
-  the only thing the monitor writes.
+- A native extension's identity in the fingerprint is the tree it was built
+  from, not its binary: each host builds its own from the same sources, so
+  keys match across machines with nothing sent between them to make it so.
+  Any edit in the project re-keys functions that reach an extension.
+- Where work goes is a mode, one word in `<cache>/placement`: `all` (the
+  default: every configured host, plus this machine), `local`, or `remote`
+  (as little here as possible). The driver re-reads it each time it starts a
+  task, so a switch mid-batch moves the next task. The monitor shows the
+  requested mode beside the mode the driver has applied, and sets it on a
+  keystroke; `--mode` sets it from a script. That file is the only thing
+  the monitor writes.
+- Preparing a host never holds the batch back: this machine starts at once
+  and a host joins when ready. Under `remote` this machine stays idle while
+  a host is on its way.
 - A host that fails readiness is dropped with the reason recorded once and the
-  batch continues; a host whose connection drops fails the inputs running
-  there and takes no more. `remote` mode with no reachable host runs locally
-  and records why.
+  batch continues. A host whose connection drops loses nothing: the inputs
+  running there are run again elsewhere, once, and the host takes no more.
+  `remote` mode with no reachable host runs locally and records why.
 - The monitor gains a `hosts` block: capacity, running, finished and failed
   per place, and whether each host was reached.
-- A worker fingerprints as the driver does: the driver sends the digests of
-  the native extensions its own fingerprint hashed, and the worker uses them
-  in place of its own, so keys match across machines and architectures.
 - Scheduling waits on one inbox fed by threads, for local processes and host
   connections alike; there is no `select`, and no platform-specific waiting.
+  The connection itself is one small object (a process's pipes today), so a
+  different transport later touches nothing above it.
 
 ### Remote execution groundwork
 
@@ -121,9 +138,9 @@ records more than it did.
   is not the code the driver meant. It runs on this machine, which is the
   point: everything is exercised in CI with no network involved.
 - Code sync. The driver describes its project as a manifest -- tracked files
-  plus untracked ones that are not ignored -- and the worker unpacks an
-  immutable source tree named by the manifest hash and imports from that.
-  Build artefacts are never shipped, whatever platform names them.
+  plus untracked ones that are not ignored -- and the host unpacks an
+  immutable source tree named by the manifest hash, which workers import
+  from.  Build artefacts are never shipped, whatever platform names them.
 - A readiness phase, once per host rather than once per input, and an audit
   after importing that every user module actually came from the source tree.
 - A worker holds no cache. Its store is the driver's store, reached over the
