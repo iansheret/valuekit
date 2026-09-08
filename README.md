@@ -526,7 +526,8 @@ source_root = "~/.cache/valuekit/source"      # optional; this is the default
 
 Login must work without a prompt (`ssh mac.local true`), which means a key
 and, on macOS, Remote Login switched on; on Windows the OpenSSH Server
-feature. The lock tool must be on the PATH a *non-interactive* ssh session
+feature. A key with a passphrase needs an agent holding it wherever the
+driver runs, so a driver that is itself reached over ssh wants `ssh -A`. The lock tool must be on the PATH a *non-interactive* ssh session
 sees, which is shorter than your login shell's; valuekit also looks in
 `~/.local/bin` and `~/.cargo/bin`. A Windows host is reached through sshd's
 default shell: leave that as `cmd.exe`, because PowerShell in that role
@@ -544,9 +545,16 @@ tree it was built from, which is the same everywhere. That does mean any
 edit in the project re-keys functions that reach an extension, and that
 the key describes the sources rather than the binary, so a build backend
 that rebuilds on import (scikit-build-core with `editable.rebuild`, or
-meson-python) is what keeps your own machine honest. Each version of the
-tree is kept immutable and synced once; an unchanged project costs one
-comparison.
+meson-python) is what keeps your own machine honest. Such a backend runs
+`cmake` by name at import time, so put the build tools in the project
+(`cmake` and `ninja` are on PyPI) and build without isolation (for uv,
+`no-build-isolation-package` under `[tool.uv]`, with `scikit-build-core`
+among the dependencies): an isolated build's tools vanish with it, and the
+build directory would still name them. Workers run in the environment
+activated, so whatever the lock installed beside the interpreter is on
+their PATH. Each version of the tree is kept immutable and synced once,
+and a host builds each version from scratch; an unchanged project costs
+one comparison.
 
 Where work goes is a *mode*, one word in `<cache>/placement`:
 

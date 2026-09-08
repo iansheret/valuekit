@@ -93,8 +93,10 @@ records more than it did.
   valuekit can invoke (`uv.lock` today; the table has one row per tool). A
   small stdlib-only bootstrap, sent over the connection, receives the tree,
   runs the tool's sync in it (`uv sync --frozen`, for the driver's Python
-  minor) and starts the host process from the environment that produced. A
-  tree with no known lock is refused before anything is sent.
+  minor) and starts the host process from the environment that produced,
+  activated: the tools the lock installed beside the interpreter (cmake and
+  ninja for an extension that rebuilds on import, say) are on the workers'
+  PATH. A tree with no known lock is refused before anything is sent.
 - One connection per host carries every task: a host process
   (`python -m valuekit.host`) starts a worker per task and multiplexes their
   streams, so a thousand inputs cost one ssh handshake. The host process

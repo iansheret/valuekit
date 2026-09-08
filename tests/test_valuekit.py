@@ -2667,9 +2667,9 @@ def _lay_project(root):
 
 def _write_batch_module(tmp_path):
     """A scenario module written to disk so that spawn workers can import
-    the functions by reference. Execution counts go to an append-only log
-    (atomic across processes, and outside the project so a batch does not
-    change the tree it runs from)."""
+    the functions by reference. Each execution leaves a file in a log
+    directory (atomic across processes, and outside the project so a batch
+    does not change the tree it runs from)."""
     log = tmp_path / "runs.log"
     proj = tmp_path / "proj"
     _lay_project(proj)
@@ -2691,6 +2691,12 @@ def _write_batch_module(tmp_path):
         "    import os\n"
         "    return os.environ.get(name, 'absent')\n"
         "@pure\n"
+        "def activation(x):\n"
+        "    import os, sys\n"
+        "    return {'path0': os.environ['PATH'].split(os.pathsep)[0],\n"
+        "            'bindir': os.path.dirname(sys.executable),\n"
+        "            'venv': os.environ.get('VIRTUAL_ENV'), 'prefix': sys.prefix}\n"
+        "@pure\n"
         "def slow(x):\n"
         "    import time\n"
         "    time.sleep(1.5)\n"
@@ -2703,8 +2709,9 @@ def _write_batch_module(tmp_path):
         "    vklog('arr', np.arange(3.0) * sid)\n"
         "    return sid\n"
         "def _note(tag):\n"
-        "    with open(LOG, 'a') as f:\n"
-        "        f.write(tag + '\\n')\n"
+        "    import os, tempfile\n"
+        "    os.makedirs(LOG, exist_ok=True)\n"
+        "    os.close(tempfile.mkstemp(prefix=tag + '.', dir=LOG)[0])\n"
         "@pure\n"
         "def load(sid):\n"
         "    _note(f'L{sid}')\n"
@@ -2744,11 +2751,12 @@ def _write_batch_module(tmp_path):
     spec.loader.exec_module(m)
 
     def counts():
+        # One file per execution: concurrent appends to one file can lose a
+        # line on Windows, where append mode seeks and writes in two steps.
         try:
-            lines = log.read_text().splitlines()
+            return [p.name.split(".")[0] for p in log.iterdir()]
         except OSError:
-            lines = []
-        return lines
+            return []
 
     return m, counts
 
@@ -3811,6 +3819,15 @@ class TestPipeBackend:
         m, _ = _write_batch_module(tmp_path)
         monkeypatch.setenv("VK_UNRELATED_SECRET", "hunter2")
         assert vk.run_all(m.env_var, ["VK_UNRELATED_SECRET"]).values == ["absent"]
+
+    def test_the_environment_is_activated_for_workers(self, cache, tmp_path):
+        # A tool the lock installed beside the interpreter (cmake, for an
+        # extension that rebuilds on import) must be findable by name; no
+        # shell activated anything on the host, so the bootstrap does.
+        m, _ = _write_batch_module(tmp_path)
+        seen = vk.run_all(m.activation, [1]).values[0]
+        assert os.path.normcase(seen["path0"]) == os.path.normcase(seen["bindir"])
+        assert os.path.normcase(seen["venv"]) == os.path.normcase(seen["prefix"])
 
     def test_a_timeout_kills_one_input_and_spares_the_rest(self, cache, tmp_path):
         # A worker speaks before it finishes -- a greeting, then the result's

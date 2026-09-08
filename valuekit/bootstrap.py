@@ -416,6 +416,13 @@ def main() -> int:
     _send({"ok": True, "python": python})
     env = dict(os.environ)
     env["VALUEKIT_TREE"] = tree
+    # The environment is activated, as a shell would: the tools the lock
+    # installed beside the interpreter (cmake and ninja for an extension that
+    # rebuilds on import, say) are on the PATH the workers see.  Nothing
+    # above the bootstrap knows where the environment keeps them.
+    bindir = os.path.dirname(python)
+    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    env["VIRTUAL_ENV"] = os.path.dirname(bindir)
     return subprocess.call([python, "-m", "valuekit.host"], env=env)
 
 

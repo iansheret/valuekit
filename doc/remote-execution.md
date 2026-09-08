@@ -46,7 +46,8 @@ sequence for a host:
    already holds the tree, receives the tarball if not, extracts it under `source_root`,
    runs the lock tool's sync in it (`uv sync --frozen --python <driver's minor>`), writes a
    marker beside the tree naming the interpreter, and starts `python -m valuekit.host` from
-   that interpreter with `VALUEKIT_TREE` set, on the same streams.
+   that interpreter with `VALUEKIT_TREE` set, on the same streams, in the environment
+   activated (its interpreter's directory first on `PATH`, `VIRTUAL_ENV` set).
 4. The host process greets with its salt, CPU count and pid. On a readiness channel the
    driver sends its greeting (salt, function, fingerprint, tree id, import roots); the host
    starts `valuekit.worker --ready`, which puts the tree's roots on `sys.path`, imports the
@@ -178,6 +179,23 @@ must survive that.
 **The worker environment is an allowlist.** What a process needs to start, plus
 `VALUEKIT_*` (which carries `VALUEKIT_TREE`). No `PYTHONPATH`, no credentials.
 
+**The bootstrap activates the environment it built.** A shell that runs a project activates
+its environment; on a host there is no shell, so the bootstrap puts the interpreter's
+directory first on the `PATH` the host process (and so every worker) sees, and sets
+`VIRTUAL_ENV`. Found with scikit-build-core's `editable.rebuild`, which runs `cmake` by
+name at import time: with `cmake` and `ninja` from PyPI in the lock, they are in the
+environment's `bin`, and nothing else would put that on the PATH. The bootstrap is the
+one place that knows where the environment keeps its tools.
+
+**A project that rebuilds on import must build without isolation.** Not valuekit's
+decision but a fact for the README: uv builds a wheel in a temporary environment, and
+scikit-build-core's persistent build directory records the absolute path of the ninja it
+used, which is gone by the first import (`CMakeCache.txt`'s `CMAKE_MAKE_PROGRAM`). With
+`no-build-isolation-package = ["<project>"]` under `[tool.uv]` and `scikit-build-core`,
+`cmake`, `ninja` among the dependencies, `uv sync` installs those first, the build uses the
+environment's own tools, and the recorded paths survive. This is what scikit-build-core's
+own documentation prescribes for `editable.rebuild`.
+
 **The suite runs the real bootstrap.** The bootstrap is the riskiest code here (raw
 file-descriptor I/O, Windows, shell quoting); a test-only bypass would leave exactly it
 untested. A session fixture builds a valuekit wheel from the checkout, writes a template
@@ -211,28 +229,75 @@ defects found and fixed on the way, both in `bootstrap.py`:
   joining empty reads forever, at full CPU and growing without bound (seen on both
   machines). It now exits.
 
-PC-as-driver is not yet verified. It cannot be exercised through a non-pty ssh session
-into the PC: the Windows ssh client forwards nothing on a piped stdin, not even EOF,
-unless the process has a console (verified: a pty session works, `CREATE_NO_WINDOW` does
-not). Run the driver from a terminal on the PC. Trial material there:
-`C:\Users\iansh\trial` holds a locked project (`proj/`, valuekit as a wheel), `drive.py`,
-`hosts-mac.toml` naming `ians@pidge.local`, and a plain venv for driving (`venv/`; the
-checkout's own `.venv` is a uv trampoline behind the same junction, unusable over ssh).
-The Mac's ssh Python is the Xcode 3.9, so this direction also exercises the
-bare-minor branch, where uv finds or fetches a 3.14 on the Mac.
+**PC-as-driver, Mac-as-host is verified (2026-09-08).** From a PowerShell on the PC
+(`C:\Users\iansh\trial`, `venv\Scripts\python.exe drive.py`, `VALUEKIT_HOSTS` naming
+`ians@pidge.local`): the tree was shipped and synced under
+`/Users/ians/.cache/valuekit/source`, uv on the Mac took the bare-minor branch (its ssh
+Python is the Xcode 3.9) and used its managed 3.14.6, six inputs ran there in 3.6s
+including the build; a second run skipped the transfer (host ready in 2s, batch 2.0s);
+mode `all` shared 60 inputs 32 on the Mac and 28 here with no failures or requeues, local
+work starting a second before the host joined. Two things to know when repeating it:
 
-1. **Validate between the PC and the Mac, both directions.** Steps in the README's
-   "Running on other machines". Not exercisable in CI. On each side: uv installed, ssh
-   login without a prompt; a project with a `uv.lock`. Confirm outcomes recorded under the
-   host, the tree and `.venv` under `~/.cache/valuekit/source`, a second run skipping the
-   transfer, and a Windows host (`python = "python"`) reached from the Mac. On the
-   Windows host sshd's default shell must be `cmd.exe`: checked here by running the
-   stage-0 command line verbatim through `cmd /c` (works) and `powershell -c` (strips
-   the quotes, a documented Windows OpenSSH limitation); `sh` works too.
-2. **A real native extension across machines.** A minimal scikit-build-core project with
-   `editable.rebuild` on both machines: the host builds it, the keys match. Also whether a
-   persistent build directory outside the tree gives incremental rebuilds, which is what
-   keeps a host joining within seconds of an edit.
+- The driver must run under Windows' own ssh client (`C:\Windows\System32\OpenSSH`,
+  which PowerShell's PATH gives) with a console. The key is passphrase-protected and held
+  by the Windows ssh-agent service; Git Bash's MSYS ssh offers the key file, cannot ask
+  for the passphrase under `BatchMode`, and is refused. A piped stdin is forwarded only
+  when the process has a console (verified: a pty session works, `CREATE_NO_WINDOW` does
+  not), which is why yesterday's `run1.cmd` through a non-pty session stalled at
+  "started" and left the "never ran the bootstrap" host event in the trial's run log.
+- The bootstrap finds uv in `~/.local/bin` on the Mac; the non-interactive PATH there is
+  `~/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
+- The trial's `venv` drives with the checkout as an editable install, so the driver side
+  is the working tree; the host side is the wheel named in the lock (`proj/wheels/`),
+  rebuilt from the checkout with `uv build --wheel` and relocked with `uv lock --refresh`
+  (a plain `uv lock` keeps the old hash when the filename is unchanged).
+
+**A native extension, on the Mac, through a same-machine host process (2026-09-08).**
+`C:\Users\iansh\trial\ext` is a minimal scikit-build-core project (`fastproj._core`, one
+C function, `editable.rebuild`, `build-dir = "build/{wheel_tag}"`, `cmake` and `ninja`
+from PyPI, non-isolated build; `drive.py` uses `parallel._host_commands` when
+`VALUEKIT_HOSTS` is unset, `hosts-mac.toml` and `hosts-pc.toml` otherwise). Copied to
+`/Users/ians/exttrial` and driven there in mode `remote`: the host built its own binary in
+its tree under `cache/source/<tree id>/build/`, readiness passed (the worker compares
+fingerprints and refuses a difference, so the keys matched), three inputs ran through the
+host in 3.1s from a cold tree. Editing `_core.c` (`s + 1`) produced a new tree id, a fresh
+host build, and the changed sums, again in 3.0s; nothing was sent but sources. On the way
+the two findings above (activation; non-isolated build) were made and fixed or
+documented. Incremental rebuilds across trees are not available: each tree is a new
+directory and CMake refuses a build directory whose recorded source directory differs,
+so a host builds each version from scratch. For this project that is seconds; for a large
+one it is the cost of an edit, once per host.
+
+**The extension across the two machines, both directions (2026-09-08).** The PC had no
+C compiler at all; Visual Studio Build Tools 2022 with the C++ workload (MSVC 14.44) was
+installed for this through winget. Then:
+
+- *PC driver, Mac host.* `uv sync --frozen` on the PC built the extension with MSVC
+  (scikit-build-core finds the compiler itself; no developer prompt) and, with
+  `hosts-mac.toml`, three inputs ran on the Mac in 4.0s from a cold tree: a `.pyd` here,
+  a `.so` there, readiness passed, so one key for both binaries.
+- *Mac driver, PC host.* The Mac's copy carries the `s + 1` edit, so its tree id is the
+  one the Mac's own same-machine trial had produced; the PC built that tree under sshd
+  (elevated token, no console) with MSVC, using the Visual Studio generator (the binary
+  sits under `build/<tag>/Release/`), and readiness passed: 22.7s cold including the
+  build, 7.1s warm with the transfer skipped. Outcomes were recorded under `hunk`, and
+  the sums carry the edit.
+
+How the Mac was driven from the PC: the same key is on both machines, passphrase-
+protected, and a non-interactive session on the Mac has no agent, so `ssh -A` from the PC
+forwarded the Windows agent into the session (`ssh -A -T ians@pidge.local "cd ~/exttrial
+&& PATH=$PWD/.venv/bin:$HOME/.local/bin:$PATH VALUEKIT_HOSTS=$PWD/hosts-pc.toml
+.venv/bin/python drive.py 7 8 9"`). The Mac's `~/.ssh/agent/` socket from June is stale
+and hangs `ssh-add`; do not use it. The driver's own venv must be activated (or its
+`Scripts`/`bin` put on PATH) for the import-time rebuild on the driver, which is the
+user's shell's job, as the README says.
+
+1. ~~**Validate between the PC and the Mac, both directions.**~~ Done both ways (above).
+   For the record, on the Windows host sshd's default shell must be `cmd.exe`: checked by
+   running the stage-0 command line verbatim through `cmd /c` (works) and `powershell -c`
+   (strips the quotes, a documented Windows OpenSSH limitation); `sh` works too.
+2. ~~**A real native extension across machines.**~~ Done both ways (above). The
+   incremental rebuild question is answered: not across trees, with CMake.
 3. **Release.** `_version.py` to `0.5.0`, CHANGELOG dated, CI green on Linux, macOS and
    Windows, `python -m build`, `twine check --strict`, tag `v0.5.0`, publish.
 
