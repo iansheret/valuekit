@@ -4021,6 +4021,15 @@ class TestBootstrap:
         (tmp_path / "made.py").write_text("raise SystemExit('should not run')\n")
         assert bootstrap._prepare(str(root), tid, "3.99", None) == (python, "")
 
+    def test_the_sync_names_this_interpreter_when_its_minor_matches(self, tmp_path, fake_tool):
+        # A host that already has the driver's minor uses it: no download,
+        # and none of the lock tool's search through managed installations.
+        mine = "%d.%d" % sys.version_info[:2]
+        tid, data = self._tar(tmp_path, **{"fake.lock": ""})
+        python, reason = bootstrap._prepare(str(tmp_path / "source"), tid, mine, data)
+        assert reason == "" and _Path(python).read_text() == sys.executable
+        assert bootstrap._python_request("3.99") == "3.99"
+
     def test_a_failed_sync_leaves_no_tree_behind(self, tmp_path, fake_tool):
         (tmp_path / "made.py").write_text("raise SystemExit('no compiler here')\n")
         tid, data = self._tar(tmp_path, **{"fake.lock": ""})
@@ -4079,6 +4088,17 @@ class TestBootstrap:
             capture_output=True,
         )
         assert out.returncode != 0 and b"Traceback" in out.stderr
+
+
+    def test_stage_zero_exits_when_its_stream_ends_early(self):
+        # A driver that dies before sending the script closes stage 0's
+        # stdin. Reading one byte at a time, an EOF is an empty read; it must
+        # end the process, not be joined forever (this once left an orphan
+        # spinning at full CPU and growing without bound on both platforms).
+        p = subprocess.run(
+            bootstrap.local_command(sys.executable), input=b"", capture_output=True, timeout=30
+        )
+        assert p.returncode == 1
 
 
 class TestSourceTree:

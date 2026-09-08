@@ -67,8 +67,10 @@ __all__ = [
 
 # The table.  A row is what one lock tool needs said about it: its
 # executable, how to sync a tree into an environment for a given Python
-# minor version, where the interpreter then lives relative to the tree, and
-# where the executable hides when a non-interactive shell's PATH is short.
+# (``{python}``: this interpreter's path when it has the minor version the
+# driver runs, else that minor for the tool to find or fetch), where the
+# interpreter then lives relative to the tree, and where the executable
+# hides when a non-interactive shell's PATH is short.
 _TOOLS = {
     "uv.lock": {
         "tool": "uv",
@@ -80,10 +82,12 @@ _TOOLS = {
 
 KNOWN_LOCKS = tuple(_TOOLS)
 
-# Reads this module's source off stdin up to a NUL and runs it.  Safe to pass
-# through sh, cmd.exe and PowerShell inside double quotes: no dollar,
-# backslash, percent, caret, ampersand, pipe or angle bracket.
-STAGE0 = "import os;exec(b''.join(iter(lambda:os.read(0,1),bytes(1))))"
+# Reads this module's source off stdin up to a NUL and runs it; exits if the
+# stream ends first (a driver that died before sending it), rather than
+# reading empty strings forever.  Safe to pass through sh, cmd.exe and
+# PowerShell inside double quotes: no dollar, backslash, percent, caret,
+# ampersand, pipe or angle bracket.
+STAGE0 = "import os;exec(b''.join(iter(lambda:os.read(0,1) or os._exit(1),bytes(1))))"
 
 _MAX_TREES = 10  # complete trees kept per source root
 _STALE = 3600  # seconds after which an unfinished tree is debris
@@ -271,6 +275,18 @@ def _find(tool: str, search) -> str | None:
     return None
 
 
+def _python_request(py_minor: str) -> str:
+    """What to ask the lock tool for: this interpreter, when it already has
+    the driver's minor version, else the version.  Naming an interpreter
+    spares a download when the host has one, and spares the tool's search
+    through its own managed installations, which an ssh session on Windows
+    cannot always traverse (their junctions are refused to an elevated
+    process, and sshd gives an administrator an elevated token)."""
+    if "%d.%d" % sys.version_info[:2] == py_minor:
+        return sys.executable
+    return py_minor
+
+
 def _sync(tree: str, py_minor: str) -> tuple[str, str]:
     """Run the tree's lock tool in it; the interpreter it made, or why not."""
     lock = lock_tool(os.listdir(tree))
@@ -288,7 +304,7 @@ def _sync(tree: str, py_minor: str) -> tuple[str, str]:
             f"session has a short one) and was not found in {looked}. Install "
             "it there, or put it on the PATH that non-interactive shells see."
         )
-    cmd = [exe] + [a.format(python=py_minor) for a in row["sync"]]
+    cmd = [exe] + [a.format(python=_python_request(py_minor)) for a in row["sync"]]
     try:
         p = subprocess.run(
             cmd, cwd=tree, stdout=subprocess.PIPE, stderr=subprocess.STDOUT

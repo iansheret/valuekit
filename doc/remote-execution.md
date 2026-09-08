@@ -194,6 +194,33 @@ can run, this machine included. "Mode": which places are used. "Link": the conne
 
 ### Before release
 
+**Validation progress (2026-09-08).** The Mac (`pidge.local`, user `ians`, 18 cores) and
+the PC (`hunk.local`, user `iansh`, 28 cores, Windows, sshd default shell `cmd.exe`) log
+into each other by key. Mac-as-driver, PC-as-host is verified: tree shipped and synced
+under `C:\Users\iansh\.cache\valuekit\source`, outcomes recorded under the host, a
+second run skipped the transfer (host ready in 1s instead of 4s), mode `all` shared a
+60-input batch between both machines, and `valuekit.batch()` read the record back. Two
+defects found and fixed on the way, both in `bootstrap.py`:
+
+- *uv could not inspect its managed Pythons on the PC* ("untrusted mount point", os
+  error 448): sshd gives an administrator an elevated token, and Windows refuses an
+  elevated process the junctions uv makes for its minor-version links. The bootstrap now
+  hands the lock tool its own interpreter's path when that interpreter has the driver's
+  minor, and the bare minor otherwise; uv then does no discovery.
+- *Stage 0 never ended at EOF*: a driver that died before sending the script left it
+  joining empty reads forever, at full CPU and growing without bound (seen on both
+  machines). It now exits.
+
+PC-as-driver is not yet verified. It cannot be exercised through a non-pty ssh session
+into the PC: the Windows ssh client forwards nothing on a piped stdin, not even EOF,
+unless the process has a console (verified: a pty session works, `CREATE_NO_WINDOW` does
+not). Run the driver from a terminal on the PC. Trial material there:
+`C:\Users\iansh\trial` holds a locked project (`proj/`, valuekit as a wheel), `drive.py`,
+`hosts-mac.toml` naming `ians@pidge.local`, and a plain venv for driving (`venv/`; the
+checkout's own `.venv` is a uv trampoline behind the same junction, unusable over ssh).
+The Mac's ssh Python is the Xcode 3.9, so this direction also exercises the
+bare-minor branch, where uv finds or fetches a 3.14 on the Mac.
+
 1. **Validate between the PC and the Mac, both directions.** Steps in the README's
    "Running on other machines". Not exercisable in CI. On each side: uv installed, ssh
    login without a prompt; a project with a `uv.lock`. Confirm outcomes recorded under the
