@@ -3220,11 +3220,11 @@ class TestBatches:
         m, _ = _write_batch_module(tmp_path)
 
         @pure
-        def main process(n):
+        def batch_driver(n):
             return vk.run_all(m.process, list(range(1, n + 1))).values
 
-        assert main process(2) == [11, 21]
-        _, t = _record_of(cache, main process)
+        assert batch_driver(2) == [11, 21]
+        _, t = _record_of(cache, batch_driver)
         key = m.process._valuekit_reachable().hash
         assert [c[:2] for c in t["calls"]] == [["process", key]] * 2
         assert {c[2] for c in t["calls"]} == {r.record_hash for r in vk.batch("process")}
