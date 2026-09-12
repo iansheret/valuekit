@@ -48,7 +48,7 @@ fallback does not enforce the timeout.
 
 This module owns the scheduling -- admission, deadlines, input-order
 reassembly, and attributing each failure to the input that caused it --
-while :mod:`valuekit.machines` owns starting and killing a task.
+while :mod:`valuekit.hosts` owns starting and killing a task.
 The split is what lets work run somewhere other than this machine without
 the scheduling being written twice.
 
@@ -71,7 +71,7 @@ from collections import deque
 from typing import Any, Callable, Iterable, Iterator
 
 from . import bootstrap, runlog, placement, events, sync
-from .machines import RemoteMachine, LocalMachine, ProcessConnection
+from .hosts import RemoteHost, LocalHost, ProcessConnection
 from .batches import BatchWriter
 from .functionhash import reachable_set
 from .debughook import breakpoints_force
@@ -253,7 +253,7 @@ class _BatchRecorder:
             except Exception:
                 self._writer = None  # the record is a diagnostic, never a failure
 
-    def outcome(self, i: int, o: Outcome, machine: str = "local") -> None:
+    def outcome(self, i: int, o: Outcome, host: str = "local") -> None:
         exc = o.exception()
         record = None
         if exc is None:
@@ -269,7 +269,7 @@ class _BatchRecorder:
             id=self._id,
             i=i,
             ok=exc is None,
-            machine=machine,
+            host=host,
             exc=None if exc is None else type(exc).__name__,
         )
         if self._writer is not None:
@@ -298,8 +298,8 @@ def _launcher(command: list[str]):
     return lambda: ProcessConnection(command)
 
 
-class _Machines:
-    """The machines a batch may run on, and how many tasks each may hold.
+class _Hosts:
+    """The hosts a batch may run on, and how many tasks each may hold.
 
     Remote hosts come from the local file (or the test hook); readiness
     runs on a thread per host and a host counts only once it is ready.  The
@@ -308,8 +308,8 @@ class _Machines:
     """
 
     def __init__(self, fn, cache_dir: str | None, completions: queue.Queue, store, batch: int):
-        self.local = LocalMachine(fn, cache_dir, completions)
-        self.hosts: list[RemoteMachine] = []
+        self.local = LocalHost(fn, cache_dir, completions)
+        self.hosts: list[RemoteHost] = []
         self._states: dict[str, str] = {}  # name -> pending | ready | failed
         self._store = store
         self._batch = batch
@@ -331,7 +331,7 @@ class _Machines:
             for name, spec in _host_commands.items():
                 command, workers = spec if isinstance(spec, tuple) else (spec, None)
                 self.hosts.append(
-                    RemoteMachine(
+                    RemoteHost(
                         project, cache_dir, completions, name,
                         _launcher([*command, "-c", bootstrap.STAGE0]),
                         source_root, workers,
@@ -346,7 +346,7 @@ class _Machines:
                     bootstrap.remote_command(h.python),
                 ]
                 self.hosts.append(
-                    RemoteMachine(
+                    RemoteHost(
                         project, cache_dir, completions, h.name, _launcher(command),
                         h.source_root, h.workers,
                     )
@@ -369,7 +369,7 @@ class _Machines:
             for t in threads:
                 t.join()
 
-    def _prepare_one(self, b: RemoteMachine) -> None:
+    def _prepare_one(self, b: RemoteHost) -> None:
         reason = b.ensure_ready()
         self._states[b.name] = "failed" if reason else "ready"
         if self._closed:
@@ -384,7 +384,7 @@ class _Machines:
         return any(s == "pending" for s in self._states.values())
 
     def capacities(self) -> tuple[str, dict[str, int]]:
-        """The mode in force and each machine's capacity under it.
+        """The mode in force and each host's capacity under it.
 
         Readiness is started here, never waited for: this machine's workers
         start at once and a host joins when it is ready, whether the mode
@@ -512,32 +512,32 @@ def run_all(
         return BatchResult(o for o in outcomes if o is not None)
 
     completions: queue.Queue = queue.Queue()
-    machines = _Machines(fn, cache_dir, completions, store, batch)
+    hosts = _Hosts(fn, cache_dir, completions, store, batch)
 
     running: list[_Task] = []
-    busy: dict[str, int] = {}  # machine name -> tasks running there
+    busy: dict[str, int] = {}  # host name -> tasks running there
     moved: set[int] = set()  # inputs already run again after losing their host
 
-    def _start(machine, idx: int, x: Any) -> None:
-        handle = machine.start(x)
+    def _start(host, idx: int, x: Any) -> None:
+        handle = host.start(x)
         deadline = time.monotonic() + timeout if timeout is not None else None
-        running.append(_Task(x, idx, handle, deadline, machine.name))
-        busy[machine.name] = busy.get(machine.name, 0) + 1
-        events.record(store, "start", id=batch, i=idx, machine=machine.name)
+        running.append(_Task(x, idx, handle, deadline, host.name))
+        busy[host.name] = busy.get(host.name, 0) + 1
+        events.record(store, "start", id=batch, i=idx, host=host.name)
 
     def _accept() -> None:
-        _, caps = machines.capacities()
+        _, caps = hosts.capacities()
         total = max_workers or sum(caps.values())
-        for machine in machines.all():
+        for host in hosts.all():
             while (
                 pending
                 and len(running) < total
-                and busy.get(machine.name, 0) < caps.get(machine.name, 0)
+                and busy.get(host.name, 0) < caps.get(host.name, 0)
             ):
-                _start(machine, *pending.popleft())
+                _start(host, *pending.popleft())
 
     def _drain(block: bool) -> None:
-        """Feed handles whatever the machines have delivered."""
+        """Feed handles whatever the hosts have delivered."""
         try:
             handle, payload = completions.get(timeout=_POLL if block else 0)
         except queue.Empty:
@@ -556,9 +556,9 @@ def run_all(
             if not running:
                 if not pending:
                     break
-                if not machines.pending():
+                if not hosts.pending():
                     raise RuntimeError(
-                        "no machine can run this batch: every capacity is zero"
+                        "no host can run this batch: every capacity is zero"
                     )
                 _drain(block=True)  # a host is on its way; wait for it
                 continue
@@ -586,11 +586,11 @@ def run_all(
                     if t.idx not in moved:
                         moved.add(t.idx)
                         pending.appendleft((t.idx, t.x))
-                        events.record(store, "requeue", id=batch, i=t.idx, machine=t.where)
+                        events.record(store, "requeue", id=batch, i=t.idx, host=t.where)
                         continue
                 o = _harvest(t, msg, qualname, timeout)
                 outcomes[t.idx] = o
-                recorder.outcome(t.idx, o, machine=t.where)
+                recorder.outcome(t.idx, o, host=t.where)
     finally:
         # Covers KeyboardInterrupt: no orphans.
         for t in running:
@@ -598,7 +598,7 @@ def run_all(
                 t.handle.kill()
             except Exception:
                 pass
-        machines.close()
+        hosts.close()
         # In the finally, not after the return: an interrupted batch is
         # exactly the one whose final state is worth having.
         events.record(store, "end", id=batch)

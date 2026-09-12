@@ -87,12 +87,12 @@ call-record layout changed (each call record is its own file, under
   under `records/`. `logs()` reads the *run's log* (was ledger); the
   monitor reads the *event log* (was run log), under `events/`. A *logged
   value* carries *labels* (were item and context). A *run* (was execution)
-  is one driver process. Work runs on a *machine* (was place, backend or
-  host); a *connection* carries *messages* (were link, wire and frame); a
+  is one driver process. Work runs on a *host*, this machine included (was place or
+  backend); a *connection* carries *messages* (were link, wire and frame); a
   function's *reachable set* (was closure) is what the function hash covers; a
   *project hash* (was tree id) identifies a version of the project's files. Modules follow:
   `runlog.py` holds the run's log, `events.py` the event log,
-  `protocol.py` the messages, `machines.py` the machines,
+  `protocol.py` the messages, `hosts.py` the hosts,
   `functionhash.py` the function hash.
 
 - One function hash and one version number. The Python version is a marker

@@ -1,17 +1,17 @@
 """Where a batch's work actually runs.
 
 :func:`valuekit.run_all` owns the scheduling -- admission against each
-machine's capacity, deadlines, input-order reassembly, and attributing every
+host's capacity, deadlines, input-order reassembly, and attributing every
 failure to the input that caused it -- none of which cares whether the work
 happens in a process on this machine or somewhere else.  This module owns
 the other half: starting a task, telling the scheduler when it has
 something to say, and killing it.
 
-A machine hands back a *handle* per task.  Whenever a handle has
+A host hands back a *handle* per task.  Whenever a handle has
 something to feed -- a message, a chunk of bytes, or the news that its
-worker is gone -- the machine puts ``(handle, payload)`` on the completions the
+worker is gone -- the host puts ``(handle, payload)`` on the completions the
 scheduler gave it, and the scheduler calls ``handle.feed(payload)``.  One
-completions for every machine is what lets a batch span machines without the
+completions for every host is what lets a batch span hosts without the
 scheduler waiting on two kinds of thing, and a blocking read on a thread is
 the one primitive every platform gives a pipe, which is why there is no
 ``select`` here.
@@ -22,8 +22,8 @@ worker has always sent: ``("ok", value)``, ``("err", exc, tb)``, or
 sent.  A handle that yields no message at all died, which the scheduler
 already knows how to attribute.
 
-Two machines.  :class:`LocalMachine` spawns a process per input on this
-machine.  :class:`RemoteMachine` holds one connection to a *host process*
+Two hosts.  :class:`LocalHost` spawns a process per input on this
+host.  :class:`RemoteHost` holds one connection to a *host process*
 (:mod:`valuekit.host`), on this machine or over ssh, which starts a worker
 per task and carries each worker's stream as a numbered channel.  A worker
 on a host holds no cache: its store is this process's store, so the messages
@@ -54,14 +54,14 @@ from typing import Any, BinaryIO, Callable, Protocol
 
 from .codec import SerializationError
 
-__all__ = ["Backend", "Handle", "Connection", "ProcessConnection", "LocalMachine", "RemoteMachine"]
+__all__ = ["Backend", "Handle", "Connection", "ProcessConnection", "LocalHost", "RemoteHost"]
 
 
 class Handle(Protocol):
     """One task in flight."""
 
     def feed(self, payload: Any) -> None:
-        """Take what the machine put on the completions for this handle."""
+        """Take what the host put on the completions for this handle."""
 
     def settled(self) -> bool:
         """Whether there is an answer, or the worker has gone."""
@@ -79,7 +79,7 @@ class Handle(Protocol):
         """A phrase describing how it died, for the failure message."""
 
     def lost(self) -> bool:
-        """Whether the machine went away with the work neither done nor failed.
+        """Whether the host went away with the work neither done nor failed.
 
         A worker that exits, however badly, has failed its input; a
         connection that closes under a worker has said nothing about the
@@ -187,7 +187,7 @@ class _LocalHandle:
         return False  # this machine does not go away
 
 
-class LocalMachine:
+class LocalHost:
     """One spawned process per input, on this machine.
 
     Isolation is the point: a timeout kills exactly one process and a
@@ -269,13 +269,13 @@ class _Handle:
         "_refused",
     )
 
-    def __init__(self, machine: RemoteMachine, ch: int, completions: queue.Queue, raw: bool = False):
+    def __init__(self, host: RemoteHost, ch: int, completions: queue.Queue, raw: bool = False):
         self.ch = ch
         self.objects: dict[str, bytes] = {}
         self.seen: set[str] = set()
         self.completions = completions
-        self.out = _ChannelWriter(machine._send, ch)
-        self._machine = machine
+        self.out = _ChannelWriter(host._send, ch)
+        self._machine = host
         self._failure: str | None = None
         self._buf = b""
         self._result: tuple | None = None
@@ -340,7 +340,7 @@ class _Handle:
                     # Readiness passed once, so a refusal now means the host
                     # has changed under this batch (its project directory was
                     # updated by a later run).  The input is neither done nor
-                    # failed: the machine is lost to this batch, and the
+                    # failed: the host is lost to this batch, and the
                     # scheduler runs the input elsewhere.
                     self._refused = body.decode("utf-8", "replace")
                     self._machine.evict(self._refused)
@@ -412,7 +412,7 @@ class _Handle:
                     protocol.write_message(self.out, protocol.VALUE, b"")
         elif tag == protocol.EVENT:
             record = json.loads(body)
-            record.setdefault("machine", self._machine.name)
+            record.setdefault("host", self._machine.name)
             events.record(store, record.pop("ev", "?"), **record)
         elif tag == protocol.LOGGED:
             from . import runlog
@@ -589,11 +589,11 @@ class ProcessConnection:
 # ---------------------------------------------------------------------------
 
 
-class RemoteMachine:
+class RemoteHost:
     """Workers on one host, over one connection to its host process.
 
     *connect* opens a :class:`Connection` to a Python on the host: for a remote
-    machine an ssh invocation, for this machine an interpreter here.  The
+    host an ssh invocation, for this machine an interpreter here.  The
     bootstrap (:mod:`valuekit.bootstrap`) then turns that into a host
     process running in the project's own environment, and everything after
     that is the same wherever the host is.

@@ -645,7 +645,7 @@ mode: all  (applied: all)        l local  r remote  a all  q quit
   pid 97702    process_scenarios.py         up 2.7s
 
 hosts
-  machine           capacity  running   done  failed  state
+  host              capacity  running   done  failed  state
   mac                      8        6      3       0  ready
   local                    4        3      2       1
 
@@ -671,7 +671,7 @@ thing the monitor writes is the `mode` line of the project's
 `remote` and `all`. The project is the one enclosing the directory the
 monitor is run from. The header shows the mode asked
 for and, beside it, the mode the running driver has applied; they differ
-until the driver next starts a task. The `hosts` block shows each machine's
+until the driver next starts a task. The `hosts` block shows each host's
 capacity under the applied mode, what is running and finished there, and
 whether the host was reached.
 

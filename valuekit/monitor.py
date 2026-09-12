@@ -3,7 +3,7 @@
 Reads the event-log files :mod:`valuekit.events` writes under ``<cache>/events/``
 and redraws a summary a few times a second.  It is a separate process with
 its own lifetime, so it can be started twenty minutes into a run, left open
-across several, or run over ssh on the machine doing the work.  Watching
+across several, or run over ssh on the host doing the work.  Watching
 has no effect on a run: nothing here is read by the pipeline.
 
 The number to look at is the hit rate.  It is the one thing the library
@@ -108,18 +108,18 @@ class _State:
             return
 
         if ev == "start":
-            self._machine_counts(source, e.get("machine", "local"))["running"] += 1
+            self._machine_counts(source, e.get("host", "local"))["running"] += 1
             return
 
         if ev == "requeue":
             # The host went away under this input; it will start again
             # elsewhere and be counted there.
-            counts = self._machine_counts(source, e.get("machine", "local"))
+            counts = self._machine_counts(source, e.get("host", "local"))
             counts["running"] = max(0, counts["running"] - 1)
             return
 
         if ev == "outcome":
-            counts = self._machine_counts(source, e.get("machine", "local"))
+            counts = self._machine_counts(source, e.get("host", "local"))
             counts["running"] = max(0, counts["running"] - 1)
             counts["done"] += 1
             if not e.get("ok", True):
@@ -262,7 +262,7 @@ def _render(
     if drivers:
         out.append("")
 
-    # Every machine that is configured, applied, or has done anything.
+    # Every host that is configured, applied, or has done anything.
     names: list[str] = []
     for name in (
         *configured,
@@ -274,7 +274,7 @@ def _render(
             names.append(name)
     if names or applied:
         out.append("hosts")
-        out.append(f"  {'machine':<16}{'capacity':>10}{'running':>9}{'done':>7}{'failed':>8}  state")
+        out.append(f"  {'host':<16}{'capacity':>10}{'running':>9}{'done':>7}{'failed':>8}  state")
         for name in (*names, "local"):
             cap = applied["capacities"].get(name) if applied else None
             counts = {"running": 0, "done": 0, "failed": 0}

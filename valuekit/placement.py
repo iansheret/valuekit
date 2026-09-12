@@ -2,7 +2,7 @@
 
 Everything about running a checkout on other machines is one file beside
 ``pyproject.toml``, ``valuekit.local.toml``, which git should ignore.  It
-is per checkout: the machines this checkout may use, how many workers each
+is per checkout: the hosts this checkout may use, how many workers each
 may run, the mode in force, and the name of this project's directory on
 each host.  A checkout that never uses other machines has no such file.
 
@@ -26,8 +26,8 @@ file, built on the host.  Nothing of the project's, valuekit included, has
 to be installed there.  A Windows host has ``python`` rather than
 ``python3``.
 
-The *mode*: ``all`` uses every reachable host and this machine at full
-capacity; ``local`` runs everything on this machine; ``remote`` runs as
+The *mode*: ``all`` uses every reachable remote host and this machine at
+full capacity; ``local`` runs everything on this machine; ``remote`` runs as
 little here as possible, which means nothing here while any host is
 reachable or still preparing, and everything here when none is.  Absent,
 it is ``all``: a host in the file is there to be used, the way a core is.
@@ -54,7 +54,7 @@ from .store import _atomic_write
 __all__ = [
     "LOCAL_FILE",
     "MODES",
-    "Host",
+    "HostEntry",
     "LocalConfig",
     "load_local",
     "read_mode",
@@ -71,7 +71,7 @@ DEFAULT_PYTHON = "python3"
 
 
 @dataclass(frozen=True)
-class Host:
+class HostEntry:
     name: str
     ssh: str
     python: str  # any Python 3 on the host, to bootstrap with
@@ -84,7 +84,7 @@ class LocalConfig:
     project: str | None  # the host directory name, if chosen
     mode: str
     local_workers: int
-    hosts: tuple[Host, ...]
+    hosts: tuple[HostEntry, ...]
 
 
 def local_path(root: str | os.PathLike | None) -> Path | None:
@@ -114,7 +114,7 @@ def load_local(root: str | os.PathLike | None) -> LocalConfig:
         raise RuntimeError(f"{p}: [local] must be a table")
     local_workers = _workers(p, "local", local.get("workers", default_local))
 
-    hosts: list[Host] = []
+    hosts: list[HostEntry] = []
     table = data.get("hosts", {})
     if not isinstance(table, dict):
         raise RuntimeError(f"{p}: [hosts] must be a table of tables")
@@ -130,7 +130,7 @@ def load_local(root: str | os.PathLike | None) -> LocalConfig:
         if workers is not None:
             workers = _workers(p, f"hosts.{name}", workers)
         hosts.append(
-            Host(
+            HostEntry(
                 name=str(name),
                 ssh=h["ssh"],
                 python=python,
@@ -192,15 +192,15 @@ def write_mode(root: str | os.PathLike, mode: str) -> None:
 def capacities(
     mode: str, local: int, remote: dict[str, int], pending: bool = False
 ) -> dict[str, int]:
-    """How many tasks each machine may run at once under *mode*.
+    """How many tasks each host may run at once under *mode*.
 
     *remote* maps each host to its capacity, 0 until it is ready; *pending*
     says whether any host is still preparing.  Every name is present in the
     result, at 0 where the mode excludes it, so a display can show what is
     switched off as well as what is on.
 
-    Under ``remote`` this machine stays idle while a host is still on its
-    way: the person who chose that mode wants their machine free, and a
+    Under ``remote`` this machine stays idle while a remote host is still on
+    its way: the person who chose that mode wants their machine free, and a
     short batch would otherwise be over before the host arrived.
     """
     if mode == "local":

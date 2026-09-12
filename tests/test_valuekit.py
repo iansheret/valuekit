@@ -583,7 +583,7 @@ class TestNativeExtensions:
         assert _fp(fn) != before
 
     def test_the_binary_alone_is_not_the_identity(self, fake_extension):
-        # Every machine builds its own binary from the same tree; the tree is
+        # Every host builds its own binary from the same tree; the tree is
         # what they share, so a rebuild that changes no source changes no key.
         mod, path = fake_extension
         fn = _using_global("solve", _NativeCallable())
@@ -3308,7 +3308,7 @@ class TestPlacement:
         # is nowhere else.
         assert capacities("remote", 6, {}) == {"local": 6}
         assert capacities("remote", 6, {"mac": 0}) == {"mac": 0, "local": 6}
-        # ... but a host still preparing is somewhere else: this machine
+        # ... but a host still preparing is somewhere else: this host
         # waits for it rather than taking the batch itself.
         assert capacities("remote", 6, {"mac": 0}, pending=True) == {"mac": 0, "local": 0}
         assert capacities("all", 6, {"mac": 0}, pending=True) == {"mac": 0, "local": 6}
@@ -3325,7 +3325,7 @@ class TestPlacement:
 
 
 class TestPlacementScheduling:
-    """Where tasks go: capacities per machine, remote hosts first, the mode
+    """Where tasks go: capacities per host, remote hosts first, the mode
     file re-read at every start, and a host that fails or dies dropped."""
 
     @pytest.fixture(autouse=True)
@@ -3349,7 +3349,7 @@ class TestPlacementScheduling:
         assert r.failures == []
         by_host = {}
         for _, e in _records(cache, "outcome"):
-            by_host.setdefault(e["machine"], []).append(e["i"])
+            by_host.setdefault(e["host"], []).append(e["i"])
         assert set(by_host) == {"h1", "h2", "local"}
         assert len(by_host["h1"]) >= 1 and len(by_host["h2"]) >= 1
         # Local starts at once; each host joins when ready.
@@ -3367,7 +3367,7 @@ class TestPlacementScheduling:
         placement.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
         assert vk.run_all(m.process, [1, 2, 4, 5]).failures == []
-        assert {e["machine"] for _, e in _records(cache, "outcome")} == {"h1"}
+        assert {e["host"] for _, e in _records(cache, "outcome")} == {"h1"}
         events = [e for _, e in _records(cache, "placement")]
         assert all(e["capacities"]["local"] == 0 for e in events)
         assert events[-1]["capacities"]["h1"] == 2
@@ -3396,7 +3396,7 @@ class TestPlacementScheduling:
         r = vk.run_all(m.slow, [1, 2, 3, 4, 5, 6, 7, 8])
         assert r.failures == []
         outcomes = [e for _, e in _records(cache, "outcome")]
-        hosts = [e["machine"] for e in sorted(outcomes, key=lambda e: e["t"])]
+        hosts = [e["host"] for e in sorted(outcomes, key=lambda e: e["t"])]
         assert hosts[0] == "local" and hosts[-1] == "h1"
         # One event when the mode changes (the host still preparing, so
         # nothing runs anywhere), another when the host joins.
@@ -3408,34 +3408,34 @@ class TestPlacementScheduling:
 
     def test_a_host_that_dies_loses_nothing(self, cache, tmp_path, monkeypatch):
         # The inputs running there are not done and not failed: they run
-        # again on this machine, once, and the batch is whole.
+        # again on this host, once, and the batch is whole.
         import threading
 
-        from valuekit import machines as machines_mod
+        from valuekit import hosts as machines_mod
         from valuekit import placement
 
         monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
         placement.write_mode(tmp_path / "proj", "remote")
-        real_ready = machines_mod.RemoteMachine.ensure_ready
+        real_ready = machines_mod.RemoteHost.ensure_ready
 
         def ready_then_die(self):
             # The host process itself dies a second after it has taken work,
-            # as a machine going down would; the bootstrap that started it
+            # as a host going down would; the bootstrap that started it
             # is not the host, so killing the link's process would not do.
             reason = real_ready(self)
             if not reason:
                 threading.Timer(1.0, os.kill, (self.pid, signal.SIGTERM)).start()
             return reason
 
-        monkeypatch.setattr(machines_mod.RemoteMachine, "ensure_ready", ready_then_die)
+        monkeypatch.setattr(machines_mod.RemoteHost, "ensure_ready", ready_then_die)
         m, _ = _write_batch_module(tmp_path)
         r = vk.run_all(m.slow, [1, 2, 3, 4, 5, 6])
         assert r.failures == []
         assert r.values == [1, 2, 3, 4, 5, 6]
         moved = [e["i"] for _, e in _records(cache, "requeue")]
         assert 1 <= len(moved) <= 2  # what was running on the host when it died
-        assert all(e["machine"] == "h1" for _, e in _records(cache, "requeue"))
-        outcomes = {e["i"]: e["machine"] for _, e in _records(cache, "outcome")}
+        assert all(e["host"] == "h1" for _, e in _records(cache, "requeue"))
+        outcomes = {e["i"]: e["host"] for _, e in _records(cache, "outcome")}
         assert all(outcomes[i] == "local" for i in moved)
         assert any(
             e["name"] == "h1" and not e["ok"] and "closed" in e["reason"]
@@ -3445,7 +3445,7 @@ class TestPlacementScheduling:
         assert modes[0] == ("remote", False) and modes[-1] == ("remote", True)
 
     def test_an_input_that_loses_two_hosts_is_a_failure(self, cache, tmp_path, monkeypatch):
-        from valuekit import machines as machines_mod
+        from valuekit import hosts as machines_mod
         from valuekit import placement
 
         monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 1), "h2": (_HOST_CMD, 1)})
@@ -3453,14 +3453,14 @@ class TestPlacementScheduling:
         placement.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
         # Every host dies as soon as it is given a task.
-        real_start = machines_mod.RemoteMachine.start
+        real_start = machines_mod.RemoteHost.start
 
         def start_and_die(self, x):
             handle = real_start(self, x)
             os.kill(self.pid, signal.SIGTERM)
             return handle
 
-        monkeypatch.setattr(machines_mod.RemoteMachine, "start", start_and_die)
+        monkeypatch.setattr(machines_mod.RemoteHost, "start", start_and_die)
         r = vk.run_all(m.process, [1])
         [(x, exc)] = r.failures
         assert x == 1 and "closed" in str(exc)
@@ -3484,13 +3484,13 @@ class TestMonitor:
                 {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
                 {"ev": "placement", "id": 1, "mode": "all", "capacities": {"mac": 8, "pc": 0, "local": 4}},
                 {"ev": "batch", "id": 1, "fn": "process", "name": "nightly", "n": 3},
-                {"ev": "start", "id": 1, "i": 0, "machine": "mac"},
-                {"ev": "start", "id": 1, "i": 1, "machine": "mac"},
-                {"ev": "start", "id": 1, "i": 2, "machine": "local"},
-                {"ev": "outcome", "id": 1, "i": 0, "ok": True, "machine": "mac"},
-                {"ev": "outcome", "id": 1, "i": 2, "ok": False, "machine": "local", "exc": "ValueError"},
-                {"ev": "start", "id": 1, "i": 3, "machine": "mac"},
-                {"ev": "requeue", "id": 1, "i": 3, "machine": "mac"},
+                {"ev": "start", "id": 1, "i": 0, "host": "mac"},
+                {"ev": "start", "id": 1, "i": 1, "host": "mac"},
+                {"ev": "start", "id": 1, "i": 2, "host": "local"},
+                {"ev": "outcome", "id": 1, "i": 0, "ok": True, "host": "mac"},
+                {"ev": "outcome", "id": 1, "i": 2, "ok": False, "host": "local", "exc": "ValueError"},
+                {"ev": "start", "id": 1, "i": 3, "host": "mac"},
+                {"ev": "requeue", "id": 1, "i": 3, "host": "mac"},
             ]
         )
         applied = st.applied(st.current())
@@ -3507,7 +3507,7 @@ class TestMonitor:
                 {"ev": "process", "pid": 1, "role": "driver", "argv": ["drive.py"]},
                 {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
                 {"ev": "placement", "id": 1, "mode": "all", "capacities": {"mac": 8, "pc": 0, "local": 4}},
-                {"ev": "start", "id": 1, "i": 0, "machine": "mac"},
+                {"ev": "start", "id": 1, "i": 0, "host": "mac"},
             ]
         )
         text = "\n".join(monitor._render(st, 120, requested="remote", configured=("mac", "pc"), keys=True))
@@ -3721,7 +3721,7 @@ class TestEventLog:
         assert batch["n"] == 3 and batch["mode"] == "parallel"
         outcomes = [e for _, e in _records(cache, "outcome")]
         assert sorted(o["i"] for o in outcomes) == [0, 1, 2]
-        assert all(o["ok"] and o["machine"] == "local" for o in outcomes)
+        assert all(o["ok"] and o["host"] == "local" for o in outcomes)
         assert [e["id"] for _, e in _records(cache, "end")] == [batch["id"]]
 
     def test_run_all_reports_a_failure_against_its_input(self, cache, tmp_path):
@@ -3788,7 +3788,7 @@ class TestEventLog:
 # the protocol format and a worker on the other end of a pipe
 # ===========================================================================
 #
-# The remote machine here is a host process on this machine with no network, which is the point:
+# The remote host here is a host process on this host with no network, which is the point:
 # the framing, the value codec, the handshake and the failure mapping all get
 # exercised in CI without ssh being configured anywhere.
 
@@ -3933,14 +3933,14 @@ _HOST_CMD = [sys.executable]  # a Python 3 to bootstrap with, as a host entry na
 
 
 def _remote_machine(fn, cache, name="h1", completions=None):
-    """A RemoteMachine over a host process launched on this machine."""
+    """A RemoteHost over a host process launched on this host."""
     import queue
-    from valuekit.machines import RemoteMachine
+    from valuekit.hosts import RemoteHost
 
-    from valuekit.machines import ProcessConnection
+    from valuekit.hosts import ProcessConnection
 
     _locked_files()
-    return RemoteMachine(
+    return RemoteHost(
         sync.Project(fn), str(cache), completions or queue.Queue(), name,
         lambda: ProcessConnection(bootstrap.local_command(sys.executable)), str(cache / "source"),
     )
@@ -3960,7 +3960,7 @@ def _settle(handle, completions, timeout=30):
 
 
 class TestRemoteMachine:
-    """Batches through a host process on this machine, in remote mode."""
+    """Batches through a host process on this host, in remote mode."""
 
     @pytest.fixture(autouse=True)
     def _use_host(self, monkeypatch, cache, tmp_path):
@@ -3980,7 +3980,7 @@ class TestRemoteMachine:
         r = vk.run_all(m.process, [1, 3, 4])
         assert [x for x, _ in r.failures] == [3]
         # The protocol cannot carry an exception object, so a remote failure is a
-        # RuntimeError naming the original -- unlike the local machine, which
+        # RuntimeError naming the original -- unlike the local host, which
         # pickles the exception itself.
         (_, exc), = r.failures
         assert isinstance(exc, RuntimeError)
@@ -4032,7 +4032,7 @@ class TestRemoteMachine:
     def test_values_logged_in_a_worker_reach_the_drivers_log(self, cache, tmp_path):
         m, counts = _write_batch_module(tmp_path)
         vk.run_all(m.with_log, [1, 2])
-        assert [e["machine"] for _, e in _records(cache, "start")] == ["h1", "h1"]
+        assert [e["host"] for _, e in _records(cache, "start")] == ["h1", "h1"]
         L = vk.logs()
         np.testing.assert_array_equal(L.where(q="arr", sid=2).one().value, [0.0, 2.0, 4.0])
         assert len(L.where(q="twice")) == 4
@@ -4092,7 +4092,7 @@ class TestRemoteMachine:
 # code sync
 # ===========================================================================
 #
-# The worker runs on this machine, so the driver's live tree is genuinely
+# The worker runs on this host, so the driver's live tree is genuinely
 # reachable. That is exactly why these tests matter: without the source tree and
 # the import check, a worker could import from the live tree and the whole feature
 # would look like it worked while proving nothing.
@@ -4432,18 +4432,18 @@ class TestSourceTree:
         root = _project(tmp_path)
         m = _load(root)
         completions = queue.Queue()
-        machine = _remote_machine(m.work, cache, completions=completions)
-        assert machine.ensure_ready() == ""
+        host = _remote_machine(m.work, cache, completions=completions)
+        assert host.ensure_ready() == ""
         # Delete the source outright. If the worker were resolving imports
         # against the live tree this cannot survive.
         (root / "vk_sync_mod.py").unlink()
-        handle = machine.start(7)
+        handle = host.start(7)
         _settle(handle, completions)
         try:
             assert handle.recv() == ("ok", 107)
         finally:
             handle.reap()
-            machine.close()
+            host.close()
 
     def test_an_edit_updates_the_tree_in_place(self, cache, tmp_path):
         root = _project(tmp_path)
@@ -4476,7 +4476,7 @@ class TestSourceTree:
         assert first.ensure_ready() == ""
         first.close()
         before = (cache / "source").stat().st_mtime_ns
-        # A second machine over the same tree finds the source tree already there
+        # A second host over the same tree finds the source tree already there
         # and asks for nothing.
         second = _remote_machine(m.work, cache)
         assert second.ensure_ready() == ""
@@ -4486,7 +4486,7 @@ class TestSourceTree:
 
     def test_a_tree_without_a_manifest_is_resent_whole(self, cache, tmp_path):
         m = _load(_project(tmp_path))
-        machine = _remote_machine(m.work, cache)
+        host = _remote_machine(m.work, cache)
         # A directory with no manifest (a failed or interrupted update) is
         # not trusted: every file is sent and written over what is there.
         half = cache / "source" / "p"
@@ -4494,8 +4494,8 @@ class TestSourceTree:
         (half / "vk_sync_mod.py").write_text(
             "from valuekit import pure\n@pure\ndef work(x):\n    return 'WRONG'\n"
         )
-        assert machine.ensure_ready() == ""
-        machine.close()
+        assert host.ensure_ready() == ""
+        host.close()
         assert vk.run_all(m.work, [1]).values == [101]
 
     def test_a_later_run_evicts_the_batch_using_the_host(self, cache, tmp_path):
@@ -4557,17 +4557,17 @@ class TestSourceTree:
             [(_, host)] = _records(cache, "host")
             assert host["ok"] is False and "outside its project" in host["reason"]
             [(_, outcome)] = _records(cache, "outcome")
-            assert outcome["machine"] == "local"
+            assert outcome["host"] == "local"
         finally:
             sys.path.remove(str(outside))
             sys.modules.pop("vk_sync_mod_far", None)
 
     def test_readiness_failure_is_one_reason_not_one_per_input(self, cache, tmp_path):
         m = _load(_project(tmp_path))
-        machine = _remote_machine(m.work, cache)
-        parts = protocol.unstrings(machine._hello)
-        machine._hello = protocol.strings("wrong-python", *parts[1:])
-        reason = machine.ensure_ready()
-        machine.close()
+        host = _remote_machine(m.work, cache)
+        parts = protocol.unstrings(host._hello)
+        host._hello = protocol.strings("wrong-python", *parts[1:])
+        reason = host.ensure_ready()
+        host.close()
         assert "wrong-python" in reason
-        assert machine.ensure_ready() == reason  # remembered, not retried
+        assert host.ensure_ready() == reason  # remembered, not retried

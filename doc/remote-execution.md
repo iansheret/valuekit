@@ -71,7 +71,7 @@ join as they become ready.
 ## Layers
 
 ```
-Connection    bytes to a process on the host       machines.ProcessConnection (later: a socket)
+Connection    bytes to a process on the host       hosts.ProcessConnection (later: a socket)
 bootstrap     tree -> environment -> host process   bootstrap.py, both halves, stdlib-only
 host          workers as numbered channels          host.py
 worker        check the function hash, run one task      worker.py
@@ -82,9 +82,9 @@ store         the driver's store over the channel   remotestore.py
 
 | File | Responsibility |
 |---|---|
-| `valuekit/parallel.py` | Scheduling: capacities per machine from the mode file, deadlines, input ordering, failure attribution, requeue on host loss, cached-input short-circuit, batch recording. |
+| `valuekit/parallel.py` | Scheduling: capacities per host from the local file's mode, deadlines, input ordering, failure attribution, requeue on host loss, cached-input short-circuit, batch recording. |
 | `valuekit/placement.py` | The local file (hosts, worker cap, mode, project name), capacities per mode, the worker environment allowlist. |
-| `valuekit/machines.py` | `Connection`/`ProcessConnection`, `LocalMachine` (a process per input), `RemoteMachine` (one connection, a channel per task), and the handle that answers a worker's store requests and runs its `@pure_local` calls. |
+| `valuekit/hosts.py` | `Connection`/`ProcessConnection`, `LocalHost` (a process per input), `RemoteHost` (one connection, a channel per task), and the handle that answers a worker's store requests and runs its `@pure_local` calls. |
 | `valuekit/bootstrap.py` | How a tree becomes an environment on a host: the lock-tool table, the layout under `source_root`, extraction, the sync, starting the host process. Both halves of its protocol. Stdlib only. |
 | `valuekit/host.py` | The host process: starts a worker per channel, multiplexes their streams, exits on EOF. |
 | `valuekit/worker.py` | The worker process: a readiness mode and a single-task mode; install, admit, audit. |
@@ -148,7 +148,7 @@ known before anything is imported. An extension with no project marker above it 
 identified by its binary, which is all there is.
 
 **Modes stay; the default is `all`; readiness never blocks.** On review, modes are a
-preset over per-machine capacities, which is the shape the extra-cores model wants
+preset over per-host capacities, which is the shape the extra-cores model wants
 underneath; the objection to them was aesthetic. What the model concretely requires was
 changed instead: configured hosts are used without a keystroke, local work starts at once
 and hosts join when ready, and (under `remote` only) this machine stays idle while a host
@@ -224,8 +224,11 @@ every test tree gets those files. The cost is `uv` in CI and a few seconds per n
 "Project hash": its manifest hash, what the host's manifest names and a native extension's marker. "Event log": the diagnostic record of
 what happened during a run, for the monitor. "Call record": a memoised call's recorded reads, result, nested calls and
 logged values. "Batch record": what `run_all` writes under a name. "Run": one driver
-process running a script. "Run log": the values a run logged, under `logs/`. "Machine": somewhere
-work can run, this one included. "Mode": which machines are used. "Connection": the link to a host.
+process running a script. "Run log": the values a run logged, under `logs/`. "Host": a machine that can run
+workers, this one included; a remote host is one reached over ssh. "Host process": the process on a
+remote host that starts its workers. "Driver": the process in which `run_all` is called; it owns the
+cache, schedules the batch, and answers the workers. "Mode": which hosts are used. "Connection": the
+link to a remote host.
 
 ## Outstanding work
 
