@@ -33,7 +33,8 @@ import sys
 import threading
 from typing import BinaryIO
 
-from . import wire
+from . import protocol
+from .functionhash import PYTHON
 from .placement import worker_env
 
 __all__ = ["main", "serve"]
@@ -58,11 +59,11 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
     def send(tag: bytes, body: bytes) -> None:
         with out_lock:
             try:
-                wire.write_frame(tx, tag, body)
+                protocol.write_message(tx, tag, body)
             except (OSError, ValueError):
                 pass  # the driver is gone; EOF on stdin follows
 
-    def pump(ch: int, w: _Worker) -> None:
+    def forward_stdout(ch: int, w: _Worker) -> None:
         """Forward the worker's stdout, then report how it ended."""
         fd = w.proc.stdout.fileno()
         while True:
@@ -72,16 +73,16 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
                 chunk = b""
             if not chunk:
                 break
-            send(wire.DATA, wire.channelled(ch, chunk))
+            send(protocol.DATA, protocol.channelled(ch, chunk))
         code = w.proc.wait()
         with w.lock:
             tail = bytes(w.stderr[-_STDERR_TAIL:])
         send(
-            wire.EXIT,
-            wire.channelled(ch, code.to_bytes(4, "little", signed=True) + tail),
+            protocol.EXIT,
+            protocol.channelled(ch, code.to_bytes(4, "little", signed=True) + tail),
         )
 
-    def drain_stderr(w: _Worker) -> None:
+    def read_stderr(w: _Worker) -> None:
         fd = w.proc.stderr.fileno()
         while True:
             try:
@@ -94,16 +95,16 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
                 w.stderr += chunk
                 del w.stderr[:-_STDERR_TAIL]
 
-    send(wire.HOST, wire.strings(_salt(), str(os.cpu_count() or 1), str(os.getpid())))
+    send(protocol.HOST, protocol.strings(PYTHON, str(os.cpu_count() or 1), str(os.getpid())))
     env = worker_env()
     try:
         while True:
-            frame = wire.read_frame(rx)
-            if frame is None:
+            message = protocol.read_message(rx)
+            if message is None:
                 return 0
-            tag, body = frame
-            ch, rest = wire.channel(body)
-            if tag == wire.OPEN:
+            tag, body = message
+            ch, rest = protocol.channel(body)
+            if tag == protocol.OPEN:
                 args = ["--ready"] if rest == b"ready" else []
                 proc = subprocess.Popen(
                     [python, "-m", "valuekit.worker", *args],
@@ -113,9 +114,9 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
                     env=env,
                 )
                 w = workers[ch] = _Worker(proc)
-                threading.Thread(target=drain_stderr, args=(w,), daemon=True).start()
-                threading.Thread(target=pump, args=(ch, w), daemon=True).start()
-            elif tag == wire.DATA:
+                threading.Thread(target=read_stderr, args=(w,), daemon=True).start()
+                threading.Thread(target=forward_stdout, args=(ch, w), daemon=True).start()
+            elif tag == protocol.DATA:
                 w = workers.get(ch)
                 if w is not None:
                     try:
@@ -123,20 +124,20 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
                         w.proc.stdin.flush()
                     except (OSError, ValueError):
                         pass  # the worker died; its EXIT says so
-            elif tag == wire.CLOSE:
+            elif tag == protocol.CLOSE:
                 w = workers.get(ch)
                 if w is not None:
                     try:
                         w.proc.stdin.close()
                     except (OSError, ValueError):
                         pass
-            elif tag == wire.KILL:
+            elif tag == protocol.KILL:
                 w = workers.pop(ch, None)
                 if w is not None:
                     _kill(w.proc)
             else:
-                raise wire.WireError(f"unexpected frame {tag!r}")
-    except wire.WireError:
+                raise protocol.ProtocolError(f"unexpected message {tag!r}")
+    except protocol.ProtocolError:
         return 2
     finally:
         for w in workers.values():
@@ -152,12 +153,6 @@ def _kill(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5)
     except Exception:
         pass
-
-
-def _salt() -> str:
-    from .pure import _salt
-
-    return _salt()
 
 
 def main(argv: list[str] | None = None) -> int:

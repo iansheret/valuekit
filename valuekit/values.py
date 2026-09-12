@@ -18,7 +18,7 @@ a cached return value.
 
 The ImmutableMap handlers are registered in :mod:`valuekit.map` (they need
 the class itself); the function handlers are registered in
-:mod:`valuekit.codehash` (they need the code hasher); plain-data dataclasses
+:mod:`valuekit.functionhash` (they need the function hasher); plain-data dataclasses
 are handled in :mod:`valuekit.plaindata`, which needs no registration at all
 because the type it recognises is a family rather than a class.
 """

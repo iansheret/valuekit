@@ -44,6 +44,10 @@ Changelog = "https://github.com/iansheret/valuekit/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
+# The same for uv: `uv sync` installs it by default, from the lock.
+[dependency-groups]
+dev = ["pytest>=8"]
+
 [tool.setuptools.dynamic]
 version = { attr = "valuekit._version.__version__" }
 

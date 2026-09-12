@@ -43,9 +43,11 @@ from .store import SerializationError, CacheMiss
 from .pure import pure, pure_local, log, set_cache_dir, clear_cache
 from .parallel import run_all, BatchResult
 from .batches import batch
+from .runlog import logs
 
 __all__ = [
     "batch",
+    "logs",
     "ImmutableMap",
     "freeze",
     "content_hash",

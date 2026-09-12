@@ -7,24 +7,25 @@ the worker unpacks an immutable copy of it -- a *source tree* -- and imports
 from that rather than from whatever happens to be on its own disk.
 
 What gets sent is the user-code partition and nothing else, the same
-boundary :func:`valuekit.codehash._classify` already draws: the project's own
+boundary :func:`valuekit.functionhash._classify` already draws: the project's own
 files, never libraries.  A dependency is the environment's job on both
 machines, exactly as numpy is -- and shipping a locally built extension would
 be worse than useless anyway, since it is the wrong architecture as often as
 not.  Compiled artefacts are therefore excluded outright rather than by
 trusting the project's ignore rules.
 
-A source tree is named by the manifest hash and never modified, so several
-versions of a project coexist, a batch cannot have its source changed
-underneath it, and re-running an unchanged tree costs one comparison.  It
-lives under the cache directory, beside ``objects/`` and ``runs/``: the cache
-directory is where valuekit writes, and nothing is written until one is named.
+A host keeps one source tree per project, updated in place from the
+manifest's difference, so a build directory there persists across edits;
+the manifest hash (the *project hash*) says whether the host's copy is current.
+On this machine the tree lives under the cache directory, beside
+``objects/`` and ``events/``: the cache directory is where valuekit writes,
+and nothing is written until one is named.
 
 What happens to the tree on the host -- unpacking it, building the
 environment the project's lock file describes, starting the host process
 inside it -- is :mod:`valuekit.bootstrap`'s.  Nothing here trusts that any
-of it worked: :mod:`valuekit.worker` audits what it actually imported
-afterwards, and the fingerprint handshake checks the result again --
+of it worked: :mod:`valuekit.worker` checks that what it actually imported came from the tree
+afterwards, and the function-hash handshake checks the result again --
 because a source tree on ``sys.path`` can still lose to an editable
 install's meta-path finder, and a silent wrong answer is the one outcome
 worth any amount of machinery to avoid.
@@ -39,6 +40,8 @@ import subprocess
 import sys
 import sysconfig
 import tarfile
+import tomllib
+import warnings
 from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 from typing import Any, Iterable
@@ -50,7 +53,7 @@ __all__ = [
     "Project",
     "manifest",
     "manifest_hash",
-    "tree_id",
+    "project_hash",
     "find_root",
     "sync_root",
     "pack_tree",
@@ -59,7 +62,7 @@ __all__ = [
     "is_environment",
 ]
 
-# Anything whose identity is a build rather than a source.  Excluded
+# Anything that is a build product rather than a source.  Excluded
 # unconditionally: a project that commits its .so files should still not ship
 # them to a machine that may not share this one's architecture.
 _SKIP_SUFFIXES = tuple(EXTENSION_SUFFIXES) + (
@@ -74,6 +77,10 @@ _SKIP_DIRS = frozenset(
         "build", "dist", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
     }
 )
+
+# Never shipped and never hashed: the local file says where a computation
+# runs, which must not be able to affect a result.
+_SKIP_FILES = frozenset({"valuekit.local.toml"})
 
 MAX_BYTES = 256 << 20  # a project tree, not a data directory
 MAX_FILES = 20_000
@@ -143,7 +150,7 @@ def _under(path: str, root: str) -> bool:
 
 
 def user_span_files(spans: Iterable[tuple[str, int, int]]) -> list[str]:
-    """The real user source files named by a fingerprint's spans.
+    """The real user source files named by a reachable set's spans.
 
     Spans record ``co_filename`` unmodified, so they carry synthetic names
     (``<string>`` for a dataclass's generated methods, or anything exec'd),
@@ -194,7 +201,7 @@ def _cache_dirs() -> list[str]:
     """The current store's directory, if it has one: never part of a tree.
 
     A cache configured inside the project would otherwise be packed into the
-    source tree that lives beside it, and would move the tree's identity every
+    source tree that lives beside it, and would move the tree's hash every
     time a value was written.
     """
     from .pure import _current_store
@@ -204,13 +211,13 @@ def _cache_dirs() -> list[str]:
     return [str(store.root)] if isinstance(store, LocalStore) else []
 
 
-def tree_id(root: str) -> str:
-    """The identity of the project at *root*: its manifest hash, right now.
+def project_hash(root: str) -> str:
+    """The hash of the project at *root*: its manifest hash, right now.
 
     Not memoised across calls: the manifest is what says whether the tree
     changed, so a remembered answer is the one thing it must not be.  A
     caller that needs it repeatedly within one operation keeps it for that
-    operation (the fingerprint walk does).
+    operation (the walk does).
     """
     return manifest_hash(manifest(root, exclude=_cache_dirs()))
 
@@ -220,24 +227,23 @@ class Project:
 
     Built once per batch and shared by every host: the manifest walk reads
     every file in the tree, and the answer is the same for all of them.
-    ``tree_id`` names exactly this set of files at exactly these contents;
-    it is the name of the source tree on every host, and the identity that
-    stands for a native extension built from it (see :mod:`valuekit.codehash`).
+    ``project_hash`` names exactly this set of files at exactly these contents;
+    it is the name of the source tree on every host, and the hash that
+    stands for a native extension built from it (see :mod:`valuekit.functionhash`).
     """
 
-    def __init__(self, fn: Any):
+    def __init__(self, fn: Any, name: str | None = None):
         self.fn = fn
         self.root = sync_root(fn)
+        self.name = project_name(self.root, name)
         self.entries = manifest(self.root, exclude=_cache_dirs())
-        self.tree_id = manifest_hash(self.entries)
+        self.project_hash = manifest_hash(self.entries)
         self.roots = import_roots(self.root)
-        self._packed: bytes | None = None
+        _warn_if_tracked(self.root)
 
-    def pack(self) -> bytes:
-        """The tree as a tarball, built once."""
-        if self._packed is None:
-            self._packed = pack_tree(self.root, self.entries)
-        return self._packed
+    def pack(self, entries: list[tuple[str, str]]) -> bytes:
+        """A tarball of *entries*, a subset of the manifest."""
+        return pack_tree(self.root, entries)
 
     def refusal(self) -> str:
         """Why no host could take this project, or "".
@@ -249,7 +255,7 @@ class Project:
         that X lives somewhere the driver never offered to send.
         """
         from . import bootstrap
-        from .codehash import function_fingerprint
+        from .functionhash import reachable_set
 
         if bootstrap.lock_tool(rel for rel, _ in self.entries) is None:
             known = ", ".join(bootstrap.KNOWN_LOCKS)
@@ -259,7 +265,7 @@ class Project:
                 "Lock the project's dependencies with one of those tools."
             )
         try:
-            spans = function_fingerprint(self.fn)[1]
+            spans = reachable_set(self.fn).spans
         except Exception:
             return ""
         root = os.path.realpath(self.root)
@@ -276,11 +282,54 @@ class Project:
         return ""
 
 
-def _file_digest(path: str) -> str | None:
-    """Content digest of a file, or None if it cannot be read.
+def project_name(root: str, override: str | None = None) -> str:
+    """The name of the project's directory on a host: *override* (the local
+    file's ``project``), else ``[project].name`` from ``pyproject.toml``,
+    else the root directory's name.  Made safe for a directory name."""
+    from .store import dirname_for
+
+    name = override
+    if not name:
+        try:
+            with open(os.path.join(root, "pyproject.toml"), "rb") as f:
+                name = tomllib.load(f).get("project", {}).get("name")
+        except (OSError, tomllib.TOMLDecodeError, AttributeError):
+            name = None
+    if not isinstance(name, str) or not name:
+        name = os.path.basename(os.path.realpath(root))
+    return dirname_for(name)
+
+
+_warned: set[str] = set()
+
+
+def _warn_if_tracked(root: str) -> None:
+    """Warn once per project if git tracks the local file, which is meant to
+    be ignored: it holds this checkout's machines, not the project's."""
+    if root in _warned:
+        return
+    _warned.add(root)
+    for name in _SKIP_FILES:
+        try:
+            out = subprocess.run(
+                ["git", "-C", root, "ls-files", "--cached", "--", name],
+                capture_output=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        if out.returncode == 0 and out.stdout.strip():
+            warnings.warn(
+                f"{name} in {root} is tracked by git; it is per checkout and "
+                "should be in .gitignore",
+                stacklevel=3,
+            )
+
+
+def _file_hash(path: str) -> str | None:
+    """Content hash of a file, or None if it cannot be read.
 
     Deliberately not memoised on ``(mtime, size)``, the way an extension
-    binary's digest is in :mod:`valuekit.codehash`.  That key fails in the
+    binary's hash is in :mod:`valuekit.functionhash`.  That key fails in the
     dangerous direction here: a file whose content changes without moving
     its mtime or its size -- a same-size edit within one tick on a
     coarse-mtime filesystem such as HFS+, ext3 or exFAT -- would keep its old
@@ -306,7 +355,7 @@ def _file_digest(path: str) -> str | None:
 
 
 def _skip(rel: str) -> bool:
-    if rel.endswith(_SKIP_SUFFIXES):
+    if rel.endswith(_SKIP_SUFFIXES) or os.path.basename(rel) in _SKIP_FILES:
         return True
     return any(part in _SKIP_DIRS for part in Path(rel).parts)
 
@@ -347,7 +396,7 @@ def _walked_files(root: str) -> list[str]:
 
 
 def manifest(root: str, exclude: Iterable[str] = ()) -> list[tuple[str, str]]:
-    """``(relpath, digest)`` for every file to ship, sorted.
+    """``(relpath, hash)`` for every file to ship, sorted.
 
     *exclude* names directories to leave out whatever the ignore rules say --
     valuekit's own cache above all, since a cache configured inside the
@@ -377,10 +426,10 @@ def manifest(root: str, exclude: Iterable[str] = ()) -> list[tuple[str, str]]:
         ):
             continue
         full = os.path.join(root, rel)
-        digest = _file_digest(full)
-        if digest is None:
+        h = _file_hash(full)
+        if h is None:
             continue  # staged-then-deleted, or vanished under us
-        entries.append((rel, digest))
+        entries.append((rel, h))
         try:
             size = os.stat(full).st_size
         except OSError:
@@ -404,9 +453,9 @@ def manifest(root: str, exclude: Iterable[str] = ()) -> list[tuple[str, str]]:
 def manifest_hash(entries: list[tuple[str, str]]) -> str:
     """A name for exactly this set of files at exactly these contents."""
     h = _new_hasher()
-    for rel, digest in entries:
+    for rel, file_hash in entries:
         _frame(h, b"p", rel.encode("utf-8", "surrogateescape"))
-        _frame(h, b"h", digest.encode("ascii"))
+        _frame(h, b"h", file_hash.encode("ascii"))
     return h.hexdigest()
 
 

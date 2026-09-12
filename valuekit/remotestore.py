@@ -1,7 +1,7 @@
 """A worker's store: the driver's store, reached over the connection.
 
-A worker keeps no cache of its own.  Every value and trace it produces is
-sent to the driver, every lookup asks the driver, and every run-log record
+A worker keeps no cache of its own.  Every value and record it produces is
+sent to the driver, every lookup asks the driver, and every event
 goes there too, so the driver's directory is the one place a batch's
 results exist wherever the work ran.  This is also what lets a
 ``@pure_local`` function called in a worker run on the driver instead:
@@ -9,7 +9,7 @@ the call is a request like any other, and the answer is a value.
 
 The conversation is strictly sequential on this side -- one request, then
 its reply -- so nothing here multiplexes.  Replies are read off the same
-stream the task arrived on; an OBJECT frame at any point is one more
+stream the task arrived on; an OBJECT message at any point is one more
 object the driver has sent, and is kept.
 
 Objects sent and objects received are both remembered by hash: the driver
@@ -20,101 +20,111 @@ without repeating it.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
 from typing import Any, BinaryIO
 
-from . import wire
-from .store import CacheMiss, trace_hash
+from . import protocol
+from .store import CacheMiss, record_hash
 
-__all__ = ["WireStore"]
+__all__ = ["RemoteStore"]
 
 
-class WireStore:
+class RemoteStore:
     """:class:`~valuekit.store.CacheStore` over a framed connection."""
 
     def __init__(self, rx: BinaryIO, tx: BinaryIO):
         self._rx = rx
         self._tx = tx
         self._objects: dict[str, bytes] = {}  # everything sent or received
-        self._seen: set[str] = set()  # the same, as the hashes wire.pack skips
+        self._seen: set[str] = set()  # the same, as the hashes protocol.pack skips
 
     # -- objects ----------------------------------------------------------
 
     def receive(self, body: bytes) -> None:
-        """Keep one OBJECT frame the driver sent."""
-        wire.recv_object(body, self._objects)
+        """Keep one OBJECT message the driver sent."""
+        protocol.recv_object(body, self._objects)
         self._seen.add(body[:20].hex())
 
     def unpack(self, root: str) -> Any:
-        return wire.unpack(root, self._objects)
+        return protocol.unpack(root, self._objects)
 
     def put_value(self, v: Any) -> str:
-        root, objects = wire.pack(v, self._seen)
+        root, objects = protocol.pack(v, self._seen)
         for h, payload in objects.items():
-            wire.write_frame(self._tx, wire.OBJECT, bytes.fromhex(h) + payload)
+            protocol.write_message(self._tx, protocol.OBJECT, bytes.fromhex(h) + payload)
             self._objects[h] = payload
             self._seen.add(h)
         return root
 
     def get_value(self, h: str) -> Any:
         if h not in self._objects:
-            wire.write_frame(self._tx, wire.GET_VALUE, bytes.fromhex(h))
-            reason = self._reply(wire.VALUE)
+            protocol.write_message(self._tx, protocol.GET_VALUE, bytes.fromhex(h))
+            reason = self._reply(protocol.VALUE)
             if reason:
                 raise CacheMiss(f"{h}: {reason.decode('utf-8', 'replace')}")
         try:
             return self.unpack(h)
-        except wire.WireError as e:
+        except protocol.ProtocolError as e:
             raise CacheMiss(f"{h}: {e}") from e
 
-    # -- traces -------------------------------------------------------------
+    # -- call records -------------------------------------------------------------
 
-    def get_traces(self, fn_key: str) -> list[tuple[str, dict]]:
-        wire.write_frame(self._tx, wire.GET_TRACES, fn_key.encode())
-        body = self._reply(wire.TRACES)
+    def get_records(self, function_hash: str) -> list[tuple[str, dict]]:
+        protocol.write_message(self._tx, protocol.GET_RECORDS, function_hash.encode())
+        body = self._reply(protocol.RECORDS)
         return [(h, t) for h, t in json.loads(body)]
 
-    def put_trace(self, fn_key: str, trace: dict, units: Sequence[str] = ()) -> str:
-        wire.write_frame(
-            self._tx, wire.TRACE, wire.strings(fn_key, json.dumps(trace), *units)
-        )
-        return trace_hash(trace)
+    def put_record(self, function_hash: str, record: dict) -> str:
+        protocol.write_message(self._tx, protocol.RECORD, protocol.strings(function_hash, json.dumps(record)))
+        return record_hash(record)
 
     # -- the driver's side of the run log ------------------------------------
 
     def emit(self, record: dict) -> None:
-        wire.write_frame(self._tx, wire.EVENT, json.dumps(record).encode())
+        protocol.write_message(self._tx, protocol.EVENT, json.dumps(record).encode())
+
+    # -- the driver's side of the run's log ------------------------------------
+
+    def emit_line(self, line: str) -> None:
+        protocol.write_message(self._tx, protocol.LOGGED, line.encode())
+
+    def reemit(self, function_hash: str, h: str) -> None:
+        """Have the driver emit what the call record *h* recorded; CacheMiss if it
+        could not read the whole subtree, in which case it emitted nothing."""
+        protocol.write_message(self._tx, protocol.REEMIT, protocol.strings(function_hash, h))
+        reason = self._reply(protocol.REEMITTED)
+        if reason:
+            raise CacheMiss(f"{h}: {reason.decode('utf-8', 'replace')}")
 
     # -- a call that must run on the driver ----------------------------------
 
     def local_call(self, module: str, qualname: str, args: tuple, kwargs: dict):
         """Run ``module:qualname(*args, **kwargs)`` on the driver.
 
-        Returns ``(value, trace_hash)``; the hash is empty if the driver
-        stored no trace for the call.  A failure there raises here, with
+        Returns ``(value, record_hash)``; the hash is empty if the driver
+        stored no call record for the call.  A failure there raises here, with
         the driver's traceback as the message.
         """
         root = self.put_value((args, kwargs))
-        wire.write_frame(self._tx, wire.CALL, wire.strings(module, qualname, root))
-        body = self._reply(wire.CALLED)
+        protocol.write_message(self._tx, protocol.CALL, protocol.strings(module, qualname, root))
+        body = self._reply(protocol.CALLED)
         if body[:1] == b"o":
-            result_root, h = wire.unstrings(body[1:])
+            result_root, h = protocol.unstrings(body[1:])
             return self.unpack(result_root), h
-        kind, text, tb = wire.unstrings(body[1:])
+        kind, text, tb = protocol.unstrings(body[1:])
         raise RuntimeError(f"{qualname} failed on the driver: {kind}: {text}\n{tb}")
 
     # -- replies ----------------------------------------------------------------
 
     def _reply(self, tag: bytes) -> bytes:
-        """Read frames until the reply tagged *tag*; keep objects on the way."""
+        """Read messages until the reply tagged *tag*; keep objects on the way."""
         while True:
-            frame = wire.read_frame(self._rx)
-            if frame is None:
-                raise wire.WireError("the driver went away mid-request")
-            got, body = frame
-            if got == wire.OBJECT:
+            message = protocol.read_message(self._rx)
+            if message is None:
+                raise protocol.ProtocolError("the driver went away mid-request")
+            got, body = message
+            if got == protocol.OBJECT:
                 self.receive(body)
             elif got == tag:
                 return body
             else:
-                raise wire.WireError(f"expected {tag!r}, got {got!r}")
+                raise protocol.ProtocolError(f"expected {tag!r}, got {got!r}")

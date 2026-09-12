@@ -13,10 +13,10 @@ Fine-grained invalidation is opt-in, and the opt-in is passing an
 :class:`~valuekit.ImmutableMap`.  Such an argument is wrapped on a miss in a
 recording proxy (itself an ImmutableMap, so the function cannot tell); the
 function runs; the observed reads, plus whole-value content hashes of every
-other argument, become a *trace*, stored alongside the content hash of the
+other argument, become a *call record*, stored alongside the content hash of the
 return value.
 
-On a lookup, the stored traces for the function's fingerprint are scanned.
+On a lookup, the stored call records for the function's function hash are scanned.
 If every recorded fact still holds against the current arguments (same
 values at the read paths, same absences, same whole-map hashes where the
 function observed everything), the stored result is returned without
@@ -24,11 +24,12 @@ executing.  Keys the function never read are irrelevant, so unrelated
 additions to a data or config map do not invalidate — whereas a plain dict
 argument is depended on whole, since nothing observed how it was used.
 
-A trace also records what the computation *bound*: every memoised call made
-inside it (function name, key and trace hash, in completion order) and
-every :func:`log` call (name and value hash).  These are facts about the
-computation, stored with its result, so a later hit needs nothing replayed:
-the bindings are in the trace it found.  :mod:`valuekit.batches` reads them.
+A call record also records what happened inside the call: every memoised
+call it made (function name, key and record hash, in completion order) and
+every :func:`log` call (labels and value, by hash).  These are facts about
+the call, stored with its result, so a hit can stand in for the call
+completely: it emits to the run's log what the call record it found
+recorded, nested calls included.  :mod:`valuekit.runlog` reads it back.
 
 ``@pure_local`` is memoised identically but promises less about the code
 and more about the world: the result may depend on this machine's
@@ -41,27 +42,26 @@ other side effect inside a @pure function are skipped.
 
 With no cache directory configured, @pure is a plain call.  For debugging
 see :mod:`valuekit.debughook`: a breakpoint anywhere in the function's
-user-code closure forces execution, without writing.
+reachable set forces execution, without writing.
 """
 
 from __future__ import annotations
 
 import functools
-import hashlib
 import inspect
 import os
-import sys
 import time
+from collections.abc import Mapping
 from contextvars import ContextVar
 from typing import Any, Callable
 
-from . import runlog
-from .codehash import _module_unit, _unit_digest, function_fingerprint
+from . import runlog, events
+from .functionhash import reachable_set
 from .debughook import breakpoints_force
 from .map import ImmutableMap, map_digest
 from .recording import Recorder, RecordingMap, unwrap_proxies
 from .store import CacheMiss, CacheStore, LocalStore
-from .values import content_hash, decode_key, digest
+from .values import content_hash, decode_key, digest, freeze
 
 __all__ = ["pure", "pure_local", "log", "set_cache_dir", "clear_cache"]
 
@@ -109,52 +109,25 @@ def clear_cache(fn: Callable | None = None) -> None:
     """Delete cached results. Always safe: the worst case is recomputation.
 
     ``clear_cache()`` deletes everything in the configured cache.
-    ``clear_cache(fn)`` states that *fn* has changed and behaves as if it
-    had: it deletes the recorded traces of *fn* and of every @pure function
-    whose closure contains it (callers, transitively), plus any traces
-    where *fn* appeared as an argument.  Matching is conservative (a caller
-    that reached *fn* through its module clears everything that referenced
-    that module, and textually identical function bodies clear together):
-    clearing too much means recomputing, while clearing too little would
-    mean wrong results.  Stored values are content-addressed and shared, so
-    they are not deleted; orphaned objects only occupy disk space and are
-    removed by a full clear.
+    ``clear_cache(fn)`` states that *fn* has changed: it deletes *fn*'s call
+    records.  Every function that computed through *fn*, whether it called
+    it directly or received it as an argument, names one of those records
+    in its own, so its next call finds nothing that can stand in for it and
+    recomputes; callers are reached transitively the same way, each at its
+    next call.  Stored values are content-addressed and shared, so they are
+    left in place; :mod:`valuekit.sweep` removes what nothing names.
     """
     if not isinstance(_store, LocalStore):
         return
     if fn is None:
         _store.clear()
         return
-    raw = getattr(fn, "__wrapped__", None)
-    if not getattr(fn, "_valuekit_pure", False) or raw is None:
+    if not getattr(fn, "_valuekit_pure", False):
         raise TypeError(
             f"clear_cache() takes a @pure-decorated function; got "
             f"{getattr(fn, '__qualname__', fn)!r}"
         )
-    units = {_unit_digest(raw.__code__)}
-    mod = sys.modules.get(getattr(raw, "__module__", "") or "")
-    if mod is not None:
-        u = _module_unit(mod)
-        if u:
-            units.add(u)
-    try:
-        value_hash = content_hash(raw)
-    except Exception:
-        value_hash = None
-    _store.drop_dependents(units, value_hash)
-
-
-# Every stored entry is salted with this, so bumping it invalidates every
-# cache everywhere.  Bump it when a release changes what a fingerprint or a
-# trace means; releases that do not are then free to leave caches intact.
-CACHE_EPOCH = 3
-
-
-def _salt() -> str:
-    return (
-        f"valuekit-epoch{CACHE_EPOCH}"
-        f"|py{sys.version_info.major}.{sys.version_info.minor}"
-    )
+    _store.drop_records(fn._valuekit_reachable().hash)
 
 
 # ---------------------------------------------------------------------------
@@ -163,9 +136,9 @@ def _salt() -> str:
 
 
 class _Frame:
-    """What the memoised call currently executing has bound so far.
+    """What the memoised call currently executing has recorded so far.
 
-    ``calls`` and ``logs`` go into its trace.  A ``discard`` frame belongs
+    ``calls`` and ``logs`` go into its call record.  A ``discard`` frame belongs
     to a debugger-forced run: it accepts nothing and stores nothing.
     """
 
@@ -178,49 +151,54 @@ class _Frame:
         self.discard = discard
 
 
-# The innermost executing call.  A context variable rather than a global:
+# The innermost executing call.  A contextvar rather than a global:
 # each thread sees its own, and the token reset in ``finally`` restores the
 # enclosing frame on any exit.  A spawned worker starts at None, which is
-# right: its root call has no enclosing computation in that process.
+# right: its root call has no enclosing call in that process.
 _ctx: ContextVar[_Frame | None] = ContextVar("valuekit_call", default=None)
 
 
-def _record_call(qn: str, fn_key: str, h: str) -> None:
-    """Note a completed memoised call in the enclosing computation, if any."""
+def _note_call(qn: str, function_hash: str, h: str) -> None:
+    """Note a completed memoised call in the enclosing call, if any."""
     frame = _ctx.get()
     if frame is not None and not frame.discard:
-        frame.calls.append([qn, fn_key, h])
+        frame.calls.append([qn, function_hash, h])
 
 
-def log(name: str, value: Any) -> None:
-    """Bind *name* to *value* in the computation currently executing.
+def log(labels: Mapping, value: Any) -> None:
+    """Record *value* under *labels*, a small mapping saying what it is.
 
-    The value is stored like a result (it must be storable) and the binding
-    is recorded in the enclosing call's trace, so it is found again on every
-    later hit without the body running.  Read it back through
-    :func:`valuekit.batch`.
+    The labels are frozen to an :class:`ImmutableMap` and both they and
+    the value are stored like results (they must be storable).  The logged
+    value goes into this run's log at once and, inside a memoised call,
+    into the call's record as well, so a later hit emits it again without
+    the body running.  Read it back through :func:`valuekit.logs`.
 
-    Outside a memoised call there is no computation to bind to: with a cache
-    configured this raises, since a dropped log is worse than a refused one;
-    with none it does nothing, like everything else here.
+    valuekit gives no label key a meaning.  Outside a memoised call the
+    logged value goes to the run's log only.  With no cache configured
+    this does nothing, like everything else here.
     """
-    if not isinstance(name, str):
-        raise TypeError(f"log() name must be a str, got {type(name).__name__}")
+    if not isinstance(labels, Mapping):
+        raise TypeError(
+            f"log() takes a mapping as its labels, got {type(labels).__name__}"
+        )
     frame = _ctx.get()
-    if frame is None:
-        if _store is not None:
-            raise RuntimeError(
-                f"valuekit.log({name!r}, ...) was called outside a @pure "
-                "function; there is no computation to attach it to."
-            )
+    store = _store if frame is None else frame.store
+    if store is None:
         return
-    if frame.discard:
+    if frame is not None and frame.discard:
         return
-    frame.logs.append([name, frame.store.put_value(value)])
+    labels = freeze(labels)
+    labels_hash = store.put_value(labels)
+    value_hash = store.put_value(value)
+    keys = runlog.label_hashes(labels)
+    if frame is not None:
+        frame.logs.append([labels_hash, value_hash, keys])
+    runlog.emit(store, labels_hash, value_hash, keys)
 
 
 # ---------------------------------------------------------------------------
-# trace matching
+# call-record matching
 # ---------------------------------------------------------------------------
 
 
@@ -262,10 +240,10 @@ def _match_map(entries: list[dict], m: ImmutableMap) -> bool:
     return True
 
 
-def _match_trace(
-    trace: dict, arguments: dict[str, Any], arg_hashes: dict[str, str]
+def _match_record(
+    record: dict, arguments: dict[str, Any], arg_hashes: dict[str, str]
 ) -> bool:
-    deps = trace.get("deps", {})
+    deps = record.get("deps", {})
     if set(deps) != set(arguments):
         return False
     for name, dep in deps.items():
@@ -285,11 +263,11 @@ def _match_trace(
     return True
 
 
-def _matches(store: CacheStore, fn_key: str, arguments: dict, arg_hashes: dict):
-    """The stored traces that hold for these arguments, newest first."""
-    for h, trace in store.get_traces(fn_key):
-        if _match_trace(trace, arguments, arg_hashes):
-            yield h, trace
+def _matches(store: CacheStore, function_hash: str, arguments: dict, arg_hashes: dict):
+    """The stored call records that hold for these arguments, newest first."""
+    for h, record in store.get_records(function_hash):
+        if _match_record(record, arguments, arg_hashes):
+            yield h, record
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +287,7 @@ def pure(fn: Callable):
          happen.
       3. No mutation of the arguments. They are passed through as they
          were given, so a function that writes to one is not pure and the
-         trace recorded against it will be wrong.
+         call record recorded against it will be wrong.
       4. The result is reachable from the arguments plus the function's own
          definition (hashed: everything reachable by name through user
          code).
@@ -369,27 +347,23 @@ def _pure(fn: Callable, *, local: bool):
             )
 
     # The function's own code object is captured now, before any debugger
-    # patches its bytecode, but names are resolved and the fingerprint
+    # patches its bytecode, but names are resolved and the function hash
     # computed at the first call, when the module is fully loaded: definition
     # order does not matter, forward references are tracked, and mutual
     # recursion between @pure functions works.
     orig_code = fn.__code__
-    _ident: list = []  # [(fn_key, spans, units)] once computed; benign races
+    _reach: list = []  # [ReachableSet] once computed; benign races
 
-    def _identity() -> tuple[str, list, list]:
-        if not _ident:
-            fingerprint, spans, units = function_fingerprint(fn, code=orig_code)
-            fn_key = hashlib.blake2b(
-                (_salt() + "|" + fingerprint).encode(), digest_size=20
-            ).hexdigest()
-            _ident.append((fn_key, spans, units))
-        return _ident[0]
+    def _reachable():
+        if not _reach:
+            _reach.append(reachable_set(fn, code=orig_code))
+        return _reach[0]
 
     def _bind(args, kwargs):
         """Bind the call and hash its non-map arguments, once.
 
-        The same hashes match every candidate trace and then go into the
-        trace written for a miss, so what is recorded is the arguments as
+        The same hashes match every candidate call record and then go into the
+        call record written for a miss, so what is recorded is the arguments as
         they were passed.
         """
         bound = sig.bind(*args, **kwargs)
@@ -402,23 +376,27 @@ def _pure(fn: Callable, *, local: bool):
         }
         return bound, arguments, arg_hashes
 
-    def _hit(store, fn_key, arguments, arg_hashes, t_lookup):
-        """The first matching trace whose value loads, or None.
+    def _hit(store, function_hash, arguments, arg_hashes, t_lookup):
+        """The first matching record whose value loads and whose logged
+        values can all be emitted, or None.
 
-        Reports the hit and records it in the enclosing computation only
+        Reports the hit and records it in the enclosing call only
         once the value is in hand: a CacheMiss on the value falls through to
         the next candidate, and reporting a match before that would
-        overcount.
+        overcount.  The same for what the call record logged: a hit stands in for
+        the call only if it can put into the run's log everything the call
+        would have, nested calls included.
         """
-        for h, trace in _matches(store, fn_key, arguments, arg_hashes):
+        for h, record in _matches(store, function_hash, arguments, arg_hashes):
             try:
-                value = store.get_value(trace["result"])
+                value = store.get_value(record["result"])
+                runlog.reemit(store, function_hash, h, record)
             except CacheMiss:
-                continue  # value evicted/corrupt: try others, else rerun
-            runlog.record(
-                store, "hit", fn=qn, key=fn_key, dur=time.perf_counter() - t_lookup
+                continue  # value or a logged value evicted: try others, else rerun
+            events.record(
+                store, "hit", fn=qn, key=function_hash, dur=time.perf_counter() - t_lookup
             )
-            _record_call(qn, fn_key, h)
+            _note_call(qn, function_hash, h)
             return (value,)
         return None
 
@@ -428,7 +406,9 @@ def _pure(fn: Callable, *, local: bool):
         if store is None:
             return fn(*args, **kwargs)
 
-        fn_key, spans, units = _identity()
+        reach = _reachable()
+        function_hash, spans = reach.hash, reach.spans
+        runlog.current_run(store)  # the run begins with its first memoised call
 
         # In a worker whose store is the driver's, a @pure_local call is
         # the driver's to make: it has the environment, and it does its own
@@ -438,17 +418,17 @@ def _pure(fn: Callable, *, local: bool):
             if local_call is not None:
                 value, h = local_call(fn.__module__, qn, args, kwargs)
                 if h:
-                    _record_call(qn, fn_key, h)
+                    _note_call(qn, function_hash, h)
                 return value
 
-        # A live breakpoint in this function's closure: execute without
+        # A live breakpoint in this function's reachable set: execute without
         # reading or writing the cache, so nothing from a debug session can
         # enter the store.  The discard frame keeps log() calls in the body
         # from raising, and from writing.
         if breakpoints_force(spans):
             global _force_epoch
             _force_epoch += 1
-            runlog.record(store, "forced", fn=qn, key=fn_key)
+            events.record(store, "forced", fn=qn, key=function_hash)
             token = _ctx.set(_Frame(store, discard=True))
             try:
                 return fn(*args, **kwargs)
@@ -459,7 +439,7 @@ def _pure(fn: Callable, *, local: bool):
 
         # -- lookup ---------------------------------------------------------
         t_lookup = time.perf_counter()
-        found = _hit(store, fn_key, arguments, arg_hashes, t_lookup)
+        found = _hit(store, function_hash, arguments, arg_hashes, t_lookup)
         if found is not None:
             return found[0]
 
@@ -481,7 +461,7 @@ def _pure(fn: Callable, *, local: bool):
         except BaseException as e:
             # Report and re-raise unchanged: the cache is still untouched,
             # and a body that raises is otherwise invisible from outside.
-            runlog.record(store, "error", fn=qn, key=fn_key, exc=type(e).__name__)
+            events.record(store, "error", fn=qn, key=function_hash, exc=type(e).__name__)
             raise
         finally:
             _ctx.reset(token)
@@ -496,11 +476,11 @@ def _pure(fn: Callable, *, local: bool):
             # Something in this call's dynamic extent was debugger-forced
             # (a breakpoint appeared after our own entry check): this result
             # may reflect a debug session, so it must not be persisted.
-            runlog.record(
+            events.record(
                 store,
                 "miss",
                 fn=qn,
-                key=fn_key,
+                key=function_hash,
                 dur=time.perf_counter() - t_lookup,
                 exec=exec_dur,
                 stored=False,
@@ -517,8 +497,8 @@ def _pure(fn: Callable, *, local: bool):
                 deps[name] = {"kind": "map", "entries": recorders[name].finalize()}
             else:
                 deps[name] = {"kind": "value", "hash": arg_hashes[name]}
-        h = store.put_trace(
-            fn_key,
+        h = store.put_record(
+            function_hash,
             {
                 "fn": qn,
                 "deps": deps,
@@ -526,18 +506,17 @@ def _pure(fn: Callable, *, local: bool):
                 "calls": frame.calls,
                 "logs": frame.logs,
             },
-            units=units,
         )
-        runlog.record(
+        events.record(
             store,
             "miss",
             fn=qn,
-            key=fn_key,
+            key=function_hash,
             dur=time.perf_counter() - t_lookup,
             exec=exec_dur,
             stored=True,
         )
-        _record_call(qn, fn_key, h)
+        _note_call(qn, function_hash, h)
         return result
 
     def cached(*args, **kwargs):
@@ -545,33 +524,33 @@ def _pure(fn: Callable, *, local: bool):
 
         Raises :class:`CacheMiss` when nothing is stored, or when no cache
         is configured.  A hit counts as one in the run log and in the
-        enclosing computation, exactly as a hit inside a call would.
+        enclosing call, exactly as a hit inside a call would.
         """
         store = _store
         if store is None:
             raise CacheMiss(f"{qn}: no cache directory is configured")
-        fn_key, _, _ = _identity()
+        function_hash = _reachable().hash
         _, arguments, arg_hashes = _bind(args, kwargs)
-        found = _hit(store, fn_key, arguments, arg_hashes, time.perf_counter())
+        found = _hit(store, function_hash, arguments, arg_hashes, time.perf_counter())
         if found is None:
             raise CacheMiss(f"{qn}: no stored result for these arguments")
         return found[0]
 
     def _lookup(*args, **kwargs):
-        """Internal: the ``(trace_hash, trace)`` that holds for these
+        """Internal: the ``(record_hash, record)`` that holds for these
         arguments, or None.  Loads no value and records nothing."""
         store = _store
         if store is None:
             return None
-        fn_key, _, _ = _identity()
+        function_hash = _reachable().hash
         _, arguments, arg_hashes = _bind(args, kwargs)
-        return next(_matches(store, fn_key, arguments, arg_hashes), None)
+        return next(_matches(store, function_hash, arguments, arg_hashes), None)
 
     wrapper.uncached = fn  # override: call the raw function directly
     wrapper.cached = cached
     wrapper.__wrapped__ = fn
     wrapper._valuekit_pure = True
     wrapper._valuekit_local = local
-    wrapper._valuekit_identity = _identity
+    wrapper._valuekit_reachable = _reachable
     wrapper._valuekit_lookup = _lookup
     return wrapper

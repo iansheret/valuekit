@@ -1,22 +1,21 @@
 """Batch records: what a ``run_all`` produced, by name, for analysis code.
 
-A trace holds everything a computation bound -- its result, the memoised
-calls it made, its ``log()`` values -- but a trace is found by matching
+A call record holds everything a call recorded -- its result, the memoised
+calls it made, its logged values -- but a call record is found by matching
 arguments, and analysis code should not have to reconstruct arguments.  So
-``run_all`` writes a small record naming its root traces, and this module
+``run_all`` writes a small record naming its root call records, and this module
 reads it back::
 
     b = valuekit.batch("process")     # the newest batch of process()
     b[7]                              # the row for input 7
-    b[7]["detrend"]                   # what detrend returned inside it
-    b[7]["residuals"]                 # a value the function log()ged
-    b.column("rms")                   # one value per input, in input order
-    b.by("order")                     # rows grouped by a logged parameter
+    b[7].result                       # what process(7) returned
+    b.failures                        # (input, exception type, message)
+    b.logs.where(quantity="rms")      # what the batch's inputs logged
 
 Nothing here imports or runs the pipeline.  Staleness within a batch is
-impossible: every input ran under one fingerprint, which the record
+impossible: every input ran under one function hash, which the record
 carries.  Across code changes the question is only "has this batch been
-re-run since the edit", and the record's ``fingerprint`` answers it.
+re-run since the edit", and the record's ``function_hash`` answers it.
 
 Layout, under the cache directory::
 
@@ -36,25 +35,19 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
-from .store import CacheMiss, LocalStore, SerializationError, _atomic_write
+from .runlog import Logs, collect
+from .store import CacheMiss, LocalStore, SerializationError, _atomic_write, dirname_for
 from .values import content_hash
 
-__all__ = ["batch", "Batch", "Row", "BatchWriter"]
+__all__ = ["batch", "Batch", "CallRecord", "BatchWriter"]
 
 RECORD_VERSION = 1
-
-_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
-
-
-def _dirname(name: str) -> str:
-    return _UNSAFE.sub("_", name) or "_"
 
 
 def batches_dir(store: LocalStore) -> Path:
@@ -76,10 +69,10 @@ class BatchWriter:
         store: LocalStore,
         name: str,
         fn: str,
-        fn_key: str,
+        function_hash: str,
         inputs: list,
     ):
-        self.dir = batches_dir(store) / _dirname(name)
+        self.dir = batches_dir(store) / dirname_for(name)
         self.id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self.path = self.dir / self.id
         hashes: list[str | None] = []
@@ -92,7 +85,7 @@ class BatchWriter:
             "v": RECORD_VERSION,
             "name": name,
             "fn": fn,
-            "fn_key": fn_key,
+            "function_hash": function_hash,
             "n": len(inputs),
             "inputs": hashes,
             "started": time.time(),
@@ -103,15 +96,15 @@ class BatchWriter:
             if old.is_dir() and old.name != self.id:
                 shutil.rmtree(old, ignore_errors=True)
 
-    def outcome(self, index: int, trace: str | None, exc: BaseException | None) -> None:
-        record: dict[str, Any] = {"i": index}
+    def outcome(self, index: int, record: str | None, exc: BaseException | None) -> None:
+        outcome: dict[str, Any] = {"i": index}
         if exc is None:
-            record["trace"] = trace
+            outcome["record"] = record
         else:
-            record["error"] = type(exc).__name__
-            record["message"] = str(exc)
+            outcome["error"] = type(exc).__name__
+            outcome["message"] = str(exc)
         try:
-            _atomic_write(self.path / f"{index}.json", json.dumps(record).encode())
+            _atomic_write(self.path / f"{index}.json", json.dumps(outcome).encode())
         except Exception:
             pass
 
@@ -121,88 +114,47 @@ class BatchWriter:
 # ---------------------------------------------------------------------------
 
 
-def _short(qualname: str) -> str:
-    return qualname.rsplit(".", 1)[-1]
+class CallRecord:
+    """One call: a root input of a batch, or a call nested in one.
 
-
-class Row:
-    """One computation: a root input of a batch, or a call nested in one.
-
-    ``row[name]`` is the value bound to *name*: what the call of that name
-    returned, or what ``log(name, ...)`` recorded, anywhere in this
-    computation or the calls nested in it -- analysis code need not know
-    which step logged a value.  A name bound more than once gives a list,
-    in order.  ``row.calls`` narrows to one nested step when that matters.
-    Values load when asked for, and arrays arrive as memory maps.
+    ``row.result`` is what it returned, ``row.calls`` the memoised calls it
+    made, ``row.logs`` what it and they logged.  Values load when asked
+    for, and arrays arrive as memory maps.
     """
 
-    __slots__ = ("_store", "fn", "trace_hash", "_trace", "input", "index")
+    __slots__ = ("_store", "fn", "record_hash", "_doc", "input", "index")
 
-    def __init__(self, store, fn: str, trace_hash: str, trace: dict, input=None, index=None):
+    def __init__(self, store, fn: str, record_hash: str, record: dict, input=None, index=None):
         self._store = store
         self.fn = fn
-        self.trace_hash = trace_hash
-        self._trace = trace
+        self.record_hash = record_hash
+        self._doc = record
         self.input = input
         self.index = index
 
     def __repr__(self) -> str:
         where = f"[{self.index}]" if self.index is not None else ""
-        return f"Row({self.fn}{where})"
+        return f"CallRecord({self.fn}{where})"
 
     @property
     def result(self) -> Any:
-        return self._store.get_value(self._trace["result"])
+        return self._store.get_value(self._doc["result"])
 
     @property
-    def calls(self) -> list[Row]:
+    def calls(self) -> list[CallRecord]:
         out = []
-        for qn, fn_key, h in self._trace.get("calls", []):
+        for qn, function_hash, h in self._doc.get("calls", []):
             try:
-                out.append(Row(self._store, qn, h, self._store.get_trace(fn_key, h)))
+                out.append(CallRecord(self._store, qn, h, self._store.get_record(function_hash, h)))
             except CacheMiss:
                 continue  # swept, or cleared: the call is no longer readable
         return out
 
-    def names(self) -> list[str]:
-        """Every name bound in this computation or any call nested in it,
-        in order of first binding."""
-        seen: dict[str, None] = {}
-        self._collect_names(seen)
-        return list(seen)
-
-    def _collect_names(self, seen: dict) -> None:
-        for call in self.calls:
-            call._collect_names(seen)
-            seen.setdefault(_short(call.fn), None)
-        for name, _ in self._trace.get("logs", []):
-            seen.setdefault(name, None)
-
-    def _bindings(self, name: str) -> list:
-        """Every value bound to *name* here or in a nested call, in the
-        order the bindings were made: what a call bound inside itself comes
-        before the call's own result, and a level's logs follow its calls."""
-        found = []
-        for call in self.calls:
-            found.extend(call._bindings(name))
-            if call.fn == name or _short(call.fn) == name:
-                found.append(call.result)
-        for logged, h in self._trace.get("logs", []):
-            if logged == name:
-                found.append(self._store.get_value(h))
-        return found
-
-    def __getitem__(self, name: str) -> Any:
-        found = self._bindings(name)
-        if not found:
-            raise KeyError(f"{name!r} is not bound in {self!r}; names: {self.names()}")
-        return found[0] if len(found) == 1 else found
-
-    def get(self, name: str, default: Any = None) -> Any:
-        found = self._bindings(name)
-        if not found:
-            return default
-        return found[0] if len(found) == 1 else found
+    @property
+    def logs(self) -> Logs:
+        """What this call logged, nested calls included.  A part
+        that has been swept since is left out rather than failing."""
+        return Logs(self._store, items=collect(self._store, self._doc, strict=False))
 
 
 class Batch:
@@ -213,7 +165,7 @@ class Batch:
         self._path = path
         self.name: str = header["name"]
         self.fn: str = header["fn"]
-        self.fingerprint: str = header["fn_key"]
+        self.function_hash: str = header["function_hash"]
         self.n: int = header["n"]
         self._input_hashes: list[str | None] = header["inputs"]
         self.started: float = header.get("started", 0.0)
@@ -271,12 +223,12 @@ class Batch:
         inputs = self.inputs
         return [inputs[i] for i in range(self.n) if i not in self._outcomes]
 
-    def _row(self, i: int) -> Row | None:
+    def _row(self, i: int) -> CallRecord | None:
         o = self._outcomes.get(i)
-        if o is None or "error" in o or not o.get("trace"):
+        if o is None or "error" in o or not o.get("record"):
             return None
         try:
-            trace = self._store.get_trace(self.fingerprint, o["trace"])
+            record = self._store.get_record(self.function_hash, o["record"])
         except CacheMiss:
             return None
         inputs = self._input_hashes
@@ -286,17 +238,17 @@ class Batch:
                 x = self._store.get_value(inputs[i])
             except CacheMiss:
                 pass
-        return Row(self._store, self.fn, o["trace"], trace, input=x, index=i)
+        return CallRecord(self._store, self.fn, o["record"], record, input=x, index=i)
 
     @property
-    def rows(self) -> list[Row]:
+    def rows(self) -> list[CallRecord]:
         """The rows of inputs that finished successfully, in input order."""
         return [r for r in (self._row(i) for i in range(self.n)) if r is not None]
 
-    def __iter__(self) -> Iterator[Row]:
+    def __iter__(self) -> Iterator[CallRecord]:
         return iter(self.rows)
 
-    def __getitem__(self, x: Any) -> Row:
+    def __getitem__(self, x: Any) -> CallRecord:
         """The row for input *x*, matched by content."""
         h = content_hash(x)
         for i, ih in enumerate(self._input_hashes):
@@ -309,23 +261,15 @@ class Batch:
                 return row
         raise KeyError(f"{x!r} is not an input of {self!r}")
 
-    def column(self, name: str) -> list:
-        """The value bound to *name* for each input, in input order; None
-        where the input has no row or no such binding."""
-        return [None if r is None else r.get(name) for r in (self._row(i) for i in range(self.n))]
-
-    def by(self, name: str) -> dict:
-        """Rows grouped by the value bound to *name*."""
-        out: dict = {}
+    @property
+    def logs(self) -> Logs:
+        """What the batch's finished inputs logged, as :func:`valuekit.logs`
+        would show it: every logged value their call records hold, nested calls
+        included.  A part that has been swept since is left out."""
+        items: list = []
         for r in self.rows:
-            v = r.get(name, _ABSENT)
-            if v is _ABSENT:
-                continue
-            out.setdefault(v, []).append(r)
-        return out
-
-
-_ABSENT = object()
+            items.extend(collect(self._store, r._doc, strict=False))
+        return Logs(self._store, items=items)
 
 
 def batch(name: str, cache_dir: str | os.PathLike | None = None) -> Batch:
@@ -342,7 +286,7 @@ def batch(name: str, cache_dir: str | os.PathLike | None = None) -> Batch:
             raise LookupError("no cache directory is configured; pass cache_dir=")
     else:
         store = LocalStore(cache_dir)
-    d = batches_dir(store) / _dirname(name)
+    d = batches_dir(store) / dirname_for(name)
     try:
         batch_id = (d / "latest").read_text().strip()
         header = json.loads((d / batch_id / "header.json").read_bytes())

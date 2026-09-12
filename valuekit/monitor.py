@@ -1,6 +1,6 @@
 """Watch a running pipeline: ``python -m valuekit.monitor <cache-dir>``.
 
-Reads the run-log files :mod:`valuekit.runlog` writes under ``<cache>/runs/``
+Reads the event-log files :mod:`valuekit.events` writes under ``<cache>/events/``
 and redraws a summary a few times a second.  It is a separate process with
 its own lifetime, so it can be started twenty minutes into a run, left open
 across several, or run over ssh on the machine doing the work.  Watching
@@ -11,17 +11,19 @@ promises and the one thing that is otherwise invisible -- a step that ought
 to be hitting and silently is not looks exactly like a slow step.
 
 The monitor also shows where work is going and lets you change it.  The
-placement *mode* (see :mod:`valuekit.placement`) is one word in a file in
-the cache directory; keys ``l``, ``r`` and ``a`` write ``local``, ``remote``
-or ``all`` there, and that file is the only thing the monitor ever writes.
-The driver reads it whenever it starts a task and records the mode it is
-applying, so the header shows both the mode asked for and the mode in
-force; they differ until the next task starts, or while no driver is
-running.  ``--mode <mode>`` writes the file and exits, for scripts.
+*mode* (see :mod:`valuekit.placement`) is a line in the project's local
+file, ``valuekit.local.toml``; keys ``l``, ``r`` and ``a`` set it to
+``local``, ``remote`` or ``all``, and that line is the only thing the
+monitor ever writes.  The driver reads the file whenever it starts a task
+and records the mode it is applying, so the header shows both the mode
+asked for and the mode in force; they differ until the next task starts,
+or while no driver is running.  ``--mode <mode>`` sets the line and exits,
+for scripts.
 
 The cache directory is taken as an argument, falling back to
-``$VALUEKIT_CACHE``.  There is no remembered location, because remembering
-one would mean writing outside the cache directory.
+``$VALUEKIT_CACHE``.  The project is the one enclosing the current
+directory; run the monitor from inside the project, or the mode is shown
+as unknown and the keys do nothing.
 """
 
 from __future__ import annotations
@@ -64,7 +66,7 @@ class _State:
         self.failures: list[tuple] = []
         self.placement: dict[str, dict] = {}  # source -> the latest placement event
         self.hosts: dict[tuple, dict] = {}  # (source, host) -> readiness
-        self.per_host: dict[str, dict[str, dict]] = {}  # source -> host -> counts
+        self.per_machine: dict[str, dict[str, dict]] = {}  # source -> host -> counts
 
     def apply(self, source: str, e: dict) -> None:
         ev = e.get("ev")
@@ -75,7 +77,7 @@ class _State:
         )
         run["last"] = max(run["last"], t)
 
-        if ev == "run":
+        if ev == "process":
             run["pid"] = e.get("pid")
             run["argv"] = e.get("argv") or []
             run["role"] = e.get("role", "driver")
@@ -106,18 +108,18 @@ class _State:
             return
 
         if ev == "start":
-            self._host_counts(source, e.get("host", "local"))["running"] += 1
+            self._machine_counts(source, e.get("machine", "local"))["running"] += 1
             return
 
         if ev == "requeue":
             # The host went away under this input; it will start again
             # elsewhere and be counted there.
-            counts = self._host_counts(source, e.get("host", "local"))
+            counts = self._machine_counts(source, e.get("machine", "local"))
             counts["running"] = max(0, counts["running"] - 1)
             return
 
         if ev == "outcome":
-            counts = self._host_counts(source, e.get("host", "local"))
+            counts = self._machine_counts(source, e.get("machine", "local"))
             counts["running"] = max(0, counts["running"] - 1)
             counts["done"] += 1
             if not e.get("ok", True):
@@ -153,8 +155,8 @@ class _State:
                 "capacity": e.get("capacity"),
             }
 
-    def _host_counts(self, source: str, host: str) -> dict:
-        return self.per_host.setdefault(source, {}).setdefault(
+    def _machine_counts(self, source: str, host: str) -> dict:
+        return self.per_machine.setdefault(source, {}).setdefault(
             host, {"running": 0, "done": 0, "failed": 0}
         )
 
@@ -260,24 +262,24 @@ def _render(
     if drivers:
         out.append("")
 
-    # Every place that is configured, applied, or has done anything.
+    # Every machine that is configured, applied, or has done anything.
     names: list[str] = []
     for name in (
         *configured,
         *(applied["capacities"] if applied else ()),
         *(h for s, h in state.hosts if s in scope),
-        *(h for s in scope for h in state.per_host.get(s, ())),
+        *(h for s in scope for h in state.per_machine.get(s, ())),
     ):
         if name not in names and name != "local":
             names.append(name)
     if names or applied:
         out.append("hosts")
-        out.append(f"  {'place':<16}{'capacity':>10}{'running':>9}{'done':>7}{'failed':>8}  state")
+        out.append(f"  {'machine':<16}{'capacity':>10}{'running':>9}{'done':>7}{'failed':>8}  state")
         for name in (*names, "local"):
             cap = applied["capacities"].get(name) if applied else None
             counts = {"running": 0, "done": 0, "failed": 0}
             for s in scope:
-                c = state.per_host.get(s, {}).get(name)
+                c = state.per_machine.get(s, {}).get(name)
                 if c:
                     for k in counts:
                         counts[k] += c[k]
@@ -424,19 +426,26 @@ class _Keys:
                 pass
 
 
-def _apply_key(root: Path, key: str | None) -> bool:
+def _apply_key(project: str | None, key: str | None) -> bool:
     """Act on one keystroke; return False when the key asks to quit."""
     if key is None:
         return True
     if key in ("q", "\x03"):
         return False
     mode = _KEYS.get(key.lower())
-    if mode is not None:
+    if mode is not None and project is not None:
         try:
-            placement.write_mode(root, mode)
+            placement.write_mode(project, mode)
         except OSError:
             pass
     return True
+
+
+def _project_here() -> str | None:
+    """The project enclosing the current directory, if any."""
+    from .sync import find_root
+
+    return find_root(os.path.join(os.getcwd(), "pyproject.toml"))
 
 
 # ---------------------------------------------------------------------------
@@ -448,10 +457,12 @@ def _usage() -> None:
     print(
         "usage: python -m valuekit.monitor [--mode local|remote|all] <cache-dir>\n"
         "       (or set VALUEKIT_CACHE)\n\n"
-        "The cache directory is the one passed to set_cache_dir(); the run\n"
-        "log is written under its runs/ subdirectory. Nothing is recorded for\n"
-        "a program that never configures a cache. --mode writes the placement\n"
-        "mode and exits; without it, keys l, r and a set the mode while watching.",
+        "The cache directory is the one passed to set_cache_dir(); the event\n"
+        "log is written under its events/ subdirectory. Nothing is recorded for\n"
+        "a program that never configures a cache. The mode is a line in the\n"
+        "valuekit.local.toml of the project enclosing the current directory:\n"
+        "--mode sets it and exits; without it, keys l, r and a set it while\n"
+        "watching.",
         file=sys.stderr,
     )
 
@@ -472,32 +483,38 @@ def main(argv: list[str] | None = None) -> int:
         _usage()
         return 2
     root_path = Path(os.path.expanduser(root))
+    project = _project_here()
 
     if mode is not None:
-        placement.write_mode(root_path, mode)
-        print(f"placement mode for {root_path}: {mode}")
+        if project is None:
+            print(f"no project (pyproject.toml or .git) encloses {os.getcwd()}", file=sys.stderr)
+            return 2
+        placement.write_mode(project, mode)
+        print(f"mode for {project}: {mode}")
         return 0
 
-    runs = root_path / "runs"
+    runs = root_path / "events"
     tail = _Tail(runs)
     state = _State()
     tty = sys.stdout.isatty()
     keys = _Keys()
     try:
-        configured = tuple(h.name for h in placement.load_hosts().hosts)
+        configured = tuple(h.name for h in placement.load_local(project).hosts)
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         configured = ()
+    if project is None:
+        print(f"no project encloses {os.getcwd()}: the mode cannot be shown or set", file=sys.stderr)
     print(f"watching {runs}", file=sys.stderr)
 
     try:
         while True:
-            if not _apply_key(root_path, keys.poll()):
+            if not _apply_key(project, keys.poll()):
                 return 0
             tail.poll(state)
             width, height = shutil.get_terminal_size((100, 40))
             lines = _render(
-                state, width, placement.read_mode(root_path), configured, keys.enabled
+                state, width, placement.read_mode(project, root_path) if project else "-", configured, keys.enabled
             )
             if tty:
                 # Home the cursor and clear to end of screen, rather than

@@ -3,9 +3,9 @@
 Disk memoisation for pure functions, plus an immutable map for the
 pipeline data they run over. Both apply the same idea: pipeline data as
 immutable *values*, identified by content. The two parts are independent;
-use either without the other. On top of them: a batch runner, a record of
-what each batch produced that analysis code reads by name, and a monitor
-for watching a run from another process.
+use either without the other. On top of them: a batch runner, a log of the
+values a run produced that analysis code reads back by their labels, and a
+monitor for watching a run from another process.
 
 The usual ways of caching a pipeline fail in one of two directions. If the
 key is too coarse (a file path, a manual version tag), results go stale silently and hits stop
@@ -19,7 +19,7 @@ recompute) and what the code actually is (edit a helper and everything
 that depends on it recomputes). What the tracking cannot see is a short
 documented list, each entry with a remedy, and an uncertain match
 recomputes rather than risk a stale result. Caching stays on under a
-debugger too: the cached prefix replays in milliseconds, the step under
+debugger too: the cached prefix is served in milliseconds, the step under
 the breakpoint executes and stops there, and nothing done while paused
 enters the cache.
 
@@ -57,7 +57,7 @@ decorator takes no options, so there is nothing to configure per function.
 
 Note that on a cache hit the function body does not run. Prints, plots,
 progress bars, and file writes inside a `@pure` function will not happen on
-replays. If a side effect matters, it does not belong in a pure function.
+hits. If a side effect matters, it does not belong in a pure function.
 
 ### The contract
 
@@ -66,7 +66,7 @@ definition on the current arguments would return. The user's promise: the
 result depends only on what the function reads from its arguments, plus its
 definition. "The definition" means everything reachable by name from the
 function's code; if go-to-definition in an IDE can reach it from the
-function, it is part of the function's *fingerprint*. Names are resolved at
+function, it is part of the function's *function hash*. Names are resolved at
 the function's first call, once the module is fully loaded, so definition
 order does not matter and mutual recursion works.
 
@@ -74,9 +74,9 @@ A result is recomputed when any of these change:
 
 | What changed | Why it is tracked |
 |---|---|
-| a key the call read (or probed and found absent) in a map argument | each call records a trace of exactly what it read |
+| a key the call read (or probed and found absent) in a map argument | each call records exactly what it read |
 | the content of any non-map argument | arguments are hashed whole |
-| the function's code, or any user function it calls, recursively (helpers, lambdas, methods of user classes, other `@pure` functions) | the recursive code hash |
+| the function's code, or any user function it calls, recursively (helpers, lambdas, methods of user classes, other `@pure` functions) | the recursive function hash |
 | an immutable module constant it uses (numbers, strings, tuples, frozensets, read-only arrays) | constants are part of the definition; `x / SPEED_OF_LIGHT` and `x / 299792458.0` invalidate identically |
 | default and closure values | part of the definition |
 | the version of an installed package it uses, or the Python version | package and standard-library boundaries contribute version markers |
@@ -84,13 +84,13 @@ A result is recomputed when any of these change:
 
 Whitespace, comments, and the function's name are not changes.
 
-A stale result is served when the change was invisible to the fingerprint.
+A stale result is served when the change was invisible to the function hash.
 This is the user's responsibility, by design:
 
-| Invisible to the fingerprint | Remedy |
+| Invisible to the function hash | Remedy |
 |---|---|
 | mutable globals (lists, dicts, sets, writeable arrays), whether rebound, mutated, or edited in source | make them constant (tuple, frozenset, `arr.flags.writeable = False`) or pass them as arguments |
-| dispatch through data: `getattr(mod, name)()`, registries, callables stored in structures | pass the function as an argument; functions are hashed by fingerprint, so lambdas work |
+| dispatch through data: `getattr(mod, name)()`, registries, callables stored in structures | pass the function as an argument; functions are hashed by function hash, so lambdas work |
 | file contents read inside the function | pass the data, or its path and a version, as arguments |
 | runtime purity violations: unseeded RNG or clock reads that reach the result, mutation of arguments or globals | none; these break the promise |
 
@@ -112,7 +112,7 @@ naming it recomputes).
 ### Native extensions
 
 A compiled extension (nanobind, pybind11, Cython, plain C) has no source to
-walk, so its binary is its identity. That matters where the version marker
+walk, so its binary is its marker. That matters where the version marker
 cannot stand in for it: a package installed from a released wheel changes
 only through a reinstall, which moves its version, while a package installed
 from a local directory — `pip install -e .` or `pip install .` — is rebuilt
@@ -127,7 +127,7 @@ runs, so editing a source file without rebuilding correctly changes nothing.
 The cost is one read of the file per build, on the order of a millisecond
 for a few megabytes.
 
-Decoration emits no warnings. Side effects in a `@pure` function (logging,
+Decoration emits no warnings. Side effects in a `@pure` function (printing,
 progress bars, metrics) are permitted by the contract precisely because
 they will not happen on a hit; whether that is acceptable is the user's
 decision.
@@ -233,22 +233,22 @@ configuration.
 - Absence is a dependency. `config.get("detrend", 0)` on a map without
   `"detrend"` records the absence; adding that key later invalidates, and
   adding other keys does not.
-- Conditional reads produce separate traces. A function that reads different
-  keys on different branches accumulates one trace per observed read-set,
+- Conditional reads produce separate call records. A function that reads different
+  keys on different branches accumulates one call record per observed read-set,
   each matched independently.
 - Every other argument (plain dicts, lists, arrays, scalars, tuples,
   lambdas, plain-data dataclasses) keys the cache by content hash, whole.
   Nothing observed how the function used it, so any change to it
   invalidates.
 - A map passed from one `@pure` call into a nested one is traced in both:
-  the inner call gets its own per-key trace, and the outer stays valid only
+  the inner call gets its own per-key call record, and the outer stays valid only
   for maps that would drive the inner the same way.
 
 ## Debugging
 
 Caching stays on while a debugger is attached. A hit is bypassed, and the
 function runs, only when a live breakpoint intersects the function or
-anything in its user-code dependency closure. Set a breakpoint in a step or
+anything in its reachable set. Set a breakpoint in a step or
 in one of its helpers and that step executes; clear the breakpoint and hits
 resume. Through nested `@pure` calls this applies to the path from the
 breakpoint to the root: a breakpoint in an inner function also forces its
@@ -311,7 +311,7 @@ Anything else raises, and points at `register_type`.
 
 Methods are the line because a method reached through an argument —
 `obs.magnitude()` — is an attribute name, so it resolves to nothing at
-module scope and never enters the calling function's fingerprint: edit it
+module scope and never enters the calling function's function hash: edit it
 and the cache would serve a stale result. So adding a method to a dataclass
 you already cache turns it into a `register_type` job, where you take on
 hashing it yourself. That cliff is deliberate.
@@ -324,7 +324,7 @@ miss rather than being rebuilt into something it no longer means.
 Caching a type is not the same as freezing it, so a dataclass still cannot
 go into an `ImmutableMap` without a `freeze_fn`.
 
-Every file is named by the hash of its content, traces included, and is
+Every file is named by the hash of its content, call records included, and is
 written whole: two processes writing the same entry write the same bytes
 under the same name, so directories can be shared between any number of
 processes, on Windows as well as POSIX, with nothing to coordinate. A
@@ -341,10 +341,10 @@ can go is everything the current code can no longer reach:
 python -m valuekit.sweep mypipeline.steps mypipeline.batches
 ```
 
-imports the named modules, takes the fingerprint of every `@pure` and
-`@pure_local` function they define, and deletes the traces and batch
-records of every other fingerprint, then every object that no remaining
-trace or batch names. Name every module whose results you want kept; a
+imports the named modules, takes the function hash of every `@pure` and
+`@pure_local` function they define, and deletes the call records and batch
+records of every other function hash, then every object that no remaining
+call record or batch names. Name every module whose results you want kept; a
 function that is not imported reads as gone. `--dry-run` reports without
 deleting, and `--cache` names the directory when the modules do not
 configure one.
@@ -394,17 +394,17 @@ everything succeeded, and it raises when something failed, so failures
 cannot be dropped by accident. ``.failures`` is for callers that handle
 failures explicitly and continue.
 
-Nothing is replayed automatically. To debug a failure, call the function
+Nothing is re-run automatically. To debug a failure, call the function
 on that one input yourself:
 
 ```python
-process_scenario(sid)         # the cached prefix replays in milliseconds;
+process_scenario(sid)         # the cached prefix is served in milliseconds;
                               # the failing step executes and raises here
 ```
 
 with a live stack and a working REPL. Choosing the input yourself is
 deliberate: which input fails first in a parallel batch differs from run
-to run, so an automatic replay would pick one arbitrarily.
+to run, so an automatic re-run would pick one arbitrarily.
 
 One debugger accommodation remains, because breakpoints do not reach
 worker processes. If a live breakpoint intersects anything reachable by
@@ -416,7 +416,7 @@ changes nothing on its own.
 Two rules for using other pools (joblib, dask, a bare executor) around
 ``@pure`` code: parallelise in the driver, between ``@pure`` calls, never
 inside a ``@pure`` function's body (reads performed in worker processes are
-not recorded, which produces traces with missing dependencies and therefore
+not recorded, which produces call records with missing dependencies and therefore
 stale results); and call ``set_cache_dir`` at module top level, since a call
 inside an ``if __name__ == "__main__":`` block, or in a notebook, does not
 reach spawn-based workers. (``run_all`` is exempt: it passes the cache
@@ -433,59 +433,92 @@ set_cache_dir(os.environ.get("VALUEKIT_CACHE"))   # None disables caching
 Nothing is cached until `set_cache_dir` is called: importing valuekit has no
 effect on its own.
 
-## Reading what a batch produced
+## Logging values
 
-Analysis code runs in a notebook or a separate script, often while the
-batch is still going, and should neither import the pipeline nor run any of
-it. It opens the batch by name:
-
-```python
-b = valuekit.batch("process")        # the newest batch of process()
-b[7]                                 # the row for input 7
-b[7].result                          # what process(7) returned
-b[7]["detrend"]                      # what detrend returned inside it
-b[7]["residuals"]                    # a value the function logged
-b.column("rms")                      # one value per input, in input order
-b.by("order")                        # rows grouped by a logged parameter
-b.failures                           # (input, exception type, message)
-b.pending                            # inputs with no outcome yet
-```
-
-A computation binds names to values, and a row is indexed by those names.
-Two things bind a name. A memoised call made inside the function binds its
-function name to its result, with no action needed: `b[7]["detrend"]` works
-because `process` called `detrend`. And `log(name, value)` binds a name
-explicitly, for a value the function does not return:
+Processing code and the code that looks at what it produced belong in
+different places. A pipeline step should not know what will be plotted,
+and a plotting script should neither import the pipeline nor run any of
+it. What joins them is `log`:
 
 ```python
 from valuekit import log
 
 @pure
 def analyse(obs, cfg):
-    log("order", cfg["order"])          # a parameter worth grouping by
     residuals = fit(obs, cfg)
-    log("residuals", residuals)         # an intermediate worth plotting
+    log({"quantity": "residuals", "sid": obs["sid"], "filter": cfg["filter"]}, residuals)
     return summarise(residuals)
 ```
 
-A name is found at any depth, so `b[7]["residuals"]` does not care which
-step logged it; `row.calls` narrows to one step when that matters. A name
-bound more than once gives a list, in order. Logged values must be
-storable, like results, and arrays come back as memory maps. `log` outside a
-memoised call raises when a cache is configured, since a dropped log is
-worse than a refused one, and does nothing when none is.
+`log(labels, value)` records a value under *labels*: a small mapping
+that says what the value is, in whatever terms the code that reads it
+will use. valuekit gives no key any meaning, and prescribes nothing about
+how labels are built or passed around; a project wraps `log` in its own
+conventions. The value is stored like a result (it must be storable), and
+so are the labels, so label values are valuekit values: strings,
+numbers, tuples, maps. A label the step reads from an argument is a read
+like any other, so renaming an experiment in a config map recomputes the
+steps that log it.
 
-Bindings are recorded in the call's trace, beside its result. Nothing is
-replayed on a hit and nothing needs re-running: the trace a hit finds
-already carries what the run that recorded it bound. The batch record names
-each input's root trace and the fingerprint the batch ran under, so a batch
-cannot mix results from two versions of the code, and the only question
-across a code change is whether the batch has been re-run since. One file
-is written per finished input, so a batch is readable the moment its first
-input finishes; `b.refresh()` picks up the rest.
+The plotting script reads by *containment*: a logged value matches when
+its labels hold every key/value pair asked for, and may hold more.
 
-Batch records and the run log go in the cache directory with everything
-else, so there is nothing to configure and nothing recorded without a cache.
+```python
+L = valuekit.logs("physics")            # what the last run of physics.py produced
+sel = L.where(quantity="residuals")      # kwargs, or a mapping: where({"sid": 7})
+for logged in sel:
+    plot(logged.value, label=logged.labels["sid"])
+r = sel.where(sid=7).one().value         # exactly one logged value, or LookupError
+```
+
+Matching is exact by value, so `1` and `1.0` are different labels. A
+selection is iterable and can be narrowed again; `one()` refuses zero
+logged values or several. Every emission is its own logged value: the
+same labels logged twice give two, and a step that logs in a loop puts
+the step number in the labels if it matters, since order carries no
+meaning.
+
+What `logs("physics")` holds is the complete set of logged values the
+last run of that script produced, as if the code had run from scratch. A
+step that executes writes its logged values as it makes them; a step
+served from cache writes the ones its call record holds, nested calls
+included, without the body running. So a re-run after an edit shows
+exactly the current code's logged values, the unchanged steps' from cache
+and the edited steps' fresh, and nothing from before. A hit that can no
+longer produce all of its logged values (one swept since) is treated as a
+miss and recomputed. Each
+script keeps its own log, named by its file stem, and a run replaces the
+previous run of the same script; a debugging script never touches the main
+script's log. With one script logged under a cache, `logs()` needs no
+name. `log` outside a memoised call, in the driver script itself, goes to
+the log with no call record; with no cache configured it does nothing.
+
+A log is readable while its run is going: `L.refresh()` picks up new
+logged values. Arrays come back as memory maps. Logs go in `logs/` in the cache
+directory with everything else, so there is nothing to configure and
+nothing recorded without a cache.
+
+### Reading what a batch produced
+
+A batch has a record of its own, since its inputs are what analysis code
+compares across:
+
+```python
+b = valuekit.batch("process")        # the newest batch of process()
+b[7].result                          # what process(7) returned
+b[7].calls                           # the memoised calls it made, with their results
+b.logs.where(quantity="rms")         # what the batch's inputs logged
+b.failures                           # (input, exception type, message)
+b.pending                            # inputs with no outcome yet
+```
+
+The record names each input's root call record and the function hash the batch
+ran under, so a batch cannot mix results from two versions of the code,
+and the only question across a code change is whether the batch has been
+re-run since. One file is written per finished input, so a batch is
+readable the moment its first input finishes; `b.refresh()` picks up the
+rest. `b.logs` is read from the call records, so it is the batch's logged values whether
+its inputs ran or were answered from cache.
 
 ## Running on other machines
 
@@ -498,8 +531,8 @@ extension, and the network. Nothing of yours, valuekit included, is
 installed there beforehand: your project's own lock file says what the
 environment is, and the host builds it.
 
-The cache stays here: every value, trace and run-log record a remote worker
-produces is sent back over the connection, every lookup asks this machine,
+The cache stays here: every value, call record, logged value and event a
+remote worker produces is sent back over the connection, every lookup asks this machine,
 and `@pure_local` calls run here. Nothing you compute elsewhere has to be
 fetched, and the remote machine keeps no results. From the analysis code's
 point of view a batch that ran on three machines is indistinguishable from
@@ -511,9 +544,15 @@ without one is refused before anything is sent, and the refusal names the
 lock files valuekit understands. The lock pins the Python version and every
 dependency, so what the host builds is what you have.
 
-Hosts are declared once, in a TOML file named by `VALUEKIT_HOSTS`:
+Which machines a checkout may use is written in `valuekit.local.toml`,
+beside `pyproject.toml`. The file is about this checkout on this machine,
+not about the project, so add it to `.gitignore`; valuekit warns if git
+tracks it. A checkout without the file runs on this machine only.
 
 ```toml
+project = "residuals-experiment"              # optional; the project's directory name on each host
+mode = "all"                                  # optional; all, local or remote (below)
+
 [local]
 workers = 8                                   # optional; default: CPU count
 
@@ -534,14 +573,14 @@ default shell: leave that as `cmd.exe`, because PowerShell in that role
 strips the quotes the bootstrap command needs.
 
 What happens on the host: your project is sent as a source tree (tracked
-files plus untracked files that are not ignored, never build artefacts)
-into `source_root`, the lock tool syncs it there (for uv, `uv sync
+files plus untracked files that are not ignored, never build artefacts,
+never `valuekit.local.toml`) into `source_root/<project>`, the lock tool syncs it there (for uv, `uv sync
 --frozen`, for the same Python minor version you are running; uv fetches
 that interpreter if the host lacks it), and workers run in the environment
 that produced. A native extension is built on the host from the same
 sources, by the project's own build backend. Its binary differs from yours,
-and that is expected: an extension's identity in the fingerprint is the
-tree it was built from, which is the same everywhere. That does mean any
+and that is expected: an extension's marker in the function hash is the project
+hash of the tree it was built from, which is the same everywhere. That does mean any
 edit in the project re-keys functions that reach an extension, and that
 the key describes the sources rather than the binary, so a build backend
 that rebuilds on import (scikit-build-core with `editable.rebuild`, or
@@ -552,11 +591,21 @@ meson-python) is what keeps your own machine honest. Such a backend runs
 among the dependencies): an isolated build's tools vanish with it, and the
 build directory would still name them. Workers run in the environment
 activated, so whatever the lock installed beside the interpreter is on
-their PATH. Each version of the tree is kept immutable and synced once,
-and a host builds each version from scratch; an unchanged project costs
-one comparison.
+their PATH.
 
-Where work goes is a *mode*, one word in `<cache>/placement`:
+Each host keeps one directory per project, named by the project (the
+`project` key, else the name in `pyproject.toml`), and updates it in
+place: a run sends only the files whose content changed and the names of
+those removed, and touches nothing else there, so the build directory and
+the environment persist and a native extension rebuilds incrementally. An
+unchanged project costs one comparison. Two checkouts of one project that
+should not share a host directory give one of them a different `project`
+name. Because a host holds one version at a time, a run that updates the
+directory while an earlier batch is still using that host takes the host
+from that batch: the inputs already running there finish, the rest run
+elsewhere, and the reason is recorded once.
+
+Where work goes is a *mode*, the `mode` line of `valuekit.local.toml`:
 
 | mode | this machine | hosts |
 |---|---|---|
@@ -564,10 +613,10 @@ Where work goes is a *mode*, one word in `<cache>/placement`:
 | `local` | everything | nothing |
 | `remote` | nothing, unless no host is reachable | everything |
 
-The default is `all`: a host in the hosts file is there to be used, the
-way a core is. Switch it from the monitor (below) or with `python -m
-valuekit.monitor --mode remote <cache-dir>`. The driver re-reads the mode
-each time it starts a task, so a switch during a batch applies to the next
+The default is `all`: a host in the file is there to be used, the way a
+core is. Edit the line, switch it from the monitor (below), or run
+`python -m valuekit.monitor --mode remote <cache-dir>` from inside the
+project. The driver re-reads the file each time it starts a task, so a switch during a batch applies to the next
 task; tasks already running finish where they are. Preparing a host never
 holds the batch back: this machine starts at once and a host joins when it
 is ready (under `remote`, this machine waits for it instead). A host that
@@ -576,9 +625,9 @@ and the batch continues elsewhere. A host whose connection drops mid-batch
 loses nothing: the inputs that were running there run again elsewhere,
 once, and the host takes no more.
 
-`run_all` takes no argument about any of this. Where a computation ran must
+`run_all` takes no argument about any of this. Where a call ran must
 not be able to affect its result, so it cannot be named in code where a
-fingerprint could reach it.
+function hash could reach it.
 
 ## Watching a run
 
@@ -596,7 +645,7 @@ mode: all  (applied: all)        l local  r remote  a all  q quit
   pid 97702    process_scenarios.py         up 2.7s
 
 hosts
-  place             capacity  running   done  failed  state
+  machine           capacity  running   done  failed  state
   mac                      8        6      3       0  ready
   local                    4        3      2       1
 
@@ -617,14 +666,16 @@ The hit rate is the number to look at. Everything else is context for it.
 Start it whenever you like, including twenty minutes into a long run — it
 reads what has been recorded so far rather than needing to have been
 watching from the beginning. Watching has no effect on the run. The one
-thing the monitor writes is the placement mode, on a keystroke: `l`, `r`
-and `a` set `local`, `remote` and `all`. The header shows the mode asked
+thing the monitor writes is the `mode` line of the project's
+`valuekit.local.toml`, on a keystroke: `l`, `r` and `a` set `local`,
+`remote` and `all`. The project is the one enclosing the directory the
+monitor is run from. The header shows the mode asked
 for and, beside it, the mode the running driver has applied; they differ
-until the driver next starts a task. The `hosts` block shows each place's
+until the driver next starts a task. The `hosts` block shows each machine's
 capacity under the applied mode, what is running and finished there, and
 whether the host was reached.
 
-The run log goes in `runs/` inside the cache directory, one file per process, and
+The event log goes in `events/` inside the cache directory, one file per process, and
 nothing is recorded until `set_cache_dir` has been called — the same rule as
 everything else here. That does mean a `run_all` batch with no cache
 directory is not observable. The monitor takes the cache directory as an
@@ -635,7 +686,7 @@ fails a run, an unwritable directory just disables it, old run files are
 pruned, and a run that produces a huge number of records stops recording
 detail rather than filling a disk. It costs about 3 µs per `@pure` call —
 under a tenth of a cache hit, which is dominated by reading the function's
-trace file.
+call-record file.
 
 ## Install
 
@@ -646,6 +697,12 @@ pip install valuekit        # Python >= 3.11; depends only on numpy
 ## Development
 
 ```
-pip install -e ".[dev]"    # quoted: zsh globs the brackets
-pytest
+uv sync                    # the environment, from uv.lock, into .venv
+uv run pytest
 ```
+
+The repository is a locked project, like the ones it runs: `uv.lock` pins
+what the suite runs against, and the host tests build a test project's
+environment with `uv`, so it must be on the PATH. Without uv,
+`pip install -e ".[dev]"` (quoted: zsh globs the brackets) and `pytest`
+also work, but the host tests then skip.

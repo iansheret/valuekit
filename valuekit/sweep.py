@@ -2,12 +2,12 @@
 
 ``python -m valuekit.sweep mypipeline.steps mypipeline.batches``
 
-A trace belongs to a fingerprint, and a fingerprint belongs to code.  When
-the code changes, its old traces are never consulted again; they only
-occupy disk.  This command imports the named modules, takes the fingerprint
+A call record belongs to a function hash, and a function hash belongs to code.  When
+the code changes, its old call records are never consulted again; they only
+occupy disk.  This command imports the named modules, takes the function hash
 of every ``@pure`` and ``@pure_local`` function defined in them, and deletes
-every trace and batch record whose fingerprint is not among them, then
-every object that no remaining trace or batch names.
+every call record and batch record whose function_hash is not among them, then
+every object that no remaining record or batch names.
 
 Retention is by code version, never by age.  A result from a year ago whose
 function has not changed is as current as one from this morning, and is
@@ -16,7 +16,7 @@ more: it looks exactly like one somebody does, so it stays.
 
 The modules named must be every module that defines a memoised function
 whose results are wanted.  A function that is not imported here reads as
-gone, and its traces go with it -- the worst case is recomputation, as with
+gone, and its call records go with it -- the worst case is recomputation, as with
 every deletion in this library.  The cache directory is the one configured
 in those modules if they configure one, else ``--cache`` or ``$VALUEKIT_CACHE``.
 """
@@ -33,28 +33,29 @@ from pathlib import Path
 
 from .batches import batches_dir
 from .codec import children
+from .runlog import logs_dir
 from .store import LocalStore
 
 __all__ = ["sweep", "main"]
 
 
 def live_keys(modules: list[str]) -> set[str]:
-    """The fingerprint keys of every memoised function in *modules*."""
+    """The function hashes of every memoised function in *modules*."""
     keys: set[str] = set()
     for name in modules:
         mod = importlib.import_module(name)
         for obj in list(vars(mod).values()):
             if getattr(obj, "_valuekit_pure", False):
-                keys.add(obj._valuekit_identity()[0])
+                keys.add(obj._valuekit_reachable().hash)
     return keys
 
 
 def sweep(cache_dir: str | os.PathLike, modules: list[str], dry_run: bool = False) -> dict:
-    """Delete traces, batches and objects the functions in *modules* cannot
+    """Delete call records, batches and objects the functions in *modules* cannot
     reach.  Returns counts of what was (or would be) removed."""
     store = LocalStore(cache_dir)
     keys = live_keys(modules)
-    counts = {"functions": len(keys), "traces": 0, "batches": 0, "objects": 0}
+    counts = {"functions": len(keys), "records": 0, "batches": 0, "objects": 0}
 
     def remove(path: Path) -> None:
         if dry_run:
@@ -67,21 +68,22 @@ def sweep(cache_dir: str | os.PathLike, modules: list[str], dry_run: bool = Fals
             except OSError:
                 pass
 
-    # -- traces of functions that no longer exist in this form ------------
+    # -- call records of functions that no longer exist in this form ------------
     reachable: set[str] = set()
-    for entry in list(store.traces.iterdir()):
-        key = entry.name[:-5] if entry.name.endswith(".deps") else entry.name
+    for entry in list(store.records.iterdir()):
+        key = entry.name
         if key in keys:
             if entry.is_dir():
-                for h, trace in store.get_traces(key):
-                    reachable.add(trace["result"])
-                    reachable.update(h for _, h in trace.get("logs", []))
+                for h, record in store.get_records(key):
+                    reachable.add(record["result"])
+                    for entry in record.get("logs", []):
+                        reachable.update(entry[:2])  # the labels and the value
             continue
         if entry.is_dir():
-            counts["traces"] += sum(1 for _ in entry.glob("*.json"))
+            counts["records"] += sum(1 for _ in entry.glob("*.json"))
         remove(entry)
 
-    # -- batches recorded under those fingerprints --------------------------
+    # -- batches recorded under those function hashes --------------------------
     bdir = batches_dir(store)
     if bdir.exists():
         for name_dir in list(bdir.iterdir()):
@@ -95,7 +97,7 @@ def sweep(cache_dir: str | os.PathLike, modules: list[str], dry_run: bool = Fals
                     header = json.loads((run / "header.json").read_bytes())
                 except (OSError, ValueError):
                     header = {}
-                if header.get("fn_key") in keys:
+                if header.get("function_hash") in keys:
                     kept.append(run.name)
                     reachable.update(h for h in header.get("inputs", []) if h)
                 else:
@@ -109,6 +111,22 @@ def sweep(cache_dir: str | os.PathLike, modules: list[str], dry_run: bool = Fals
                 remove(name_dir / "latest")
             if not dry_run and not kept:
                 remove(name_dir)
+
+    # -- what the run logs name: a value logged outside any memoised call has
+    # no call record, and a run's log is kept whatever the code did since
+    ldir = logs_dir(store)
+    if ldir.exists():
+        for p in ldir.rglob("*.jsonl"):
+            try:
+                lines = p.read_bytes().splitlines()
+            except OSError:
+                continue
+            for raw in lines:
+                try:
+                    d = json.loads(raw)
+                    reachable.update((d["labels"], d["v"]))
+                except (ValueError, KeyError, TypeError):
+                    continue
 
     # -- objects nothing above names, transitively ----------------------------
     queue = list(reachable)
@@ -137,7 +155,7 @@ def sweep(cache_dir: str | os.PathLike, modules: list[str], dry_run: bool = Fals
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m valuekit.sweep",
-        description="Delete traces, batches and objects the current code cannot reach.",
+        description="Delete call records, batches and objects the current code cannot reach.",
     )
     ap.add_argument("modules", nargs="+", help="modules defining the memoised functions")
     ap.add_argument("--cache", help="cache directory (default: $VALUEKIT_CACHE)")
@@ -160,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     counts = sweep(cache, args.modules, dry_run=args.dry_run)
     verb = "would remove" if args.dry_run else "removed"
     print(
-        f"{counts['functions']} live functions; {verb} {counts['traces']} traces, "
+        f"{counts['functions']} live functions; {verb} {counts['records']} call records, "
         f"{counts['batches']} batches, {counts['objects']} objects"
     )
     return 0

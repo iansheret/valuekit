@@ -2,7 +2,7 @@
 
 Caching stays active while a debugger is attached.  A cache hit is bypassed
 only when a live breakpoint intersects the code of the function (or of
-anything in its user-code dependency closure): setting a breakpoint in a
+anything in its reachable set): setting a breakpoint in a
 step, or in a helper it calls, makes that step execute; clearing the
 breakpoint restores hits.  Forced runs never write to the store, so nothing
 done in a debug session (evaluating expressions, modifying locals, dropping
@@ -98,7 +98,7 @@ def breakpoints_force(spans: Iterable[tuple[str, int, int]]) -> bool:
     """True if the current debug state requires executing instead of hitting.
 
     *spans* are (filename, first_line, last_line) for every code object in a
-    @pure function's dependency closure (collected at decoration time).
+    @pure function's reachable set (collected at decoration time).
     """
     if os.environ.get("VALUEKIT_ALWAYS_RUN"):
         return True

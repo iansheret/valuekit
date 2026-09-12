@@ -27,50 +27,54 @@ with `uv sync` from a lock file. The suite therefore needs `uv` on the PATH.
    provides the toolchain (a Python 3 to start with, the lock tool, a compiler, the
    network); the project provides everything else through its lock file, valuekit
    included. The host builds the environment; the project builds its own extension.
-2. **The user's model is "my machine has extra cores".** Hosts in the hosts file are used
+2. **The user's model is "my machine has extra cores".** Hosts in the local file are used
    by default. Preparing one never holds work back. A host that dies loses nothing.
-3. **The design extends to serverless.** The connection is a seam; the bootstrap is a
+3. **The design extends to serverless.** The connection is one interface; the bootstrap is a
    container entrypoint; requeue on connection loss is what a recycled instance needs.
 
 ## What works today
 
-`run_all` runs a batch across this machine and any hosts named in the hosts file. The
-sequence for a host:
+`run_all` runs a batch across this machine and any hosts named in the project's
+`valuekit.local.toml`. The sequence for a host:
 
 1. The driver refuses before connecting if the project cannot go: no lock file valuekit
    knows, or user code outside the project tree (`sync.Project.refusal`).
 2. The driver opens one connection: `ssh -T -o BatchMode=yes <target> "<python> -c
    <stage 0>"`, where stage 0 is a one-line Python program that reads a script off stdin
    up to a NUL byte and runs it. The driver sends `valuekit/bootstrap.py` as that script.
-3. The bootstrap speaks a short JSON-line protocol on the same streams: it says whether it
-   already holds the tree, receives the tarball if not, extracts it under `source_root`,
-   runs the lock tool's sync in it (`uv sync --frozen --python <driver's minor>`), writes a
-   marker beside the tree naming the interpreter, and starts `python -m valuekit.host` from
-   that interpreter with `VALUEKIT_TREE` set, on the same streams, in the environment
+3. The bootstrap speaks a short JSON-line protocol on the same streams: it says whether
+   `source_root/<project>` already holds this project hash, else reports the files it has;
+   the driver sends the names to delete and a tar of the files whose hash differs; the
+   bootstrap applies both in place, runs the lock tool's sync (`uv sync --frozen --python
+   <driver's minor>`), writes the manifest beside the directory (project hash, interpreter,
+   every file's hash), and starts `python -m valuekit.host` from that interpreter with
+   `VALUEKIT_TREE` and `VALUEKIT_PROJECT_HASH` set, on the same streams, in the environment
    activated (its interpreter's directory first on `PATH`, `VIRTUAL_ENV` set).
-4. The host process greets with its salt, CPU count and pid. On a readiness channel the
-   driver sends its greeting (salt, function, fingerprint, tree id, import roots); the host
+4. The host process's first message carries its Python version, CPU count and pid. On a
+   readiness channel the driver sends HELLO (Python version, function, function hash, project hash,
+   import roots); the host
    starts `valuekit.worker --ready`, which puts the tree's roots on `sys.path`, imports the
-   function, audits that every user module came from the tree, and compares fingerprints.
+   function, checks that every user module came from the tree, and compares function hashes.
    Readiness runs on a thread per host; the batch never waits for it.
 5. Each task is a channel: one `valuekit.worker` per task. The worker's store is a
-   `WireStore`, so its values, traces and run-log records go to the driver, its lookups ask
+   `RemoteStore`, so its values, call records, logged values and events go to the driver, its lookups ask
    the driver, and a `@pure_local` call is sent to the driver to run there.
 6. The driver records each outcome under the host it ran on. An input whose host
-   connection closed is requeued elsewhere, once; a worker that exits with a code fails
-   its input as a local one would.
+   connection closed, or whose task worker was refused because a later run replaced the
+   host's copy of the project, is requeued elsewhere, once; a worker that exits with a
+   code fails its input as a local one would.
 
-The mode file (`<cache>/placement`) is read each time a task is started and defaults to
+The `mode` line of `valuekit.local.toml` is read each time a task is started and defaults to
 `all`. A switch to a mode that needs hosts not yet prepared starts their readiness; they
 join as they become ready.
 
 ## Layers
 
 ```
-Link          bytes to a process on the host       backend.ProcessLink (later: a socket)
+Connection    bytes to a process on the host       machines.ProcessConnection (later: a socket)
 bootstrap     tree -> environment -> host process   bootstrap.py, both halves, stdlib-only
 host          workers as numbered channels          host.py
-worker        verify identity, run one task         worker.py
+worker        check the function hash, run one task      worker.py
 store         the driver's store over the channel   remotestore.py
 ```
 
@@ -78,21 +82,22 @@ store         the driver's store over the channel   remotestore.py
 
 | File | Responsibility |
 |---|---|
-| `valuekit/parallel.py` | Scheduling: capacities per place from the mode file, deadlines, input ordering, failure attribution, requeue on host loss, cached-input short-circuit, batch recording. |
-| `valuekit/placement.py` | The hosts file, the mode file, capacities per mode, the worker environment allowlist. |
-| `valuekit/backend.py` | `Link`/`ProcessLink` (the connection), `LocalBackend` (a process per input), `HostBackend` (one link, a channel per task), and the handle that answers a worker's store requests and runs its `@pure_local` calls. |
+| `valuekit/parallel.py` | Scheduling: capacities per machine from the mode file, deadlines, input ordering, failure attribution, requeue on host loss, cached-input short-circuit, batch recording. |
+| `valuekit/placement.py` | The local file (hosts, worker cap, mode, project name), capacities per mode, the worker environment allowlist. |
+| `valuekit/machines.py` | `Connection`/`ProcessConnection`, `LocalMachine` (a process per input), `RemoteMachine` (one connection, a channel per task), and the handle that answers a worker's store requests and runs its `@pure_local` calls. |
 | `valuekit/bootstrap.py` | How a tree becomes an environment on a host: the lock-tool table, the layout under `source_root`, extraction, the sync, starting the host process. Both halves of its protocol. Stdlib only. |
 | `valuekit/host.py` | The host process: starts a worker per channel, multiplexes their streams, exits on EOF. |
 | `valuekit/worker.py` | The worker process: a readiness mode and a single-task mode; install, admit, audit. |
-| `valuekit/remotestore.py` | `WireStore`: the worker's side of the store, over its channel. |
-| `valuekit/wire.py` | Message framing, channel framing, and value transfer as content-addressed object graphs. |
+| `valuekit/remotestore.py` | `RemoteStore`: the worker's side of the store, over its channel. |
+| `valuekit/protocol.py` | Message framing, channel framing, and value transfer as content-addressed object graphs. |
 | `valuekit/codec.py` | The structural value format, and the child-hash walk the sweep uses. |
-| `valuekit/sync.py` | `Project` (the project as shipped, once per batch), manifest, tree identity, packing, import roots, and the path predicate that separates project from environment. |
-| `valuekit/codehash.py` | Fingerprints, including a native extension's identity as the tree it was built from. |
+| `valuekit/sync.py` | `Project` (the project as shipped, once per batch), manifest, project hash, packing, import roots, and the path predicate that separates project from environment. |
+| `valuekit/functionhash.py` | Function hashes (the hash of a function's reachable set), including a native extension's marker as the project hash of the tree it was built from. |
 | `valuekit/batches.py` | Batch records: written by `run_all`, read by `valuekit.batch()`. |
+| `valuekit/runlog.py` | The run's log: the values a run logged, under `logs/<script>/`, written as steps log or hit, read by `valuekit.logs()`. |
 | `valuekit/sweep.py` | Retention: delete what the current code cannot reach. |
-| `valuekit/runlog.py` | Records hits, misses, forced runs, errors, batch progress, placement, host and requeue events. |
-| `valuekit/monitor.py` | Reads the run log; shows and sets the placement mode. |
+| `valuekit/events.py` | Records hits, misses, forced runs, errors, batch progress, placement, host and requeue events. |
+| `valuekit/monitor.py` | Reads the event log; shows and sets the placement mode. |
 
 ## Decisions taken
 
@@ -110,7 +115,7 @@ project-configured prepare command (a hook by another name).
 
 **Dependencies are the project's job; the toolchain is the environment's.** This replaces
 "dependencies are the environment's job on both machines". The environment partition in
-the fingerprint still exists, populated by the sync rather than by a human.
+the function hash still exists, populated by the sync rather than by a human.
 
 **The bootstrap is stdlib-only and sent over the connection.** Nothing of valuekit's is
 on the host before the project's environment exists, and valuekit is one of the project's
@@ -119,23 +124,31 @@ to a NUL so nothing meant for the protocol is consumed ahead. The bootstrap stay
 host process's parent (spawn-and-wait on every platform, since `exec` is unreliable on
 Windows) and never touches the streams after the spawn. It is also a container entrypoint.
 
-**The tree is renamed into place before the sync, and the marker is written after.** An
-editable install records the directory it was made in, so syncing in a temporary
-directory would bake that path in. A directory without a marker is either being built by
-another driver (waited for) or debris (removed once older than an hour). A sync that fails
-removes the tree, so a retry starts clean.
+**One directory per project on a host, updated in place.** Each version of the tree used
+to get its own directory named by the project hash, which made every edit a from-scratch
+build of a native extension: CMake keys its cache on the source path. Now
+`source_root/<project>` is the one directory, its manifest beside it names the project hash
+it holds and every file's hash, and an update sends only the difference and touches
+nothing the manifest never listed, so `build/` and the environment persist. The manifest
+is removed before an update and written after; a lock file beside the directory says an
+update is in progress, a second driver waits for it, and a lock older than an hour is
+broken. A sync that fails keeps the tree and drops the manifest, so the next update starts
+from what is there. The cost is that a host holds one version at a time: a later run
+evicts an earlier batch from that host (its remaining inputs are requeued elsewhere, once,
+like a lost connection). The project hash still says whether a host is current and still
+stands for a native extension in the function hash.
 
-**A native extension's identity is the tree it was built from.** Each host builds its own
+**A native extension's marker is the project hash of the tree it was built from.** Each host builds its own
 binary from the same sources, so the tree is what they share; a key computed anywhere
 equals a key computed anywhere else with nothing sent between them. The cost is coarseness
 (any edit in the project re-keys functions that reach an extension) and reliance on the
 build being current: the key describes the sources, so a build backend that rebuilds on
-import is what keeps the driver honest. On a worker the identity is the tree's name,
+import is what keeps the driver honest. On a worker the hash is the tree's name,
 known before anything is imported. An extension with no project marker above it at all is
 identified by its binary, which is all there is.
 
 **Modes stay; the default is `all`; readiness never blocks.** On review, modes are a
-preset over per-place capacities, which is the shape the extra-cores model wants
+preset over per-machine capacities, which is the shape the extra-cores model wants
 underneath; the objection to them was aesthetic. What the model concretely requires was
 changed instead: configured hosts are used without a keystroke, local work starts at once
 and hosts join when ready, and (under `remote` only) this machine stays idle while a host
@@ -146,13 +159,13 @@ input is neither done nor failed; `@pure` makes the retry safe. A worker that ex
 code still fails its input, as locally. A second loss fails the input, so one that takes a
 host down each time does not cycle. `Handle.lost()` is the distinction.
 
-**The connection is a seam.** `Link` is two byte streams and how they ended;
-`ProcessLink` is the one implementation (a child process's pipes, whether the child is
-`python` here or `ssh`). A websocket later is another `Link`. Nothing above it changes.
+**The connection is one interface.** `Connection` is two byte streams and how they ended;
+`ProcessConnection` is the one implementation (a child process's pipes, whether the child is
+`python` here or `ssh`). A websocket later is another `Connection`. Nothing above it changes.
 
 **`run_all` gains no placement parameter.** Where work runs is configuration: the hosts
 file for what exists, the mode file for what is used. A host list in code could be reached
-by a fingerprint, and where a computation ran must not be able to affect its result.
+by a function hash, and where a call ran must not be able to affect its result.
 
 **`run_all` requires `@pure` or `@pure_local`.** A batch's results are recorded by the
 function that produced them, an already-cached input needs no worker, and a function whose
@@ -170,11 +183,16 @@ credential forwarding.
 no connection sharing, so a connection per task would cost a handshake per input. The host
 process multiplexes worker streams by channel and exits when its stdin closes.
 
-**The mode lives in the cache directory; the hosts file does not.** The mode changes from
-run to run and is safely reset by deleting the cache. The hosts file is authored once and
-must survive that.
+**Remote configuration is one file per checkout, `valuekit.local.toml`.** Hosts, the
+local worker cap, the mode and the project's host directory name. It replaced
+`VALUEKIT_HOSTS` and `<cache>/placement`: it is about this checkout on this machine, so it
+is ignored by git (valuekit warns if it is tracked), never shipped, and never hashed. It
+does not configure the cache; `set_cache_dir` stays in code, so a checkout that never uses
+other machines needs no file. A checkout that wants its own host directory, a git
+worktree say, sets `project`.
 
-**The monitor's only write is the mode file.** Watching has no effect on a run.
+**The monitor's only write is the `mode` line of that file.** Watching has no effect on a
+run. The monitor finds the project from the directory it is run in.
 
 **The worker environment is an allowlist.** What a process needs to start, plus
 `VALUEKIT_*` (which carries `VALUEKIT_TREE`). No `PYTHONPATH`, no credentials.
@@ -202,11 +220,12 @@ untested. A session fixture builds a valuekit wheel from the checkout, writes a 
 project depending on it by a relative path inside the tree, and locks it with uv once;
 every test tree gets those files. The cost is `uv` in CI and a few seconds per new tree.
 
-**Terminology.** "Source tree": the project's files on a host. "Tree id": its manifest
-hash, the tree's name and a native extension's identity. "Run log": the record of what
-happened during a run. "Trace": a memoised call's recorded reads, result, nested calls and
-log bindings. "Batch record": what `run_all` writes under a name. "Place": somewhere work
-can run, this machine included. "Mode": which places are used. "Link": the connection.
+**Terminology.** "Source tree": the project's files on a host, one directory per project.
+"Project hash": its manifest hash, what the host's manifest names and a native extension's marker. "Event log": the diagnostic record of
+what happened during a run, for the monitor. "Call record": a memoised call's recorded reads, result, nested calls and
+logged values. "Batch record": what `run_all` writes under a name. "Run": one driver
+process running a script. "Run log": the values a run logged, under `logs/`. "Machine": somewhere
+work can run, this one included. "Mode": which machines are used. "Connection": the link to a host.
 
 ## Outstanding work
 
@@ -244,7 +263,7 @@ work starting a second before the host joined. Two things to know when repeating
   for the passphrase under `BatchMode`, and is refused. A piped stdin is forwarded only
   when the process has a console (verified: a pty session works, `CREATE_NO_WINDOW` does
   not), which is why yesterday's `run1.cmd` through a non-pty session stalled at
-  "started" and left the "never ran the bootstrap" host event in the trial's run log.
+  "started" and left the "never ran the bootstrap" host event in the trial's event log.
 - The bootstrap finds uv in `~/.local/bin` on the Mac; the non-interactive PATH there is
   `~/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 - The trial's `venv` drives with the checkout as an editable install, so the driver side
@@ -258,15 +277,20 @@ C function, `editable.rebuild`, `build-dir = "build/{wheel_tag}"`, `cmake` and `
 from PyPI, non-isolated build; `drive.py` uses `parallel._host_commands` when
 `VALUEKIT_HOSTS` is unset, `hosts-mac.toml` and `hosts-pc.toml` otherwise). Copied to
 `/Users/ians/exttrial` and driven there in mode `remote`: the host built its own binary in
-its tree under `cache/source/<tree id>/build/`, readiness passed (the worker compares
-fingerprints and refuses a difference, so the keys matched), three inputs ran through the
-host in 3.1s from a cold tree. Editing `_core.c` (`s + 1`) produced a new tree id, a fresh
+its tree under `cache/source/<project hash>/build/`, readiness passed (the worker compares
+function hashes and refuses a difference, so they matched), three inputs ran through the
+host in 3.1s from a cold tree. Editing `_core.c` (`s + 1`) produced a new project hash, a fresh
 host build, and the changed sums, again in 3.0s; nothing was sent but sources. On the way
 the two findings above (activation; non-isolated build) were made and fixed or
-documented. Incremental rebuilds across trees are not available: each tree is a new
-directory and CMake refuses a build directory whose recorded source directory differs,
-so a host builds each version from scratch. For this project that is seconds; for a large
-one it is the cost of an edit, once per host.
+documented. At the time, incremental rebuilds across trees were not available: each tree
+was a new directory and CMake refuses a build directory whose recorded source directory
+differs, so a host built each version from scratch. Closed on 2026-09-12 by the
+one-directory-per-project decision above: repeated with the same project through a host
+process on this machine, an edit to `_core.c` reached the host as one file, the ninja log
+showed one object recompiled and relinked in the same build directory, and the results
+carried the edit. One defect found on the way: the tar carries no times, so a file written
+over an older tree read as older than the build, and a rebuild-on-import backend ran the
+old binary on the new source; extracted files now take the host's current time.
 
 **The extension across the two machines, both directions (2026-09-08).** The PC had no
 C compiler at all; Visual Studio Build Tools 2022 with the C++ workload (MSVC 14.44) was
@@ -276,7 +300,7 @@ installed for this through winget. Then:
   (scikit-build-core finds the compiler itself; no developer prompt) and, with
   `hosts-mac.toml`, three inputs ran on the Mac in 4.0s from a cold tree: a `.pyd` here,
   a `.so` there, readiness passed, so one key for both binaries.
-- *Mac driver, PC host.* The Mac's copy carries the `s + 1` edit, so its tree id is the
+- *Mac driver, PC host.* The Mac's copy carries the `s + 1` edit, so its project hash is the
   one the Mac's own same-machine trial had produced; the PC built that tree under sshd
   (elevated token, no console) with MSVC, using the Visual Studio generator (the binary
   sits under `build/<tag>/Release/`), and readiness passed: 22.7s cold including the
@@ -303,16 +327,16 @@ user's shell's job, as the README says.
 
 ### Correctness
 
-4. **`_salt()` covers only `major.minor`.** Adding `micro` converts a silent risk into an
-   explicit refusal, at the cost of a `CACHE_EPOCH` bump. Less pressing now that the
-   bootstrap asks the lock tool for the driver's minor.
+4. **The Python version marker covers only `major.minor`.** Adding `micro` converts a silent
+   risk into an explicit refusal, at the cost of a format-version bump. Less pressing now that
+   the bootstrap asks the lock tool for the driver's minor.
 
 5. **Verify a reported instability in `_unit_digest`** (a frozenset constant's `repr`
    varying with `PYTHONHASHSEED`). The evidence offered did not support the claim.
 
 ### Later
 
-6. **A websocket `Link` and a container image**, for Cloud Run services. The image is the
+6. **A websocket `Connection` and a container image**, for Cloud Run services. The image is the
    toolchain; the bootstrap is the entrypoint; requeue covers a recycled instance. The
    real limit is bandwidth to the driver's store; a bucket holding objects by hash would
    be a second tier, after the streaming version works.
@@ -336,11 +360,15 @@ case. Undecided.
 ## Checking that it still works
 
 ```
-.venv/Scripts/python.exe -m pytest -ra          # Windows; python -m pytest elsewhere
+uv sync && uv run pytest -ra
 ```
 
-`uv` must be on the PATH: the host tests build the test project's environment with it,
-and skip with a message when it is absent.
+The repository is itself a locked project: `uv.lock` pins the suite's environment, and
+CI syncs from it. The host tests build a test project's environment with `uv` (which
+must therefore be on the PATH; they skip with a message when it is absent), pinning
+numpy to the driver's version and Python to the driver's minor, because a package's
+version is part of the function hash of every function that uses it and a host whose
+numpy differed would refuse the driver's functions as out of sync.
 
 To exercise a host by hand without ssh, point the private hook at a Python on this
 machine and set a mode:
@@ -356,5 +384,5 @@ vk.run_all(mymodule.work, [1, 2, 3])          # mode defaults to "all"
 vk.batch("work")[1]
 ```
 
-With a hosts file at `$VALUEKIT_HOSTS`, drop the hook and `python -m valuekit.monitor
+With hosts in the project's `valuekit.local.toml`, drop the hook and `python -m valuekit.monitor
 <cache-dir>` shows the hosts block and switches modes with `l`, `r` and `a`.

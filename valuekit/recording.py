@@ -13,7 +13,7 @@ fine-grained invalidation: on a cache miss the map is wrapped in a
   deriving with ``|`` / ``assoc`` / ``dissoc``, and anything else that
   observes the whole map → whole-map dependency (conservative).
 
-The resulting trace is exactly the set of facts that must still hold for a
+The resulting record is exactly the set of facts that must still hold for a
 recorded result to be valid, which is what makes invalidation fine-grained:
 an unrelated new key changes none of the recorded facts.
 
@@ -21,11 +21,11 @@ RecordingMap *is* an ImmutableMap, sharing the underlying storage, so a
 function cannot distinguish one from the other: ``isinstance`` succeeds,
 equality and repr agree, and deriving with ``|`` yields a plain map exactly
 as it does outside a recorded call.  A proxy that escapes its call is inert
-rather than wrong — the recorder closes when the trace is finalised.
+rather than wrong — the recorder closes when the call record is finalised.
 
 A map handed from an outer @pure call into an inner one carries both
-recorders (each with its own path), so one read is recorded in both traces:
-the inner gets its own fine-grained trace, and the outer stays valid only
+recorders (each with its own path), so one read is recorded in both call records:
+the inner gets its own fine-grained record, and the outer stays valid only
 for maps that would drive the inner the same way.
 """
 

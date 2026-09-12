@@ -30,28 +30,31 @@ import numpy as np
 from .codec import decode, encode
 from .values import _blob, _read_blob, content_hash
 
-__all__ = ["WireError", "read_frame", "write_frame", "pack", "unpack"]
+__all__ = ["ProtocolError", "read_message", "write_message", "pack", "unpack"]
 
 # Bigger than any plausible message, small enough that a corrupt length is
 # refused rather than acted on.
-MAX_FRAME = 1 << 31
+MAX_MESSAGE = 1 << 31
 
-HELLO = b"\x01"  # driver -> worker: ids, tree id, import roots
-READY = b"\x02"  # worker -> driver: empty if admitted, else the reason
+HELLO = b"\x01"  # driver -> worker: ids, project hash, import roots
+READY = b"\x02"  # worker -> driver: empty if accepted, else the reason
 OBJECT = b"\x03"  # either way: one content-addressed object
 TASK = b"\x04"  # driver -> worker: the root hash of the input
 RESULT = b"\x05"  # worker -> driver: ok or error
-EVENT = b"\x06"  # worker -> driver: one run-log record
+EVENT = b"\x06"  # worker -> driver: one event
 
 # The worker's store is the driver's store.  These carry a worker's store
 # calls to the driver and the answers back; a worker holds nothing itself.
-TRACE = b"\x0a"  # worker -> driver: store this trace (fn key, doc, units)
-GET_TRACES = b"\x0b"  # worker -> driver: the traces of one fn key
-TRACES = b"\x0c"  # driver -> worker: the reply, as json pairs
+RECORD = b"\x0a"  # worker -> driver: store this call record (fn key, doc)
+GET_RECORDS = b"\x0b"  # worker -> driver: the call records of one fn key
+RECORDS = b"\x0c"  # driver -> worker: the reply, as json pairs
 GET_VALUE = b"\x0d"  # worker -> driver: send me this value's objects
 VALUE = b"\x0e"  # driver -> worker: empty once sent, or why not
 CALL = b"\x0f"  # worker -> driver: run this @pure_local call here
-CALLED = b"\x10"  # driver -> worker: its result root and trace hash, or error
+CALLED = b"\x10"  # driver -> worker: its result root and record hash, or error
+LOGGED = b"\x17"  # worker -> driver: one runlog line (a log() call there)
+REEMIT = b"\x18"  # worker -> driver: emit what this call record recorded (fn key, hash)
+REEMITTED = b"\x19"  # driver -> worker: empty once emitted, or why not
 
 # Between the driver and a host process (valuekit.host), which runs one
 # worker per task and carries each worker's stream as a numbered channel.
@@ -64,9 +67,9 @@ EXIT = b"\x16"  # host -> driver: channel id, exit code, stderr tail
 
 
 def channel(body: bytes) -> tuple[int, bytes]:
-    """Split a host-frame body into its channel id and the rest."""
+    """Split a host-message body into its channel id and the rest."""
     if len(body) < 4:
-        raise WireError("truncated channel frame")
+        raise ProtocolError("truncated channel message")
     return int.from_bytes(body[:4], "little"), body[4:]
 
 
@@ -74,7 +77,7 @@ def channelled(ch: int, rest: bytes = b"") -> bytes:
     return ch.to_bytes(4, "little") + rest
 
 
-class WireError(Exception):
+class ProtocolError(Exception):
     """The connection said something impossible. Never a cache miss."""
 
 
@@ -83,7 +86,7 @@ class WireError(Exception):
 # ---------------------------------------------------------------------------
 
 
-def write_frame(f: BinaryIO, tag: bytes, body: bytes = b"") -> None:
+def write_message(f: BinaryIO, tag: bytes, body: bytes = b"") -> None:
     f.write(_blob(tag, body))
     f.flush()
 
@@ -96,25 +99,25 @@ def _read_exact(f: BinaryIO, n: int) -> bytes:
         chunk = f.read(n - got)
         if not chunk:
             if got == 0:
-                return b""  # clean EOF between frames
-            raise WireError(f"stream ended {n - got} bytes into a frame")
+                return b""  # clean EOF between messages
+            raise ProtocolError(f"stream ended {n - got} bytes into a message")
         chunks.append(chunk)
         got += len(chunk)
     return b"".join(chunks)
 
 
-def read_frame(f: BinaryIO) -> tuple[bytes, bytes] | None:
+def read_message(f: BinaryIO) -> tuple[bytes, bytes] | None:
     """The next ``(tag, body)``, or None at a clean end of stream."""
     header = _read_exact(f, 9)
     if not header:
         return None
     tag = header[:1]
     n = int.from_bytes(header[1:9], "little")
-    if n > MAX_FRAME:
-        raise WireError(f"frame claims {n} bytes; refusing")
+    if n > MAX_MESSAGE:
+        raise ProtocolError(f"message claims {n} bytes; refusing")
     body = _read_exact(f, n) if n else b""
     if n and not body:
-        raise WireError("stream ended at a frame body")
+        raise ProtocolError("stream ended at a message body")
     return tag, body
 
 
@@ -169,7 +172,7 @@ def unpack(root: str, objects: dict[str, bytes], fallback=None) -> Any:
         except KeyError:
             if fallback is not None:
                 return fallback(h)
-            raise WireError(f"object {h} was never sent") from None
+            raise ProtocolError(f"object {h} was never sent") from None
         marker, data = payload[:1], payload[1:]
         if marker == _ARRAY_RO:
             arr = np.load(BytesIO(data), allow_pickle=False)
@@ -181,7 +184,7 @@ def unpack(root: str, objects: dict[str, bytes], fallback=None) -> Any:
             return np.load(BytesIO(data), allow_pickle=False)
         if marker == _STRUCT:
             return decode(data, get)
-        raise WireError(f"unknown object marker {marker!r}")
+        raise ProtocolError(f"unknown object marker {marker!r}")
 
     return get(root)
 
@@ -190,15 +193,15 @@ def send_value(f: BinaryIO, v: Any, seen: set[str]) -> str:
     """Send whatever of *v* the peer lacks; return the root hash."""
     root, objects = pack(v, seen)
     for h, payload in objects.items():
-        write_frame(f, OBJECT, bytes.fromhex(h) + payload)
+        write_message(f, OBJECT, bytes.fromhex(h) + payload)
         seen.add(h)
     return root
 
 
 def recv_object(body: bytes, objects: dict[str, bytes]) -> None:
-    """Record an OBJECT frame's contents."""
+    """Record an OBJECT message's contents."""
     if len(body) < 20:
-        raise WireError("truncated object frame")
+        raise ProtocolError("truncated object message")
     objects[body[:20].hex()] = body[20:]
 
 
@@ -206,17 +209,17 @@ _EXT = {_ARRAY_RO: ".npy", _ARRAY_RW: ".npyw", _STRUCT: ".bin"}
 
 
 def store_object(store, body: bytes) -> None:
-    """Write an OBJECT frame's contents into *store* as they are.
+    """Write an OBJECT message's contents into *store* as they are.
 
     An object's payload after its marker is byte-for-byte what the store
     writes for that value, so a peer's objects go in without a decode.
     """
     if len(body) < 21:
-        raise WireError("truncated object frame")
+        raise ProtocolError("truncated object message")
     try:
         ext = _EXT[body[20:21]]
     except KeyError:
-        raise WireError(f"unknown object marker {body[20:21]!r}") from None
+        raise ProtocolError(f"unknown object marker {body[20:21]!r}") from None
     store.put_object(body[:20].hex(), ext, body[21:])
 
 
@@ -231,6 +234,6 @@ def unstrings(body: bytes) -> list[str]:
         try:
             _, part, pos = _read_blob(body, pos)
         except ValueError as e:
-            raise WireError(str(e)) from None
+            raise ProtocolError(str(e)) from None
         out.append(part.decode("utf-8"))
     return out

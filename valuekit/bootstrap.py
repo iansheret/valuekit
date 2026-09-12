@@ -14,9 +14,12 @@ connection, a one-line Python program (:data:`STAGE0`) reads it and runs
 it, and it then speaks a short protocol on the same two streams::
 
     driver -> the source of this module, then a NUL byte
-    driver -> {"root": ..., "tree": <tree id>, "python": "3.13"}
-    host   -> {"have": bool}          whether the tree is already here
-    driver -> 8-byte length, tar      only if not
+    driver -> {"root": ..., "project": ..., "project_hash": <project hash>, "python": "3.13"}
+    host   -> {"have": true}                    the tree here is this one already
+            | {"have": false, "files": {...}}   what is here: relpath -> file hash
+    driver -> {"delete": [...], "files": {...}}  only if not have: what to remove,
+                                                 and the full new manifest
+    driver -> 8-byte length, tar                 the files whose hash differs
     host   -> {"ok": true, "python": <interpreter>} | {"ok": false, "reason": ...}
     host   -> python -m valuekit.host, from that interpreter, on these streams
 
@@ -33,14 +36,18 @@ row per tool.  Nothing above this module knows which row was used.  A tree
 with no lock valuekit knows is refused, and the refusal names the ones it
 does.
 
-The layout under the source root is one directory per tree, named by the
-tree's identity, and a marker file beside it holding the interpreter path.
-The marker is written last, so a directory without one is either being
-built by another driver or is debris; the first is waited for, the second
-is removed once it is old enough to be sure.  The tree is renamed into
-place *before* the sync runs, since an editable install records the
-directory it was made in.  A sync that fails removes the tree, so a retry
-starts clean rather than waiting on a marker that will never come.
+*One directory per project, updated in place.*  Under the source root each
+project has one directory, named by the project, and beside it a manifest
+file naming the project hash the directory holds, the interpreter the sync
+made, and every file with its hash.  A driver whose tree differs sends the
+files that changed and the names of those removed; nothing else in the
+directory is touched, so a build directory and the environment persist and
+a native extension rebuilds incrementally.  The manifest is removed before
+an update and written after, so a directory with no manifest is either
+being updated or was left by a failed sync; either way the next driver
+updates it in place.  A lock file beside the directory says an update is
+in progress; a second driver waits for it, then proceeds with its own if
+the tree is still not the one it wants.
 """
 
 from __future__ import annotations
@@ -53,7 +60,6 @@ import subprocess
 import sys
 import tarfile
 import time
-import uuid
 
 __all__ = [
     "KNOWN_LOCKS",
@@ -89,9 +95,8 @@ KNOWN_LOCKS = tuple(_TOOLS)
 # ampersand, pipe or angle bracket.
 STAGE0 = "import os;exec(b''.join(iter(lambda:os.read(0,1) or os._exit(1),bytes(1))))"
 
-_MAX_TREES = 10  # complete trees kept per source root
-_STALE = 3600  # seconds after which an unfinished tree is debris
-_WAIT = 600  # seconds to wait for another driver's tree to finish
+_STALE = 3600  # seconds after which a lock counts as abandoned
+_WAIT = 600  # seconds to wait for another driver's update to finish
 _TAIL = 64 << 10
 
 
@@ -129,15 +134,19 @@ def _script() -> bytes:
     return _source
 
 
-def offer(rx, tx, source_root: str, tree_id: str, py_minor: str, pack) -> str:
+def offer(rx, tx, source_root: str, project: str, project_hash: str, py_minor: str, entries, pack) -> str:
     """Bring the host at the far end of *rx*/*tx* to a running host process.
 
-    *pack* is called for the tree's tarball only if the host asks for it.
-    Returns "" once the host process is about to greet, else why not.
+    *entries* is the manifest, ``(relpath, hash)`` pairs; *pack* is called
+    with the subset of them the host lacks, only if it lacks any.  Returns
+    "" once the host process is about to send its first message, else why
+    not.
     """
     tx.write(_script() + b"\0")
     tx.write(
-        json.dumps({"root": source_root, "tree": tree_id, "python": py_minor}).encode()
+        json.dumps(
+            {"root": source_root, "project": project, "project_hash": project_hash, "python": py_minor}
+        ).encode()
         + b"\n"
     )
     tx.flush()
@@ -145,7 +154,12 @@ def offer(rx, tx, source_root: str, tree_id: str, py_minor: str, pack) -> str:
     if reply is None:
         return "the host's Python never ran the bootstrap"
     if not reply.get("have"):
-        data = pack()
+        theirs = reply.get("files") or {}
+        ours = dict(entries)
+        delete = sorted(set(theirs) - set(ours))
+        changed = [(rel, h) for rel, h in entries if theirs.get(rel) != h]
+        tx.write(json.dumps({"delete": delete, "files": ours}).encode() + b"\n")
+        data = pack(changed)
         tx.write(len(data).to_bytes(8, "little") + data)
         tx.flush()
     reply = _reply(rx)
@@ -207,6 +221,33 @@ def _send(obj: dict) -> None:
         data = data[n:]
 
 
+def _paths(root: str, project: str) -> tuple[str, str, str]:
+    """The tree directory, its manifest file and its lock file."""
+    tree = os.path.join(root, project)
+    return tree, tree + ".manifest", tree + ".lock"
+
+
+def _read_manifest(path: str) -> dict | None:
+    """The manifest at *path* if it is whole and its interpreter exists."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(m, dict) or not isinstance(m.get("files"), dict):
+        return None
+    python = m.get("python")
+    if not python or not os.path.exists(python):
+        return None
+    return m
+
+
+def _write_manifest(path: str, project_hash: str, python: str, files: dict) -> None:
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump({"project_hash": project_hash, "python": python, "files": files}, f)
+    os.replace(path + ".tmp", path)
+
+
 def _stale(path: str) -> bool:
     try:
         return time.time() - os.stat(path).st_mtime > _STALE
@@ -214,33 +255,42 @@ def _stale(path: str) -> bool:
         return False
 
 
-def _ready(marker: str) -> str | None:
-    """The interpreter a finished tree's marker names, if it still exists."""
-    try:
-        with open(marker, encoding="utf-8") as f:
-            python = f.read().strip()
-    except OSError:
-        return None
-    return python if python and os.path.exists(python) else None
+def _take_lock(lock: str) -> str:
+    """Hold *lock* for this update; wait for another driver's first.
 
-
-def _await(marker: str, tree: str) -> tuple[str, str]:
-    """Wait for another driver to finish the tree it is building."""
+    Returns "" once held, else why not.  A lock older than ``_STALE`` was
+    left by a driver that died and is removed.
+    """
     deadline = time.time() + _WAIT
-    while time.time() < deadline:
-        python = _ready(marker)
-        if python:
-            return python, ""
-        if not os.path.isdir(tree):
-            break
-        time.sleep(0.5)
-    return "", (
-        f"another driver was preparing {tree} and it did not finish. If nothing "
-        f"is running there, delete that directory and try again."
-    )
+    while True:
+        if _stale(lock):
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if time.time() > deadline:
+                return (
+                    f"another driver was updating this project ({lock} is held) and "
+                    "did not finish. If nothing is running there, delete that file."
+                )
+            time.sleep(0.5)
+            continue
+        os.close(fd)
+        return ""
+
+
+def _release_lock(lock: str) -> None:
+    try:
+        os.remove(lock)
+    except OSError:
+        pass
 
 
 def _extract(data: bytes, dest: str) -> str:
+    """Unpack *data* over *dest*, replacing files it names and no others."""
     try:
         tar = tarfile.open(fileobj=io.BytesIO(data), mode="r")
     except tarfile.TarError as e:
@@ -255,12 +305,44 @@ def _extract(data: bytes, dest: str) -> str:
                 or (len(m.name) > 1 and m.name[1] == ":")
             ):
                 return f"refusing to unpack {m.name!r}: not a plain file inside the tree"
-        os.makedirs(dest)
+        os.makedirs(dest, exist_ok=True)
         if hasattr(tarfile, "data_filter"):
             tar.extractall(dest, filter="data")
         else:
             tar.extractall(dest)  # every member was just checked
+        # The tar carries no times.  A file written over an older tree must
+        # read as newer than any build made from the old one, or a build
+        # backend that rebuilds on import sees nothing to do and the worker
+        # runs the old binary on the new source.
+        now = time.time()
+        for m in tar.getmembers():
+            try:
+                os.utime(os.path.join(dest, *m.name.split("/")), (now, now))
+            except OSError:
+                pass
     return ""
+
+
+def _delete(tree: str, rels) -> None:
+    """Remove the named files from *tree*; a path outside it is ignored."""
+    real = os.path.realpath(tree)
+    for rel in rels:
+        path = os.path.realpath(os.path.join(tree, *rel.replace("\\", "/").split("/")))
+        if not path.startswith(real + os.sep):
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        # Directories the manifest no longer reaches are left in place only
+        # if something else is in them.
+        parent = os.path.dirname(path)
+        while parent != real:
+            try:
+                os.rmdir(parent)
+            except OSError:
+                break
+            parent = os.path.dirname(parent)
 
 
 def _find(tool: str, search) -> str | None:
@@ -324,67 +406,42 @@ def _sync(tree: str, py_minor: str) -> tuple[str, str]:
     )
 
 
-def _prune(root: str) -> None:
-    """Keep the source root to a few finished trees; drop old debris."""
+def _prepare(
+    root: str, project: str, project_hash: str, py_minor: str, delete, files: dict, data: bytes
+) -> tuple[str, str]:
+    """Update the project's directory to *project_hash* and build its
+    environment; the interpreter, or why not.
+
+    *delete* names the files to remove, *files* is the full new manifest,
+    *data* a tar of the files whose content differs.  Holds the project's
+    lock throughout.  A driver that arrives while another holds the lock
+    waits; if the other driver's update produced this project hash there is
+    nothing left to do.
+    """
+    tree, manifest, lock = _paths(root, project)
+    os.makedirs(root, exist_ok=True)
+    reason = _take_lock(lock)
+    if reason:
+        return "", reason
     try:
-        names = os.listdir(root)
-    except OSError:
-        return
-    markers = []
-    for name in names:
-        path = os.path.join(root, name)
-        if name.endswith(".complete"):
-            try:
-                markers.append((os.stat(path).st_mtime, name[: -len(".complete")]))
-            except OSError:
-                pass
-        elif os.path.isdir(path) and name + ".complete" not in names and _stale(path):
-            shutil.rmtree(path, ignore_errors=True)  # unfinished, and old
-    markers.sort()
-    for _, tree_id in markers[: max(0, len(markers) - _MAX_TREES + 1)]:
-        shutil.rmtree(os.path.join(root, tree_id), ignore_errors=True)
+        current = _read_manifest(manifest)
+        if current is not None and current.get("project_hash") == project_hash:
+            return current["python"], ""  # another driver just did this
         try:
-            os.remove(os.path.join(root, tree_id + ".complete"))
+            os.remove(manifest)
         except OSError:
             pass
-
-
-def _prepare(root: str, tree_id: str, py_minor: str, data: bytes | None) -> tuple[str, str]:
-    """The tree's interpreter, building the environment if it is not there."""
-    tree = os.path.join(root, tree_id)
-    marker = tree + ".complete"
-    python = _ready(marker)
-    if python:
-        return python, ""
-    if data is None:
-        return _await(marker, tree)  # the driver was told it is here
-
-    os.makedirs(root, exist_ok=True)
-    _prune(root)
-    if os.path.isdir(tree) and _stale(tree):
-        shutil.rmtree(tree, ignore_errors=True)
-    tmp = os.path.join(root, ".tmp-" + uuid.uuid4().hex)
-    try:
-        reason = _extract(data, tmp)
+        _delete(tree, delete)
+        reason = _extract(data, tree)
         if reason:
             return "", reason
-        try:
-            os.rename(tmp, tree)
-        except OSError:
-            if os.path.isdir(tree):
-                return _await(marker, tree)  # someone else got there first
-            raise
+        python, reason = _sync(tree, py_minor)
+        if reason:
+            return "", reason  # the tree stays; the next update starts from it
+        _write_manifest(manifest, project_hash, python, files)
+        return python, ""
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-    python, reason = _sync(tree, py_minor)
-    if reason:
-        shutil.rmtree(tree, ignore_errors=True)
-        return "", reason
-    with open(marker + ".tmp", "w", encoding="utf-8") as f:
-        f.write(python + "\n")
-    os.replace(marker + ".tmp", marker)
-    return python, ""
+        _release_lock(lock)
 
 
 def main() -> int:
@@ -394,28 +451,35 @@ def main() -> int:
         return 1
     req = json.loads(line)
     root = os.path.expanduser(req["root"])
-    tree_id = req["tree"]
-    tree = os.path.join(root, tree_id)
-    have = _ready(tree + ".complete") is not None or (
-        os.path.isdir(tree) and not _stale(tree)
-    )
-    _send({"have": have})
-    data = None
-    if not have:
+    project = req["project"]
+    project_hash = req["project_hash"]
+    tree, manifest, _ = _paths(root, project)
+    current = _read_manifest(manifest)
+    have = current is not None and current.get("project_hash") == project_hash
+    if have:
+        _send({"have": True})
+        python, reason = current["python"], ""
+    else:
+        _send({"have": False, "files": current["files"] if current else {}})
+        line = _read_line()
         head = _read_exact(8)
         data = _read_exact(int.from_bytes(head, "little")) if head else None
-        if data is None:
+        if line is None or data is None:
             return 1
-    try:
-        python, reason = _prepare(root, tree_id, req["python"], data)
-    except Exception as e:  # anything else is still a reason, not a crash
-        python, reason = "", f"{type(e).__name__}: {e}"
+        change = json.loads(line)
+        try:
+            python, reason = _prepare(
+                root, project, project_hash, req["python"], change["delete"], change["files"], data
+            )
+        except Exception as e:  # anything else is still a reason, not a crash
+            python, reason = "", f"{type(e).__name__}: {e}"
     if reason:
         _send({"ok": False, "reason": reason})
         return 1
     _send({"ok": True, "python": python})
     env = dict(os.environ)
     env["VALUEKIT_TREE"] = tree
+    env["VALUEKIT_PROJECT_HASH"] = project_hash
     # The environment is activated, as a shell would: the tools the lock
     # installed beside the interpreter (cmake and ninja for an extension that
     # rebuilds on import, say) are on the PATH the workers see.  Nothing

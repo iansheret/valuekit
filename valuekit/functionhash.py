@@ -1,6 +1,6 @@
-"""Recursive code hashing.
+"""The function hash: a hash of everything a function reaches by name.
 
-A @pure function's identity is a content hash of everything **reachable by
+A @pure function's function hash is a content hash of everything **reachable by
 name** from its code: its own bytecode and constants, plus — recursively
 through user code — every function, class, module, and immutable constant
 its names resolve to.  The walk stops at boundaries:
@@ -9,7 +9,7 @@ its names resolve to.  The walk stops at boundaries:
   package invalidates; edits inside site-packages are invisible);
 * native extensions whose version cannot describe them -- anything installed
   from a local directory, editable or not, and so rebuilt in place --
-  contribute the identity of the project tree they were built from;
+  contribute the hash of the project tree they were built from;
 * the standard library contributes ``std:<module>`` (the Python version is
   already part of the global salt);
 * user modules referenced *as modules* (``mymod.helper()``) contribute a hash
@@ -22,15 +22,18 @@ its names resolve to.  The walk stops at boundaries:
   writeable arrays) are deliberately untracked and silent: @pure is the
   caller's promise that they never change or never matter.
 
-Names are resolved when the fingerprint is computed — at a @pure function's
+Names are resolved when the function hash is computed — at a @pure function's
 first call, once its module is fully loaded — so definition order does not
 matter and mutual recursion works.  The decorated function's own code
 object is captured at decoration time, before a debugger patches its
 bytecode.
 
-The same walk collects (filename, first_line, last_line) *spans* for every
-user code object in the closure; the debugger hook intersects live
-breakpoints against these to decide when a cache hit must be bypassed.
+The walk's product is the function's *reachable set*: its hash is the code
+hash that names the function's call records, and its spans (filename,
+first line, last line, one per user code object reached) are what the
+debugger hook intersects live breakpoints against to decide when a cache
+hit must be bypassed.  The Python major and minor version is a marker in
+the hash, since bytecode differs between versions on identical source.
 """
 
 from __future__ import annotations
@@ -47,37 +50,24 @@ import numpy as np
 
 from .values import _frame, _new_hasher, digest, freeze, hash_update
 
-__all__ = ["function_fingerprint"]
+__all__ = ["reachable_set", "ReachableSet", "PYTHON"]
 
 _MISSING = object()
 
-
-def _unit_digest(code: types.CodeType) -> str:
-    """Content digest of a single code object — the identity of one function
-    body, independent of its name, file, or line number.  Used by the
-    dependency index that makes clear_cache(fn) reach fn's callers."""
-    h = _new_hasher()
-    _frame(h, b"U", code.co_code)
-    _frame(h, b"n", ",".join(code.co_names).encode())
-    for c in code.co_consts:
-        if not isinstance(c, types.CodeType):
-            _frame(h, b"c", repr(c).encode("utf-8", "replace"))
-    return h.hexdigest()
+# The running interpreter's major and minor version: a marker in every code
+# hash, and what driver and host compare before comparing hashes.
+PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
-def _module_unit(mod: types.ModuleType) -> str | None:
-    """Content digest of a user module's source file, or None."""
-    fname = getattr(mod, "__file__", None)
-    if not fname:
-        return None
-    try:
-        with open(fname, "rb") as f:
-            src = f.read()
-    except OSError:
-        return None
-    h = _new_hasher()
-    _frame(h, b"M", src)
-    return h.hexdigest()
+class ReachableSet:
+    """Everything reachable by name from a function's code, as its hash and
+    the source spans of the user code objects in it."""
+
+    __slots__ = ("hash", "spans")
+
+    def __init__(self, hash: str, spans: list[tuple[str, int, int]]):
+        self.hash = hash
+        self.spans = spans
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +119,8 @@ def _dist_version(top: str) -> str | None:
 # released artefact changes only through a reinstall, which moves the
 # version -- the version is its marker.  One built from a local directory,
 # editable or not, is rebuilt in place under the same version, so something
-# else has to identify it: the *project it was built from*, as the identity
-# of that tree (see :func:`valuekit.sync.tree_id`).
+# else has to identify it: the *project it was built from*, as the hash
+# of that tree (see :func:`valuekit.sync.project_hash`).
 #
 # The sources rather than the binary, deliberately.  A batch may run on
 # several machines, and each builds its own binary from the same tree; the
@@ -143,12 +133,12 @@ def _dist_version(top: str) -> str | None:
 # is what keeps that honest, and is what a project needs anyway to be
 # checked out and run.
 #
-# On a worker the tree's identity is known before anything is imported (it
+# On a worker the tree's hash is known before anything is imported (it
 # is the name of the directory the tree was unpacked into), so it is set
 # once and no manifest is walked there.
 
-_source_id: str | None = None  # set on a worker; None on the driver
-_walk = threading.local()  # .tree_ids: identities computed by the walk in progress
+_project_hash_here: str | None = None  # set on a worker; None on the driver
+_walk = threading.local()  # .project_hashes: identities computed by the walk in progress
 
 
 def _is_extension_file(filename: str) -> bool:
@@ -186,16 +176,16 @@ def _is_live_extension(filename: str, top: str) -> bool:
     return dist is None or _dist_dir(dist) is not None
 
 
-def _source_identity(filename: str, top: str) -> str:
+def _source_project_hash(filename: str, top: str) -> str:
     """What stands for the live extension at *filename*.
 
-    The identity of the project it was built from, found through its
+    The hash of the project tree it was built from, found through its
     distribution's install directory, or failing that the nearest project
     marker above the binary.  An extension with no project around it at all
     is identified by its binary, which is all there is.
     """
-    if _source_id is not None:
-        return _source_id
+    if _project_hash_here is not None:
+        return _project_hash_here
     from . import sync
 
     dist = _distribution(top)
@@ -203,11 +193,11 @@ def _source_identity(filename: str, top: str) -> str:
     if root is None:
         root = sync.find_root(filename)
     if root is None:
-        return sync._file_digest(filename) or "?"
-    ids = getattr(_walk, "tree_ids", None)
+        return sync._file_hash(filename) or "?"
+    ids = getattr(_walk, "project_hashes", None)
     if ids is not None and root in ids:
         return ids[root]
-    tid = sync.tree_id(root)
+    tid = sync.project_hash(root)
     if ids is not None:
         ids[root] = tid
     return tid
@@ -256,8 +246,8 @@ def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
     if top == "valuekit":
         # This library is never user code, wherever it is installed from: a
         # user function naming ``log`` or ``ImmutableMap`` must not hash
-        # their module-level state.  CACHE_EPOCH, not a version marker,
-        # says when a valuekit change invalidates caches.
+        # their module-level state.  The store's format version, not a
+        # marker here, says when a valuekit change invalidates caches.
         return _PKG, "pkg:valuekit"
     if top and top in sys.stdlib_module_names:
         return _STD, f"std:{top}"
@@ -267,7 +257,7 @@ def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
     if filename and _is_live_extension(filename, top):
         # An extension rebuilt in place under a fixed version: the project
         # it was built from identifies it.
-        return _PKG, f"ext:{module_name}={_source_identity(filename, top)}"
+        return _PKG, f"ext:{module_name}={_source_project_hash(filename, top)}"
     if filename and _is_installed(filename, top):
         ver = _dist_version(top)
         return _PKG, f"pkg:{top}=={ver or '?'}"
@@ -313,7 +303,6 @@ class _Walker:
     def __init__(self) -> None:
         self.h = _new_hasher()
         self.spans: list[tuple[str, int, int]] = []
-        self.units: set[str] = set()  # closure membership, for clear_cache(fn)
         self.seen: set[int] = set()  # id() of code objects / classes / modules
 
     # -- helpers -----------------------------------------------------------
@@ -336,7 +325,7 @@ class _Walker:
     def _add_value(self, label: str, v: Any) -> None:
         """Content-hash a plain value, falling back to the marker of the
         extension that defines it: a nanobind function or a Cython class has
-        no other identity."""
+        no other marker."""
         if self._try_digest(label, v):
             return
         marker = _extension_marker(getattr(v, "__module__", None))
@@ -397,7 +386,6 @@ class _Walker:
             return
         self.seen.add(id(code))
         self.spans.append((code.co_filename, code.co_firstlineno, _code_end_line(code)))
-        self.units.add(_unit_digest(code))
 
         _frame(self.h, b"C", code.co_code)
         self._mark("names:" + ",".join(code.co_names))
@@ -476,9 +464,6 @@ class _Walker:
                 src = f.read()
             _frame(self.h, b"m", name.encode() + b"=" + src)
             self.spans.append((fname, 1, 1_000_000_000))  # whole-file span
-            u = _module_unit(mod)
-            if u:
-                self.units.add(u)
         except Exception:
             self._mark(f"opaque-module:{name}")
 
@@ -520,33 +505,27 @@ class _Walker:
                         self.add_function(f)
 
 
-def function_fingerprint(
-    fn: Callable,
-    *,
-    code: types.CodeType | None = None,
-) -> tuple[str, list[tuple[str, int, int]], list[str]]:
-    """Hash *fn* and everything reachable by name from its user code.
+def reachable_set(fn: Callable, *, code: types.CodeType | None = None) -> ReachableSet:
+    """Walk everything reachable by name from *fn*'s user code.
 
-    Returns ``(hex_hash, code_spans, unit_digests)``: the units name every
-    code object (and user-module source) in the walked closure, and feed the
-    on-disk dependency index that lets clear_cache(fn) reach fn's callers.
     *code* optionally overrides the function's own code object (used by
     @pure, which captures it at decoration time, before any debugger patches
     bytecode).
     """
-    # A tree's identity is computed at most once per walk, however many of
-    # its extensions the walk reaches; a walk nested in another (a function
+    # A tree's hash is computed at most once per walk, however many of its
+    # extensions the walk reaches; a walk nested in another (a function
     # hashed as a value) shares the outer one's.
-    outer = getattr(_walk, "tree_ids", None)
+    outer = getattr(_walk, "project_hashes", None)
     if outer is None:
-        _walk.tree_ids = {}
+        _walk.project_hashes = {}
     try:
         w = _Walker()
+        w._mark(f"python:{PYTHON}")
         w.add_function(fn, code=code)  # type: ignore[arg-type]
     finally:
         if outer is None:
-            _walk.tree_ids = None
-    return w.h.hexdigest(), w.spans, sorted(w.units)
+            _walk.project_hashes = None
+    return ReachableSet(w.h.hexdigest(), w.spans)
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +533,7 @@ def function_fingerprint(
 # ---------------------------------------------------------------------------
 #
 # A function passed as an argument to a @pure function is hashed by its code
-# fingerprint (including defaults and captured closure values), so lambdas
+# function_hash (including defaults and captured closure values), so lambdas
 # work as parameters. Functions are treated as immutable for freezing
 # purposes. They have no serialiser: a function may be an input, but cannot
 # appear inside a cached return value.
@@ -565,8 +544,7 @@ freeze.register(types.BuiltinFunctionType, lambda v: v)
 
 @hash_update.register
 def _h_function(v: types.FunctionType, h: Any) -> None:
-    fp, _, _ = function_fingerprint(v)
-    _frame(h, b"L", fp.encode("ascii"))
+    _frame(h, b"L", reachable_set(v).hash.encode("ascii"))
 
 
 @hash_update.register

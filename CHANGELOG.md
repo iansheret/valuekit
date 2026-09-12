@@ -7,24 +7,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## Unreleased
 
 Caches written by earlier versions are refused; delete the directory. The
-trace layout changed (each trace is now its own file) and a trace now
-records more than it did.
+call-record layout changed (each call record is its own file, under
+`records/`) and a call record now holds more than it did.
 
 ### Added
 
-- `log(name, value)` binds a name to a value inside a `@pure` function. The
-  value is stored like a result and the binding is recorded in the call's
-  trace, so it is found again on every later hit without the body running.
-  A memoised call made inside another is recorded the same way, under its
-  function name, with no call needed.
+- `log(labels, value)` records a value under a small mapping saying what
+  it is, and `valuekit.logs(script)` reads it back by containment:
+  `logs("physics").where(quantity="residuals", sid=7).one().value`. No key
+  means anything to valuekit; labels are the project's own terms. A
+  script's log is the complete set of logged values its last run produced,
+  as if the code had run from scratch: a step that executes writes its
+  logged values as it makes them, and a step served from cache writes what
+  its call record holds, nested calls included, so a re-run after an edit
+  shows the current code's logged values and nothing stale. Each script's
+  log replaces its previous run's and never touches another script's.
+  Every emission is its own logged value; order carries no meaning. This is
+  the boundary between processing code and the plotting code that reads it,
+  which imports nothing.
 
 - `run_all` records each batch under a name (default: the function's
   qualified name; `name=` to choose) and `valuekit.batch(name)` reads it
-  back: rows by input, values by name (`b[7]["detrend"]`, whether `detrend`
-  was a nested step or a `log` name, at any depth), a column across inputs,
-  rows grouped by a logged parameter, failures with their messages. Nothing
-  is imported or run to read a batch, and a batch can be read while it is
-  still running. Every input of a batch ran under one fingerprint, which the
+  back: rows by input with their results and nested calls, `b.logs` for
+  what the inputs logged, failures with their messages. Nothing is imported
+  or run to read a batch, and a batch can be read while it is still
+  running. Every input of a batch ran under one function hash, which the
   record carries, so a batch cannot mix results from two versions of the
   code.
 
@@ -41,19 +48,62 @@ records more than it did.
   an already-cached input without starting a worker.
 
 - `python -m valuekit.sweep <module>...` deletes what the current code can no
-  longer reach: traces and batches of functions whose fingerprint no
-  importable function produces, then objects no remaining trace or batch
+  longer reach: call records and batches of functions whose function hash no
+  importable function produces, then objects no remaining call record or batch
   names. Retention is by code version, not by age; nothing is removed for
   being old.
 
 - A running pipeline can be watched from a separate process.
   `python -m valuekit.monitor <cache-dir>` shows, live, the hit rate per
   function, batch progress, and failures. It attaches whenever you start it,
-  including part-way through a long run, and only ever reads. The run log is
-  written to `runs/` inside the cache directory; a batch run with no cache
+  including part-way through a long run, and only ever reads. The event log is
+  written to `events/` inside the cache directory; a batch run with no cache
   directory is therefore not observable. Writing it never fails a run.
 
 ### Changed
+
+- Remote configuration is one file per checkout, `valuekit.local.toml`
+  beside `pyproject.toml`: the hosts, this machine's worker cap, the mode
+  (`all`, `local` or `remote`) and the project's directory name on each
+  host. It replaces the `VALUEKIT_HOSTS` environment variable and the
+  `placement` file in the cache directory. It is per checkout, so it
+  belongs in `.gitignore` (valuekit warns if git tracks it); it is never
+  sent to a host and never hashed. A checkout that runs on this machine
+  only needs no file. The monitor's keys and `--mode` edit the file's
+  `mode` line and find the project from the current directory.
+
+- A host keeps one directory per project, updated in place. A run sends
+  only the files whose content changed and the names of those removed,
+  and touches nothing else in the directory, so a native extension's
+  build directory persists and it rebuilds incrementally; before, each
+  edit made a new directory named by the project hash and a from-scratch
+  build. A manifest beside the directory names the project hash it holds, and
+  a lock file serialises updates. A host holds one version at a time: a
+  later run that updates the directory takes the host from an earlier
+  batch still using it, whose remaining inputs run elsewhere, once.
+
+- Names say what things are. The *function hash* (was fingerprint, with a
+  salted key on top) names a function's *call records* (were traces), kept
+  under `records/`. `logs()` reads the *run's log* (was ledger); the
+  monitor reads the *event log* (was run log), under `events/`. A *logged
+  value* carries *labels* (were item and context). A *run* (was execution)
+  is one driver process. Work runs on a *machine* (was place, backend or
+  host); a *connection* carries *messages* (were link, wire and frame); a
+  function's *reachable set* (was closure) is what the function hash covers; a
+  *project hash* (was tree id) identifies a version of the project's files. Modules follow:
+  `runlog.py` holds the run's log, `events.py` the event log,
+  `protocol.py` the messages, `machines.py` the machines,
+  `functionhash.py` the function hash.
+
+- One function hash and one version number. The Python version is a marker
+  inside the function hash rather than a salt applied on top, and the store's
+  format version is the only version: the cache epoch is gone.
+
+- `clear_cache(fn)` deletes `fn`'s call records and nothing else. A
+  caller's record names one of them, so its next call cannot load its
+  subtree and recomputes; callers are reached transitively, each at its
+  next call. The per-function dependency index that found callers eagerly
+  is gone, with the code-object digests it was built on.
 
 - `run_all` requires a `@pure` or `@pure_local` function and raises
   `TypeError` otherwise. A batch's results are recorded by the function that
@@ -61,22 +111,29 @@ records more than it did.
   whose effects do not matter is the only kind that can safely run
   elsewhere.
 
-- Each trace is its own file, named by the hash of its content, under
-  `traces/<fnkey>/`. Two processes writing the same trace write the same
+- Each call record is its own file, named by the hash of its content, under
+  `records/<function hash>/`. Two processes writing the same record write the same
   bytes under the same name, so there are no appends and nothing to
-  coordinate. This fixes lost traces on Windows, where an append is not
+  coordinate. This fixes lost call records on Windows, where an append is not
   atomic, and makes a hit cost one `stat` instead of a re-read of the
-  function's whole trace file.
+  function's whole call-record file.
 
-- A trace records the memoised calls made inside it and its `log` bindings,
-  in order. Matching is unchanged.
+- A call record holds the memoised calls made inside it and its logged
+  values, in order. Matching is unchanged. A hit stands in for the call only
+  if it can emit everything the call logged; otherwise it is treated as a
+  miss.
 
 - The Windows CI job is gating. Besides the appends, three defects were
   fixed there: replacing an object file another process has memory-mapped
   is treated as the completed write it is; polling a killed worker's pipe
-  reports death instead of raising; and the pipe backend waits on reader
+  reports death instead of raising; and the host connection waits on reader
   threads rather than `select`, which Windows refuses for pipes and which
   made a batch spin forever.
+
+- The repository is a locked project: `uv.lock` pins the development
+  environment and CI syncs from it. The suite's test project pins numpy to
+  the driver's version and Python to the driver's minor, since a package
+  version is part of the function hash of every function using it.
 
 - `valuekit` itself is never classified as user code, wherever it is
   installed from, so a function naming `log` or `ImmutableMap` does not hash
@@ -84,7 +141,7 @@ records more than it did.
 
 ### Running on other machines
 
-- A batch can run on hosts declared in a TOML file named by `VALUEKIT_HOSTS`,
+- A batch can run on hosts declared in the project's `valuekit.local.toml`,
   over ssh, as if this machine had more cores. A host needs what a person
   would need to check the project out and run it: a Python 3 to start with,
   the project's lock tool, a compiler for an extension, and the network.
@@ -105,13 +162,13 @@ records more than it did.
   from, not its binary: each host builds its own from the same sources, so
   keys match across machines with nothing sent between them to make it so.
   Any edit in the project re-keys functions that reach an extension.
-- Where work goes is a mode, one word in `<cache>/placement`: `all` (the
-  default: every configured host, plus this machine), `local`, or `remote`
-  (as little here as possible). The driver re-reads it each time it starts a
-  task, so a switch mid-batch moves the next task. The monitor shows the
-  requested mode beside the mode the driver has applied, and sets it on a
-  keystroke; `--mode` sets it from a script. That file is the only thing
-  the monitor writes.
+- Where work goes is a mode, the `mode` line of `valuekit.local.toml`: `all`
+  (the default: every configured host, plus this machine), `local`, or
+  `remote` (as little here as possible). The driver re-reads it each time it
+  starts a task, so a switch mid-batch moves the next task. The monitor
+  shows the requested mode beside the mode the driver has applied, and sets
+  it on a keystroke; `--mode` sets it from a script. That line is the only
+  thing the monitor writes.
 - Preparing a host never holds the batch back: this machine starts at once
   and a host joins when ready. Under `remote` this machine stays idle while
   a host is on its way.

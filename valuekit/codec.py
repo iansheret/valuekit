@@ -7,7 +7,7 @@ one indirection is what lets the same format serve two purposes: a
 ``get_value``, so children become files on disk, while a transport passes
 "send this object unless the peer already has it" and "look it up among the
 objects received", so children become messages.  Content-addressing then
-deduplicates on the wire for exactly the reason it deduplicates on disk --
+deduplicates on the protocol for exactly the reason it deduplicates on disk --
 an array shared by fifty values is transferred once.
 
 There is no pickle here, which matters more once a peer is involved than it

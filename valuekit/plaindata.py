@@ -11,7 +11,7 @@ through the data rather than by name.
 Excluding methods is what makes that identity complete.  A method reached
 through an argument -- ``obs.magnitude()`` -- is an attribute name, so it
 resolves to nothing at module scope and never enters the calling function's
-fingerprint; edit it and a stale result is served.  A class defining one is
+function_hash; edit it and a stale result is served.  A class defining one is
 rejected, and the message points at ``register_type``, where the user takes
 on hashing it themselves.
 
@@ -156,7 +156,7 @@ def _build_spec(cls: type) -> tuple[str, tuple[str, ...], str]:
         raise _reject(cls, "takes constructor arguments it does not store")
 
     # Reject behaviour attached anywhere in the class or its bases: it would
-    # be invisible to the fingerprint of a function reaching it through an
+    # be invisible to the function hash of a function reaching it through an
     # argument.  A field's default sits in the class namespace under the
     # field's own name, and is a value however callable it happens to be.
     ignored = set(field_names) | _ANNOTATION_NAMES

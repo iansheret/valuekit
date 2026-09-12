@@ -5,7 +5,7 @@ a :class:`BatchResult` of per-input outcomes, in input order.
 
 ``fn`` must be memoised (``@pure`` or ``@pure_local``).  Three things rest
 on that.  An input whose result the cache already holds needs no worker,
-and is answered here.  Each input's root trace can be named in a *batch
+and is answered here.  Each input's root call record can be named in a *batch
 record* (see :mod:`valuekit.batches`), which is how analysis code reaches
 what the batch produced without reconstructing arguments.  And running
 somewhere other than this machine is safe only for a function whose
@@ -35,8 +35,8 @@ that caused it.  There are three kinds, treated alike:
 any input failed, so failures cannot be dropped by accident; ``.failures``
 lists ``(input, exception)`` pairs for callers that handle them explicitly.
 
-Nothing is replayed automatically.  To debug one input, call ``fn(x)`` on
-it: the cached prefix replays without executing and the failing step runs
+Nothing is re-run automatically.  To debug one input, call ``fn(x)`` on
+it: the cached prefix is served without executing and the failing step runs
 inline, in this process, with a live stack — and you choose which input you
 land in, rather than whichever one happened to fail first.
 
@@ -48,7 +48,7 @@ fallback does not enforce the timeout.
 
 This module owns the scheduling -- admission, deadlines, input-order
 reassembly, and attributing each failure to the input that caused it --
-while :mod:`valuekit.backend` owns starting and killing a unit of work.
+while :mod:`valuekit.machines` owns starting and killing a task.
 The split is what lets work run somewhere other than this machine without
 the scheduling being written twice.
 
@@ -65,16 +65,15 @@ from __future__ import annotations
 
 import os
 import queue
-import sys
 import threading
 import time
 from collections import deque
 from typing import Any, Callable, Iterable, Iterator
 
-from . import bootstrap, placement, runlog, sync
-from .backend import HostBackend, LocalBackend, ProcessLink
+from . import bootstrap, runlog, placement, events, sync
+from .machines import RemoteMachine, LocalMachine, ProcessConnection
 from .batches import BatchWriter
-from .codehash import function_fingerprint
+from .functionhash import reachable_set
 from .debughook import breakpoints_force
 from .store import CacheMiss, LocalStore
 
@@ -86,10 +85,10 @@ _POLL = 0.2  # seconds between checks of deadlines and of the mode file
 # the run file already carries the pid, so a counter is identifier enough.
 _batch_seq = 0
 
-# Where work happens is configuration (the hosts file and the mode file),
-# never a call-site argument: a host list in code could reach a fingerprint,
-# and where a computation ran must not be able to affect its result.  This
-# private hook stands in for the hosts file in tests: a name to the command
+# Where work happens is configuration (the local file), never a call-site
+# argument: a host list in code could reach a function hash, and where a call
+# ran must not be able to affect its result.  This private hook stands in
+# for the local file's hosts in tests: a name to the command
 # that runs a Python 3 to bootstrap with, or to ``(command, workers)``; a host
 # with no capacity given reports its own.
 _host_commands: dict[str, Any] | None = None
@@ -233,48 +232,48 @@ def _harvest(t: _Task, msg, name: str, timeout) -> Outcome:
     return Outcome(t.x, exc=exc)
 
 
-class _Record:
+class _BatchRecorder:
     """Everything one batch reports about an input as it finishes: the run
-    log, the batch record, and the enclosing computation's call list."""
+    log, the batch record, and the enclosing call's call list."""
 
     def __init__(self, store, fn, name: str, batch_id: int, inputs: list):
-        from .pure import _record_call
+        from .pure import _note_call
 
         self._store = store
         self._fn = fn
         self._name = name
         self._id = batch_id
-        self._record_call = _record_call
+        self._note_call = _note_call
         self._writer = None
         if isinstance(store, LocalStore):
             try:
                 self._writer = BatchWriter(
-                    store, name, fn.__qualname__, fn._valuekit_identity()[0], inputs
+                    store, name, fn.__qualname__, fn._valuekit_reachable().hash, inputs
                 )
             except Exception:
                 self._writer = None  # the record is a diagnostic, never a failure
 
-    def outcome(self, i: int, o: Outcome, host: str = "local") -> None:
+    def outcome(self, i: int, o: Outcome, machine: str = "local") -> None:
         exc = o.exception()
-        trace = None
+        record = None
         if exc is None:
             found = self._fn._valuekit_lookup(o.input)
             if found is not None:
-                trace = found[0]
-                self._record_call(
-                    self._fn.__qualname__, self._fn._valuekit_identity()[0], trace
+                record = found[0]
+                self._note_call(
+                    self._fn.__qualname__, self._fn._valuekit_reachable().hash, record
                 )
-        runlog.record(
+        events.record(
             self._store,
             "outcome",
             id=self._id,
             i=i,
             ok=exc is None,
-            host=host,
+            machine=machine,
             exc=None if exc is None else type(exc).__name__,
         )
         if self._writer is not None:
-            self._writer.outcome(i, trace, exc)
+            self._writer.outcome(i, record, exc)
 
 
 def _cached(fn, x) -> Outcome | None:
@@ -284,59 +283,71 @@ def _cached(fn, x) -> Outcome | None:
         return None
     from .pure import _current_store
 
+    store = _current_store()
     try:
-        return Outcome(x, value=_current_store().get_value(found[1]["result"]))
+        value = store.get_value(found[1]["result"])
+        # The stored result stands in for the call only with everything the
+        # call would have logged; otherwise a worker runs it afresh.
+        runlog.reemit(store, fn._valuekit_reachable().hash, found[0], found[1])
     except CacheMiss:
         return None
+    return Outcome(x, value=value)
 
 
 def _launcher(command: list[str]):
-    return lambda: ProcessLink(command)
+    return lambda: ProcessConnection(command)
 
 
-class _Places:
-    """The backends a batch may run on, and how many tasks each may hold.
+class _Machines:
+    """The machines a batch may run on, and how many tasks each may hold.
 
-    Remote hosts come from the hosts file (or the test hook); readiness
+    Remote hosts come from the local file (or the test hook); readiness
     runs on a thread per host and a host counts only once it is ready.  The
-    mode file is re-read every time capacities are asked for, so a switch
-    made while the batch runs applies to the next task started.
+    mode is re-read from the file every time capacities are asked for, so a
+    switch made while the batch runs applies to the next task started.
     """
 
-    def __init__(self, fn, cache_dir: str | None, inbox: queue.Queue, store, batch: int):
-        self.local = LocalBackend(fn, cache_dir, inbox)
-        self.hosts: list[HostBackend] = []
+    def __init__(self, fn, cache_dir: str | None, completions: queue.Queue, store, batch: int):
+        self.local = LocalMachine(fn, cache_dir, completions)
+        self.hosts: list[RemoteMachine] = []
         self._states: dict[str, str] = {}  # name -> pending | ready | failed
         self._store = store
         self._batch = batch
         self._cache_dir = cache_dir
         self._applied: tuple | None = None
         self._closed = False
-        config = placement.load_hosts()
-        self.local_workers = config.local
+        # The local file lives in the function's project; a function with
+        # no project (defined in __main__, or exec'd) has no file and so no
+        # hosts.
+        try:
+            self._root: str | None = sync.sync_root(fn)
+        except sync.SyncError:
+            self._root = None
+        config = placement.load_local(self._root)
+        self.local_workers = config.local_workers
         if _host_commands is not None:
-            project = sync.Project(fn) if _host_commands else None
+            project = sync.Project(fn, config.project) if _host_commands else None
             source_root = os.path.join(cache_dir, "source") if cache_dir else ""
             for name, spec in _host_commands.items():
                 command, workers = spec if isinstance(spec, tuple) else (spec, None)
                 self.hosts.append(
-                    HostBackend(
-                        project, cache_dir, inbox, name,
+                    RemoteMachine(
+                        project, cache_dir, completions, name,
                         _launcher([*command, "-c", bootstrap.STAGE0]),
                         source_root, workers,
                     )
                 )
         else:
             # One project for every host: the tree is walked once per batch.
-            project = sync.Project(fn) if config.hosts else None
+            project = sync.Project(fn, config.project) if config.hosts else None
             for h in config.hosts:
                 command = [
                     "ssh", "-T", "-o", "BatchMode=yes", h.ssh,
                     bootstrap.remote_command(h.python),
                 ]
                 self.hosts.append(
-                    HostBackend(
-                        project, cache_dir, inbox, h.name, _launcher(command),
+                    RemoteMachine(
+                        project, cache_dir, completions, h.name, _launcher(command),
                         h.source_root, h.workers,
                     )
                 )
@@ -358,12 +369,12 @@ class _Places:
             for t in threads:
                 t.join()
 
-    def _prepare_one(self, b: HostBackend) -> None:
+    def _prepare_one(self, b: RemoteMachine) -> None:
         reason = b.ensure_ready()
         self._states[b.name] = "failed" if reason else "ready"
         if self._closed:
             return  # the batch ended first; nothing to report it to
-        runlog.record(
+        events.record(
             self._store, "host", id=self._batch, name=b.name, ok=not reason,
             reason=reason or None, capacity=b.capacity,
         )
@@ -373,13 +384,13 @@ class _Places:
         return any(s == "pending" for s in self._states.values())
 
     def capacities(self) -> tuple[str, dict[str, int]]:
-        """The mode in force and each place's capacity under it.
+        """The mode in force and each machine's capacity under it.
 
         Readiness is started here, never waited for: this machine's workers
         start at once and a host joins when it is ready, whether the mode
         named it from the start or a switch mid-batch brought it in.
         """
-        mode = placement.read_mode(self._cache_dir)
+        mode = placement.read_mode(self._root, self._cache_dir)
         if mode != "local" and self.hosts:
             self.prepare(wait=False)
         remote = {}
@@ -390,14 +401,14 @@ class _Places:
             remote[b.name] = (b.capacity or 0) if usable else 0
             if b.dead and self._states[b.name] == "ready":
                 self._states[b.name] = "failed"
-                runlog.record(
+                events.record(
                     self._store, "host", id=self._batch, name=b.name, ok=False,
-                    reason="the connection closed", capacity=b.capacity,
+                    reason=b.failure or "the connection closed", capacity=b.capacity,
                 )
         caps = placement.capacities(mode, self.local_workers, remote, self.pending())
         if (mode, caps) != self._applied:
             self._applied = (mode, caps)
-            runlog.record(self._store, "placement", id=self._batch, mode=mode, capacities=caps)
+            events.record(self._store, "placement", id=self._batch, mode=mode, capacities=caps)
         return mode, caps
 
     def close(self) -> None:
@@ -431,7 +442,7 @@ def run_all(
     Every input is processed and failures are collected on the
     BatchResult: ``.values`` raises an ExceptionGroup if any input failed,
     and ``.failures`` gives the ``(input, exception)`` pairs.  Nothing is
-    replayed automatically; to debug one input, call ``fn(x)`` on it.
+    re-run automatically; to debug one input, call ``fn(x)`` on it.
 
     The batch is recorded under ``name`` (default: the function's qualified
     name) for :func:`valuekit.batch` to read.
@@ -453,6 +464,7 @@ def run_all(
     cache_dir = str(store.root) if isinstance(store, LocalStore) else None
     qualname = getattr(fn, "__qualname__", repr(fn))
     name = name or qualname
+    runlog.current_run(store)  # begun here, so that every worker joins this run
 
     global _batch_seq
     _batch_seq += 1
@@ -462,29 +474,29 @@ def run_all(
     # this process, so the breakpoint fires and the debugger contract
     # applies.  (Also covers VALUEKIT_ALWAYS_RUN.)
     try:
-        _, spans, _ = function_fingerprint(fn)
+        spans = reachable_set(fn).spans
     except Exception:
         spans = []
     if breakpoints_force(spans):
-        runlog.record(
+        events.record(
             store, "batch", id=batch, fn=qualname, name=name, n=len(inputs),
             mode="sequential",
         )
-        record = _Record(store, fn, name, batch, inputs)
+        recorder = _BatchRecorder(store, fn, name, batch, inputs)
         seq: list[Outcome] = []
         try:
             for i, x in enumerate(inputs):
                 o = Outcome(x, value=fn(x))  # exceptions propagate
                 seq.append(o)
-                record.outcome(i, o)
+                recorder.outcome(i, o)
         finally:
-            runlog.record(store, "end", id=batch)
+            events.record(store, "end", id=batch)
         return BatchResult(seq)
 
-    runlog.record(
+    events.record(
         store, "batch", id=batch, fn=qualname, name=name, n=len(inputs), mode="parallel"
     )
-    record = _Record(store, fn, name, batch, inputs)
+    recorder = _BatchRecorder(store, fn, name, batch, inputs)
 
     outcomes: list[Outcome | None] = [None] * len(inputs)
     pending = deque()
@@ -494,59 +506,59 @@ def run_all(
             pending.append((i, x))
         else:
             outcomes[i] = o
-            record.outcome(i, o)
+            recorder.outcome(i, o)
     if not pending:
-        runlog.record(store, "end", id=batch)
+        events.record(store, "end", id=batch)
         return BatchResult(o for o in outcomes if o is not None)
 
-    inbox: queue.Queue = queue.Queue()
-    places = _Places(fn, cache_dir, inbox, store, batch)
+    completions: queue.Queue = queue.Queue()
+    machines = _Machines(fn, cache_dir, completions, store, batch)
 
     running: list[_Task] = []
-    busy: dict[str, int] = {}  # place name -> tasks running there
+    busy: dict[str, int] = {}  # machine name -> tasks running there
     moved: set[int] = set()  # inputs already run again after losing their host
 
-    def _start(backend, idx: int, x: Any) -> None:
-        handle = backend.start(x)
+    def _start(machine, idx: int, x: Any) -> None:
+        handle = machine.start(x)
         deadline = time.monotonic() + timeout if timeout is not None else None
-        running.append(_Task(x, idx, handle, deadline, backend.name))
-        busy[backend.name] = busy.get(backend.name, 0) + 1
-        runlog.record(store, "start", id=batch, i=idx, host=backend.name)
+        running.append(_Task(x, idx, handle, deadline, machine.name))
+        busy[machine.name] = busy.get(machine.name, 0) + 1
+        events.record(store, "start", id=batch, i=idx, machine=machine.name)
 
-    def _admit() -> None:
-        _, caps = places.capacities()
+    def _accept() -> None:
+        _, caps = machines.capacities()
         total = max_workers or sum(caps.values())
-        for backend in places.all():
+        for machine in machines.all():
             while (
                 pending
                 and len(running) < total
-                and busy.get(backend.name, 0) < caps.get(backend.name, 0)
+                and busy.get(machine.name, 0) < caps.get(machine.name, 0)
             ):
-                _start(backend, *pending.popleft())
+                _start(machine, *pending.popleft())
 
     def _drain(block: bool) -> None:
-        """Feed handles whatever the backends have delivered."""
+        """Feed handles whatever the machines have delivered."""
         try:
-            handle, payload = inbox.get(timeout=_POLL if block else 0)
+            handle, payload = completions.get(timeout=_POLL if block else 0)
         except queue.Empty:
             return
         handle.feed(payload)
         while True:
             try:
-                handle, payload = inbox.get_nowait()
+                handle, payload = completions.get_nowait()
             except queue.Empty:
                 return
             handle.feed(payload)
 
     try:
         while pending or running:
-            _admit()
+            _accept()
             if not running:
                 if not pending:
                     break
-                if not places.pending():
+                if not machines.pending():
                     raise RuntimeError(
-                        "no place can run this batch: every capacity is zero"
+                        "no machine can run this batch: every capacity is zero"
                     )
                 _drain(block=True)  # a host is on its way; wait for it
                 continue
@@ -574,11 +586,11 @@ def run_all(
                     if t.idx not in moved:
                         moved.add(t.idx)
                         pending.appendleft((t.idx, t.x))
-                        runlog.record(store, "requeue", id=batch, i=t.idx, host=t.where)
+                        events.record(store, "requeue", id=batch, i=t.idx, machine=t.where)
                         continue
                 o = _harvest(t, msg, qualname, timeout)
                 outcomes[t.idx] = o
-                record.outcome(t.idx, o, host=t.where)
+                recorder.outcome(t.idx, o, machine=t.where)
     finally:
         # Covers KeyboardInterrupt: no orphans.
         for t in running:
@@ -586,9 +598,9 @@ def run_all(
                 t.handle.kill()
             except Exception:
                 pass
-        places.close()
+        machines.close()
         # In the finally, not after the return: an interrupted batch is
         # exactly the one whose final state is worth having.
-        runlog.record(store, "end", id=batch)
+        events.record(store, "end", id=batch)
 
     return BatchResult(o for o in outcomes if o is not None)

@@ -1,21 +1,24 @@
-"""Where a batch runs: the hosts file and the mode file.
+"""Where a batch runs: the local file.
 
-Two pieces of state, kept apart because they have different lifetimes.
+Everything about running a checkout on other machines is one file beside
+``pyproject.toml``, ``valuekit.local.toml``, which git should ignore.  It
+is per checkout: the machines this checkout may use, how many workers each
+may run, the mode in force, and the name of this project's directory on
+each host.  A checkout that never uses other machines has no such file.
 
-The *hosts file* is configuration the user writes once: which machines can
-take work, how to reach them, and how many workers each may run.  It is
-TOML, located by ``$VALUEKIT_HOSTS``; with no file there are no remote
-hosts.  ``[local]`` may cap this machine's workers; each ``[hosts.<name>]``
-names an ssh target::
+::
+
+    project = "residuals-experiment"   # optional: the host directory name
+    mode = "all"                       # optional: all | local | remote
 
     [local]
-    workers = 8
+    workers = 8                        # optional: this machine's cap
 
     [hosts.mac]
-    ssh = "ian@mac.local"
-    python = "python3"                           # omitted: this; any Python 3 there
-    workers = 8                                  # omitted: the host's CPU count
-    source_root = "~/.cache/valuekit/source"     # omitted: this default
+    ssh = "ian@mac.local"                        # anything ssh accepts
+    python = "python3"                           # optional; any Python 3 there
+    workers = 8                                  # optional; default: the host's CPU count
+    source_root = "~/.cache/valuekit/source"     # optional; this is the default
 
 ``python`` is only what starts the bootstrap (:mod:`valuekit.bootstrap`);
 the interpreter that runs the project comes from the project's own lock
@@ -23,26 +26,25 @@ file, built on the host.  Nothing of the project's, valuekit included, has
 to be installed there.  A Windows host has ``python`` rather than
 ``python3``.
 
-The *mode* is a choice that changes from run to run and during one: one
-word in ``<cache>/placement``.  ``all`` uses every reachable host and this
-machine at full capacity; ``local`` runs everything on this machine;
-``remote`` runs as little here as possible, which means nothing here while
-any host is reachable or still preparing, and everything here when none is.
-The file is absent by default, which reads as ``all``: a host in the hosts
-file is there to be used, the way a core is, and needs no switching on.  It
-is written by the monitor on a keystroke or by ``python -m valuekit.monitor
---mode``, and deleting the cache directory resets it.
+The *mode*: ``all`` uses every reachable host and this machine at full
+capacity; ``local`` runs everything on this machine; ``remote`` runs as
+little here as possible, which means nothing here while any host is
+reachable or still preparing, and everything here when none is.  Absent,
+it is ``all``: a host in the file is there to be used, the way a core is.
+The scheduler reads the file each time it is about to start a task, so an
+edit takes effect for the next task started; tasks already running finish
+where they are.  The monitor's keys and its ``--mode`` flag edit the
+``mode`` line in place and touch nothing else in the file.
 
-The scheduler reads the mode each time it is about to start a task, so a
-change takes effect for the next task started; tasks already running finish
-where they are, and their results land in this machine's cache either way.
-Preparing a host never holds a task back: this machine starts at once and
-a host joins when it is ready.
+The file is never part of the source tree sent to a host and never part of
+any hash: it says where a computation runs, which must not be able to
+affect a result.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,17 +52,20 @@ from pathlib import Path
 from .store import _atomic_write
 
 __all__ = [
+    "LOCAL_FILE",
     "MODES",
     "Host",
-    "Hosts",
-    "load_hosts",
+    "LocalConfig",
+    "load_local",
     "read_mode",
     "write_mode",
     "capacities",
     "worker_env",
 ]
 
+LOCAL_FILE = "valuekit.local.toml"
 MODES = ("local", "remote", "all")
+DEFAULT_MODE = "all"
 DEFAULT_SOURCE_ROOT = "~/.cache/valuekit/source"
 DEFAULT_PYTHON = "python3"
 
@@ -75,22 +80,34 @@ class Host:
 
 
 @dataclass(frozen=True)
-class Hosts:
-    local: int
+class LocalConfig:
+    project: str | None  # the host directory name, if chosen
+    mode: str
+    local_workers: int
     hosts: tuple[Host, ...]
 
 
-def load_hosts(path: str | os.PathLike | None = None) -> Hosts:
-    """The hosts file at *path*, or at ``$VALUEKIT_HOSTS``, or none."""
-    path = path or os.environ.get("VALUEKIT_HOSTS")
+def local_path(root: str | os.PathLike | None) -> Path | None:
+    return None if root is None else Path(root) / LOCAL_FILE
+
+
+def load_local(root: str | os.PathLike | None) -> LocalConfig:
+    """The local file in *root*, or the defaults when there is none."""
     default_local = os.cpu_count() or 1
-    if not path:
-        return Hosts(default_local, ())
-    p = Path(os.path.expanduser(path))
+    p = local_path(root)
+    if p is None or not p.exists():
+        return LocalConfig(None, DEFAULT_MODE, default_local, ())
     try:
         data = tomllib.loads(p.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as e:
-        raise RuntimeError(f"cannot read the hosts file {p}: {e}") from e
+        raise RuntimeError(f"cannot read {p}: {e}") from e
+
+    project = data.get("project")
+    if project is not None and (not isinstance(project, str) or not project):
+        raise RuntimeError(f"{p}: project must be a non-empty string")
+    mode = data.get("mode", DEFAULT_MODE)
+    if mode not in MODES:
+        raise RuntimeError(f"{p}: mode must be one of {', '.join(MODES)}, not {mode!r}")
 
     local = data.get("local", {})
     if not isinstance(local, dict):
@@ -121,7 +138,7 @@ def load_hosts(path: str | os.PathLike | None = None) -> Hosts:
                 source_root=str(h.get("source_root") or DEFAULT_SOURCE_ROOT),
             )
         )
-    return Hosts(local_workers, tuple(hosts))
+    return LocalConfig(project, mode, local_workers, tuple(hosts))
 
 
 def _workers(path: Path, section: str, value) -> int:
@@ -134,39 +151,48 @@ def _workers(path: Path, section: str, value) -> int:
 # the mode
 # ---------------------------------------------------------------------------
 
-
-def _mode_path(cache_dir: str | os.PathLike) -> Path:
-    return Path(cache_dir) / "placement"
+_MODE_LINE = re.compile(r"^\s*mode\s*=")
 
 
-DEFAULT_MODE = "all"
+def read_mode(root: str | os.PathLike | None, cache_dir: str | os.PathLike | None) -> str:
+    """The mode in force for the project at *root*; ``all`` when unset or
+    the file is unreadable.
 
-
-def read_mode(cache_dir: str | os.PathLike | None) -> str:
-    """The mode in force for *cache_dir*; ``all`` when unset or unreadable.
-
-    With no cache directory there is no mode file and no run log, and a
-    host's results would have nowhere to land: that case is ``local``.
+    With no cache directory a host's results would have nowhere to land:
+    that case is ``local``.
     """
     if cache_dir is None:
         return "local"
     try:
-        mode = _mode_path(cache_dir).read_text(encoding="utf-8").strip()
-    except OSError:
+        return load_local(root).mode
+    except RuntimeError:
         return DEFAULT_MODE
-    return mode if mode in MODES else DEFAULT_MODE
 
 
-def write_mode(cache_dir: str | os.PathLike, mode: str) -> None:
+def write_mode(root: str | os.PathLike, mode: str) -> None:
+    """Set the ``mode`` line of the local file in *root*, creating the file
+    if needed and leaving every other line as it was."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, not {mode!r}")
-    _atomic_write(_mode_path(cache_dir), f"{mode}\n".encode())
+    p = Path(root) / LOCAL_FILE
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        lines = []
+    new = f'mode = "{mode}"\n'
+    for i, line in enumerate(lines):
+        if _MODE_LINE.match(line):
+            lines[i] = new
+            break
+    else:
+        lines.insert(0, new)
+    _atomic_write(p, "".join(lines).encode("utf-8"))
 
 
 def capacities(
     mode: str, local: int, remote: dict[str, int], pending: bool = False
 ) -> dict[str, int]:
-    """How many tasks each place may run at once under *mode*.
+    """How many tasks each machine may run at once under *mode*.
 
     *remote* maps each host to its capacity, 0 until it is ready; *pending*
     says whether any host is still preparing.  Every name is present in the
