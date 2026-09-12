@@ -96,13 +96,12 @@ This is the user's responsibility, by design:
 
 The remedy column repeats one idea: arguments are always tracked, so moving
 a dependency into the arguments makes it visible. If something invisible
-changed anyway, clear it. `clear_cache(fn)` means "`fn` has changed" and
-behaves as if it had: it deletes the recorded results of `fn` and of every
-`@pure` function that computed through it (callers, transitively, and uses
-of `fn` as an argument), across processes, using a small on-disk dependency
-index. Matching is conservative: clearing too much means recomputing, while
-clearing too little would mean wrong results, so ties resolve towards
-clearing more. `clear_cache()` deletes everything.
+changed anyway, clear it. `clear_cache(fn)` means "`fn` has changed": it
+deletes `fn`'s call records. Every `@pure` function that computed through
+`fn`, whether it called it or received it as an argument, names one of
+those records in its own, so its next call finds nothing to stand in for
+it and recomputes; callers are reached transitively the same way, each at
+its next call. `clear_cache()` deletes everything.
 
 Tunables belong in config maps rather than in module globals. A traced
 config read is exact per call (change an unread key and hits are kept),
@@ -164,8 +163,8 @@ file or a download cache, are permitted, since on a hit none of them
 happen. The result must be a value, never a path: a path from this machine
 means nothing on another.
 
-Because the function reads an environment, it runs only on the machine that
-has that environment, the one driving the pipeline. A batch running
+Because the function reads an environment, it runs only in the main process,
+on the machine that has that environment. A batch running
 elsewhere sends such calls back here and receives the value. Expect a
 pipeline to have a handful of these at the top and `@pure` everywhere else;
 `@pure_local` is not the way out when `@pure` feels strict.
@@ -414,7 +413,7 @@ fallback does not enforce the timeout. Merely having a debugger attached
 changes nothing on its own.
 
 Two rules for using other pools (joblib, dask, a bare executor) around
-``@pure`` code: parallelise in the driver, between ``@pure`` calls, never
+``@pure`` code: parallelise in the main process, between ``@pure`` calls, never
 inside a ``@pure`` function's body (reads performed in worker processes are
 not recorded, which produces call records with missing dependencies and therefore
 stale results); and call ``set_cache_dir`` at module top level, since a call
@@ -490,7 +489,7 @@ miss and recomputed. Each
 script keeps its own log, named by its file stem, and a run replaces the
 previous run of the same script; a debugging script never touches the main
 script's log. With one script logged under a cache, `logs()` needs no
-name. `log` outside a memoised call, in the driver script itself, goes to
+name. `log` outside a memoised call, in the script itself, goes to
 the log with no call record; with no cache configured it does nothing.
 
 A log is readable while its run is going: `L.refresh()` picks up new
@@ -566,7 +565,7 @@ source_root = "~/.cache/valuekit/source"      # optional; this is the default
 Login must work without a prompt (`ssh mac.local true`), which means a key
 and, on macOS, Remote Login switched on; on Windows the OpenSSH Server
 feature. A key with a passphrase needs an agent holding it wherever the
-driver runs, so a driver that is itself reached over ssh wants `ssh -A`. The lock tool must be on the PATH a *non-interactive* ssh session
+main process runs, so a main process that is itself reached over ssh wants `ssh -A`. The lock tool must be on the PATH a *non-interactive* ssh session
 sees, which is shorter than your login shell's; valuekit also looks in
 `~/.local/bin` and `~/.cargo/bin`. A Windows host is reached through sshd's
 default shell: leave that as `cmd.exe`, because PowerShell in that role
@@ -616,7 +615,7 @@ Where work goes is a *mode*, the `mode` line of `valuekit.local.toml`:
 The default is `all`: a host in the file is there to be used, the way a
 core is. Edit the line, switch it from the monitor (below), or run
 `python -m valuekit.monitor --mode remote <cache-dir>` from inside the
-project. The driver re-reads the file each time it starts a task, so a switch during a batch applies to the next
+project. The main process re-reads the file each time it starts a task, so a switch during a batch applies to the next
 task; tasks already running finish where they are. Preparing a host never
 holds the batch back: this machine starts at once and a host joins when it
 is ready (under `remote`, this machine waits for it instead). A host that
@@ -670,8 +669,8 @@ thing the monitor writes is the `mode` line of the project's
 `valuekit.local.toml`, on a keystroke: `l`, `r` and `a` set `local`,
 `remote` and `all`. The project is the one enclosing the directory the
 monitor is run from. The header shows the mode asked
-for and, beside it, the mode the running driver has applied; they differ
-until the driver next starts a task. The `hosts` block shows each host's
+for and, beside it, the mode the running main process has applied; they differ
+until the main process next starts a task. The `hosts` block shows each host's
 capacity under the applied mode, what is running and finished there, and
 whether the host was reached.
 

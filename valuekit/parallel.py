@@ -58,7 +58,7 @@ content-named file, so concurrent writers cannot drop each other's
 results.  ``fn`` must be a module-level function (it is sent to workers by
 reference).  Worker processes are daemonic: they are cleaned up if the
 parent exits, and ``fn`` cannot itself start processes (parallelise in this
-driver, not inside it).
+main process, not inside it).
 """
 
 from __future__ import annotations

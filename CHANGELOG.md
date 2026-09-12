@@ -39,9 +39,9 @@ call-record layout changed (each call record is its own file, under
   result may depend on something outside the program -- a file on this
   machine, a database, a download that needs this machine's credentials --
   which the user promises does not change for the same arguments. It runs
-  only on the machine driving the pipeline; a worker elsewhere sends the
+  only on the main process; a worker elsewhere sends the
   call back. This is what lets a batch that fetches data run remotely
-  without credentials leaving the driver.
+  without credentials leaving the main process.
 
 - `fn.cached(...)` returns a `@pure` function's stored result without
   executing, or raises `CacheMiss`. `run_all` uses the same lookup to answer
@@ -87,7 +87,7 @@ call-record layout changed (each call record is its own file, under
   under `records/`. `logs()` reads the *run's log* (was ledger); the
   monitor reads the *event log* (was run log), under `events/`. A *logged
   value* carries *labels* (were item and context). A *run* (was execution)
-  is one driver process. Work runs on a *host*, this machine included (was place or
+  is one main process process. Work runs on a *host*, this machine included (was place or
   backend); a *connection* carries *messages* (were link, wire and frame); a
   function's *reachable set* (was closure) is what the function hash covers; a
   *project hash* (was tree id) identifies a version of the project's files. Modules follow:
@@ -132,7 +132,7 @@ call-record layout changed (each call record is its own file, under
 
 - The repository is a locked project: `uv.lock` pins the development
   environment and CI syncs from it. The suite's test project pins numpy to
-  the driver's version and Python to the driver's minor, since a package
+  the main process's version and Python to the main process's minor, since a package
   version is part of the function hash of every function using it.
 
 - `valuekit` itself is never classified as user code, wherever it is
@@ -149,7 +149,7 @@ call-record layout changed (each call record is its own file, under
 - The project must be locked: its tree carries a lock file from a tool
   valuekit can invoke (`uv.lock` today; the table has one row per tool). A
   small stdlib-only bootstrap, sent over the connection, receives the tree,
-  runs the tool's sync in it (`uv sync --frozen`, for the driver's Python
+  runs the tool's sync in it (`uv sync --frozen`, for the main process's Python
   minor) and starts the host process from the environment that produced,
   activated: the tools the lock installed beside the interpreter (cmake and
   ninja for an extension that rebuilds on import, say) are on the workers'
@@ -164,9 +164,9 @@ call-record layout changed (each call record is its own file, under
   Any edit in the project re-keys functions that reach an extension.
 - Where work goes is a mode, the `mode` line of `valuekit.local.toml`: `all`
   (the default: every configured host, plus this machine), `local`, or
-  `remote` (as little here as possible). The driver re-reads it each time it
+  `remote` (as little here as possible). The main process re-reads it each time it
   starts a task, so a switch mid-batch moves the next task. The monitor
-  shows the requested mode beside the mode the driver has applied, and sets
+  shows the requested mode beside the mode the main process has applied, and sets
   it on a keystroke; `--mode` sets it from a script. That line is the only
   thing the monitor writes.
 - Preparing a host never holds the batch back: this machine starts at once
@@ -194,20 +194,20 @@ call-record layout changed (each call record is its own file, under
   store writes, so they are stored without being decoded.
 - A worker that speaks a framed protocol over a pipe, with a handshake that
   recomputes the function's fingerprint and refuses if the code it would run
-  is not the code the driver meant. It runs on this machine, which is the
+  is not the code the main process meant. It runs on this machine, which is the
   point: everything is exercised in CI with no network involved.
-- Code sync. The driver describes its project as a manifest -- tracked files
+- Code sync. The main process describes its project as a manifest -- tracked files
   plus untracked ones that are not ignored -- and the host unpacks an
   immutable source tree named by the manifest hash, which workers import
   from.  Build artefacts are never shipped, whatever platform names them.
 - A readiness phase, once per host rather than once per input, and an audit
   after importing that every user module actually came from the source tree.
-- A worker holds no cache. Its store is the driver's store, reached over the
+- A worker holds no cache. Its store is the main process's store, reached over the
   connection: every value, trace and run-log record it produces goes to the
-  driver, every lookup asks the driver, and a `@pure_local` call runs on the
-  driver. A batch's results exist in one place however many machines ran it.
+  main process, every lookup asks the main process, and a `@pure_local` call runs on the
+  main process. A batch's results exist in one place however many machines ran it.
 - A worker's environment is an allowlist of what a process needs to start,
-  plus `VALUEKIT_*`. Nothing else of the driver's crosses.
+  plus `VALUEKIT_*`. Nothing else of the main process's crosses.
 
 ## 0.3.1 — 2026-08-27
 

@@ -1,6 +1,6 @@
-"""One process per host per batch: ``python -m valuekit.host``.
+"""One process per host per batch: ``python -m valuekit.hostprocess``.
 
-The driver opens one connection to a host -- an ssh session, or a plain
+The main process opens one connection to a host -- an ssh session, or a plain
 subprocess when the host is this machine -- and this process is what runs
 at the other end.  It starts one ``valuekit.worker`` subprocess per task and
 carries each worker's stdin and stdout over the connection as a numbered
@@ -9,20 +9,20 @@ a thousand.  (The Windows ssh client has no connection sharing, which is
 what rules out a connection per task.)
 
     host   -> HOST    salt, CPU count, pid
-    driver -> OPEN    channel, "ready" | "task"     start a worker
-    driver -> DATA    channel, bytes                 to that worker's stdin
+    main   -> OPEN    channel, "ready" | "task"     start a worker
+    main   -> DATA    channel, bytes                 to that worker's stdin
     host   -> DATA    channel, bytes                 from that worker's stdout
-    driver -> CLOSE   channel                        close the worker's stdin
-    driver -> KILL    channel                        kill the worker
+    main   -> CLOSE   channel                        close the worker's stdin
+    main   -> KILL    channel                        kill the worker
     host   -> EXIT    channel, exit code, stderr tail
 
 Workers are started with the allowlisted environment, as they are locally;
 ``VALUEKIT_TREE``, set by the bootstrap that started this process, passes
 through it and tells each worker which source tree it is in.
 This process exits when its stdin closes, after killing every worker it
-started: a dropped connection or a driver that died leaves nothing running.
+started: a dropped connection or a main process that died leaves nothing running.
 Bytes on a channel are passed through untouched; what they mean is between
-the driver and the worker.
+the main process and the worker.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
             try:
                 protocol.write_message(tx, tag, body)
             except (OSError, ValueError):
-                pass  # the driver is gone; EOF on stdin follows
+                pass  # the main process is gone; EOF on stdin follows
 
     def forward_stdout(ch: int, w: _Worker) -> None:
         """Forward the worker's stdout, then report how it ended."""

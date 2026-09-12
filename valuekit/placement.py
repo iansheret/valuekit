@@ -219,10 +219,10 @@ def capacities(
 # ---------------------------------------------------------------------------
 
 # What a process needs from the environment to start and to find its
-# interpreter's own files; everything else stays with the driver.  No
+# interpreter's own files; everything else stays with the main process.  No
 # PYTHONPATH (imports must resolve through the source tree, or the check
 # that they did proves nothing) and no credentials, which a @pure_local
-# call keeps on the driver.
+# call keeps on the main process.
 _WORKER_ENV = frozenset(
     {
         "PATH", "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL",

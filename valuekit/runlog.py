@@ -10,7 +10,7 @@ code that will read it.  Retrieval selects by containment::
     for logged in sel:
         logged.labels, logged.value
 
-A *run* is one driver process running a script, named by the script's
+A *run* is one main process process running a script, named by the script's
 file stem.  Its log is the complete set of logged values that run
 produced, as if the code had run from scratch: a step that executes
 writes its logged values as it makes them, and a step served from cache
@@ -28,8 +28,8 @@ Layout, under the cache directory::
 
 A line names the labels and the value by hash, both in the object store,
 and carries the labels' entries in encoded form so a query needs no
-decoding.  Workers on this machine write their own file into the driver's
-run; a remote worker sends its lines to the driver, which writes them.
+decoding.  Workers on this machine write their own file into the main process's
+run; a remote worker sends its lines to the main process, which writes them.
 Nothing here imports or runs the pipeline.
 """
 
@@ -80,8 +80,8 @@ def _script_name() -> str:
 
 
 class _Run:
-    """The run this process writes to: begun here (a driver) or
-    joined (a worker the driver told which one it belongs to)."""
+    """The run this process writes to: begun here (a main process) or
+    joined (a worker the main process told which one it belongs to)."""
 
     __slots__ = ("root", "name", "id", "dir", "_fh", "_lock")
 
@@ -113,12 +113,12 @@ class _Run:
 
 
 _current: _Run | None = None
-_adopted: tuple[str, str] | None = None  # (name, id) handed down by the driver
+_adopted: tuple[str, str] | None = None  # (name, id) handed down by the main process
 _begin_lock = threading.Lock()
 
 
 def adopt(name: str, run_id: str) -> None:
-    """Internal: a worker joins the driver's run instead of beginning
+    """Internal: a worker joins the main process's run instead of beginning
     its own.  Must be called before the worker's first memoised call."""
     global _adopted
     _adopted = (name, run_id)
@@ -133,7 +133,7 @@ def current_run(store: Any) -> _Run | None:
     """The run this process writes to for *store*, begun if needed.
 
     None for a store without a directory (a worker whose store is the
-    driver's sends its lines there instead).  Beginning a run
+    main process's sends its lines there instead).  Beginning a run
     writes its header, points ``latest`` at it and removes the older
     runs under the same name; a worker joins without any of that.
     """
@@ -194,7 +194,7 @@ atexit.register(_close)
 
 def emit(store: Any, labels_hash: str, value_hash: str, keys: dict[str, str]) -> None:
     """Write one logged value to this run's log.  In a worker whose store
-    is the driver's, the line goes to the driver."""
+    is the main process's, the line goes to the main process."""
     line = {"labels": labels_hash, "v": value_hash, "k": keys, "t": time.time()}
     send = getattr(store, "emit_line", None)
     if send is not None:
@@ -206,7 +206,7 @@ def emit(store: Any, labels_hash: str, value_hash: str, keys: dict[str, str]) ->
 
 
 def write_line(store: Any, line: str) -> None:
-    """Internal: a line a remote worker sent; the driver writes it."""
+    """Internal: a line a remote worker sent; the main process writes it."""
     d = json.loads(line)
     run = current_run(store)
     if run is not None:
@@ -250,7 +250,7 @@ def reemit(store: Any, function_hash: str, h: str, record: dict) -> None:
 
     Raises :class:`CacheMiss` if the subtree cannot be read whole, and then
     emits nothing: the caller treats the hit as a miss.  In a remote
-    worker the driver walks its own store and answers.
+    worker the main process walks its own store and answers.
     """
     remote = getattr(store, "reemit", None)
     if remote is not None:

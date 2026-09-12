@@ -54,7 +54,7 @@ _role_override: str | None = None
 
 
 def set_role(role: str) -> None:
-    """Declare this process a "driver" or a "worker".
+    """Declare this process a "main" or a "worker".
 
     A worker that was not started by :mod:`multiprocessing` cannot be
     recognised by inspecting the process tree, so one says so instead.  Must
@@ -66,7 +66,7 @@ def set_role(role: str) -> None:
 
 
 def _role() -> str:
-    """"driver" or "worker".
+    """"main" or "worker".
 
     A batch runs one worker per input, each recording its own file; without
     this a twelve-input batch reads as thirteen runs.  The multiprocessing
@@ -79,9 +79,9 @@ def _role() -> str:
     try:
         import multiprocessing
 
-        return "driver" if multiprocessing.parent_process() is None else "worker"
+        return "main" if multiprocessing.parent_process() is None else "worker"
     except Exception:
-        return "driver"
+        return "main"
 
 
 def events_dir(store: Any) -> Path | None:
@@ -190,8 +190,8 @@ def record(store: Any, ev: str, **fields: Any) -> None:
     try:
         emit = getattr(store, "emit", None)
         if emit is not None:
-            # A worker whose store is the driver's: the record goes there,
-            # into the driver's own event file.
+            # A worker whose store is the main process's: the record goes there,
+            # into the main process's own event file.
             record = {"ev": ev, "t": time.time()}
             record.update(fields)
             emit(json.loads(json.dumps(record, default=_unrepresentable)))

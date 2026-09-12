@@ -1,4 +1,4 @@
-"""Framing and value transfer between a driver and a worker.
+"""Framing and value transfer between a main process and a worker.
 
 Messages are ``tag | 8-byte little-endian length | body`` -- the same shape
 :mod:`valuekit.values` already uses for hashing and for the key codec, read
@@ -36,34 +36,34 @@ __all__ = ["ProtocolError", "read_message", "write_message", "pack", "unpack"]
 # refused rather than acted on.
 MAX_MESSAGE = 1 << 31
 
-HELLO = b"\x01"  # driver -> worker: ids, project hash, import roots
-READY = b"\x02"  # worker -> driver: empty if accepted, else the reason
+HELLO = b"\x01"  # main   -> worker: ids, project hash, import roots
+READY = b"\x02"  # worker -> main process: empty if accepted, else the reason
 OBJECT = b"\x03"  # either way: one content-addressed object
-TASK = b"\x04"  # driver -> worker: the root hash of the input
-RESULT = b"\x05"  # worker -> driver: ok or error
-EVENT = b"\x06"  # worker -> driver: one event
+TASK = b"\x04"  # main   -> worker: the root hash of the input
+RESULT = b"\x05"  # worker -> main process: ok or error
+EVENT = b"\x06"  # worker -> main process: one event
 
-# The worker's store is the driver's store.  These carry a worker's store
-# calls to the driver and the answers back; a worker holds nothing itself.
-RECORD = b"\x0a"  # worker -> driver: store this call record (fn key, doc)
-GET_RECORDS = b"\x0b"  # worker -> driver: the call records of one fn key
-RECORDS = b"\x0c"  # driver -> worker: the reply, as json pairs
-GET_VALUE = b"\x0d"  # worker -> driver: send me this value's objects
-VALUE = b"\x0e"  # driver -> worker: empty once sent, or why not
-CALL = b"\x0f"  # worker -> driver: run this @pure_local call here
-CALLED = b"\x10"  # driver -> worker: its result root and record hash, or error
-LOGGED = b"\x17"  # worker -> driver: one runlog line (a log() call there)
-REEMIT = b"\x18"  # worker -> driver: emit what this call record recorded (fn key, hash)
-REEMITTED = b"\x19"  # driver -> worker: empty once emitted, or why not
+# The worker's store is the main process's store.  These carry a worker's store
+# calls to the main process and the answers back; a worker holds nothing itself.
+RECORD = b"\x0a"  # worker -> main process: store this call record (fn key, doc)
+GET_RECORDS = b"\x0b"  # worker -> main process: the call records of one fn key
+RECORDS = b"\x0c"  # main   -> worker: the reply, as json pairs
+GET_VALUE = b"\x0d"  # worker -> main process: send me this value's objects
+VALUE = b"\x0e"  # main   -> worker: empty once sent, or why not
+CALL = b"\x0f"  # worker -> main process: run this @pure_local call here
+CALLED = b"\x10"  # main   -> worker: its result root and record hash, or error
+LOGGED = b"\x17"  # worker -> main process: one runlog line (a log() call there)
+REEMIT = b"\x18"  # worker -> main process: emit what this call record recorded (fn key, hash)
+REEMITTED = b"\x19"  # main   -> worker: empty once emitted, or why not
 
-# Between the driver and a host process (valuekit.host), which runs one
+# Between the main process and a host process (valuekit.hostprocess), which runs one
 # worker per task and carries each worker's stream as a numbered channel.
-HOST = b"\x11"  # host -> driver: on start, its salt, CPU count and pid
-OPEN = b"\x12"  # driver -> host: channel id, then "ready" or "task"
+HOST = b"\x11"  # host -> main process: on start, its salt, CPU count and pid
+OPEN = b"\x12"  # main   -> host: channel id, then "ready" or "task"
 DATA = b"\x13"  # both: channel id, then bytes of that worker's stdin or stdout
-CLOSE = b"\x14"  # driver -> host: channel id; close the worker's stdin
-KILL = b"\x15"  # driver -> host: channel id; kill the worker
-EXIT = b"\x16"  # host -> driver: channel id, exit code, stderr tail
+CLOSE = b"\x14"  # main   -> host: channel id; close the worker's stdin
+KILL = b"\x15"  # main   -> host: channel id; kill the worker
+EXIT = b"\x16"  # host -> main process: channel id, exit code, stderr tail
 
 
 def channel(body: bytes) -> tuple[int, bytes]:
@@ -163,7 +163,7 @@ def unpack(root: str, objects: dict[str, bytes], fallback=None) -> Any:
     """Rebuild the value *root* names from *objects*.
 
     *fallback*, if given, resolves an object the peer did not send because
-    this side already had it: on the driver, the store's ``get_value``.
+    this side already had it: on the main process, the store's ``get_value``.
     """
 
     def get(h: str) -> Any:

@@ -9,19 +9,19 @@ one of the project's dependencies, so it arrives with the rest.
 
 That leaves a gap: something has to run on the host before the project's
 environment exists, to receive the tree and build that environment.  This
-module is that something.  The driver sends its source over the
+module is that something.  The main process sends its source over the
 connection, a one-line Python program (:data:`STAGE0`) reads it and runs
 it, and it then speaks a short protocol on the same two streams::
 
-    driver -> the source of this module, then a NUL byte
-    driver -> {"root": ..., "project": ..., "project_hash": <project hash>, "python": "3.13"}
+    main   -> the source of this module, then a NUL byte
+    main   -> {"root": ..., "project": ..., "project_hash": <project hash>, "python": "3.13"}
     host   -> {"have": true}                    the tree here is this one already
             | {"have": false, "files": {...}}   what is here: relpath -> file hash
-    driver -> {"delete": [...], "files": {...}}  only if not have: what to remove,
+    main   -> {"delete": [...], "files": {...}}  only if not have: what to remove,
                                                  and the full new manifest
-    driver -> 8-byte length, tar                 the files whose hash differs
+    main   -> 8-byte length, tar                 the files whose hash differs
     host   -> {"ok": true, "python": <interpreter>} | {"ok": false, "reason": ...}
-    host   -> python -m valuekit.host, from that interpreter, on these streams
+    host   -> python -m valuekit.hostprocess, from that interpreter, on these streams
 
 Only the standard library is used, and only what Python 3.8 has, because
 the interpreter this runs under is whatever the host happens to have.
@@ -39,14 +39,14 @@ does.
 *One directory per project, updated in place.*  Under the source root each
 project has one directory, named by the project, and beside it a manifest
 file naming the project hash the directory holds, the interpreter the sync
-made, and every file with its hash.  A driver whose tree differs sends the
+made, and every file with its hash.  A main process whose tree differs sends the
 files that changed and the names of those removed; nothing else in the
 directory is touched, so a build directory and the environment persist and
 a native extension rebuilds incrementally.  The manifest is removed before
 an update and written after, so a directory with no manifest is either
-being updated or was left by a failed sync; either way the next driver
+being updated or was left by a failed sync; either way the next main process
 updates it in place.  A lock file beside the directory says an update is
-in progress; a second driver waits for it, then proceeds with its own if
+in progress; a second main process waits for it, then proceeds with its own if
 the tree is still not the one it wants.
 """
 
@@ -74,7 +74,7 @@ __all__ = [
 # The table.  A row is what one lock tool needs said about it: its
 # executable, how to sync a tree into an environment for a given Python
 # (``{python}``: this interpreter's path when it has the minor version the
-# driver runs, else that minor for the tool to find or fetch), where the
+# main process runs, else that minor for the tool to find or fetch), where the
 # interpreter then lives relative to the tree, and where the executable
 # hides when a non-interactive shell's PATH is short.
 _TOOLS = {
@@ -89,14 +89,14 @@ _TOOLS = {
 KNOWN_LOCKS = tuple(_TOOLS)
 
 # Reads this module's source off stdin up to a NUL and runs it; exits if the
-# stream ends first (a driver that died before sending it), rather than
+# stream ends first (a main process that died before sending it), rather than
 # reading empty strings forever.  Safe to pass through sh, cmd.exe and
 # PowerShell inside double quotes: no dollar, backslash, percent, caret,
 # ampersand, pipe or angle bracket.
 STAGE0 = "import os;exec(b''.join(iter(lambda:os.read(0,1) or os._exit(1),bytes(1))))"
 
 _STALE = 3600  # seconds after which a lock counts as abandoned
-_WAIT = 600  # seconds to wait for another driver's update to finish
+_WAIT = 600  # seconds to wait for another main process's update to finish
 _TAIL = 64 << 10
 
 
@@ -120,7 +120,7 @@ def local_command(python: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# the driver's half
+# the main process's half
 # ---------------------------------------------------------------------------
 
 _source: bytes | None = None
@@ -256,10 +256,10 @@ def _stale(path: str) -> bool:
 
 
 def _take_lock(lock: str) -> str:
-    """Hold *lock* for this update; wait for another driver's first.
+    """Hold *lock* for this update; wait for another main process's first.
 
     Returns "" once held, else why not.  A lock older than ``_STALE`` was
-    left by a driver that died and is removed.
+    left by a main process that died and is removed.
     """
     deadline = time.time() + _WAIT
     while True:
@@ -273,7 +273,7 @@ def _take_lock(lock: str) -> str:
         except FileExistsError:
             if time.time() > deadline:
                 return (
-                    f"another driver was updating this project ({lock} is held) and "
+                    f"another main process was updating this project ({lock} is held) and "
                     "did not finish. If nothing is running there, delete that file."
                 )
             time.sleep(0.5)
@@ -359,7 +359,7 @@ def _find(tool: str, search) -> str | None:
 
 def _python_request(py_minor: str) -> str:
     """What to ask the lock tool for: this interpreter, when it already has
-    the driver's minor version, else the version.  Naming an interpreter
+    the main process's minor version, else the version.  Naming an interpreter
     spares a download when the host has one, and spares the tool's search
     through its own managed installations, which an ssh session on Windows
     cannot always traverse (their junctions are refused to an elevated
@@ -414,8 +414,8 @@ def _prepare(
 
     *delete* names the files to remove, *files* is the full new manifest,
     *data* a tar of the files whose content differs.  Holds the project's
-    lock throughout.  A driver that arrives while another holds the lock
-    waits; if the other driver's update produced this project hash there is
+    lock throughout.  A main process that arrives while another holds the lock
+    waits; if the other main process's update produced this project hash there is
     nothing left to do.
     """
     tree, manifest, lock = _paths(root, project)
@@ -426,7 +426,7 @@ def _prepare(
     try:
         current = _read_manifest(manifest)
         if current is not None and current.get("project_hash") == project_hash:
-            return current["python"], ""  # another driver just did this
+            return current["python"], ""  # another main process just did this
         try:
             os.remove(manifest)
         except OSError:
@@ -487,7 +487,7 @@ def main() -> int:
     bindir = os.path.dirname(python)
     env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     env["VIRTUAL_ENV"] = os.path.dirname(bindir)
-    return subprocess.call([python, "-m", "valuekit.host"], env=env)
+    return subprocess.call([python, "-m", "valuekit.hostprocess"], env=env)
 
 
 if __name__ == "__main__":

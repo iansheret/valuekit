@@ -55,7 +55,7 @@ __all__ = ["reachable_set", "ReachableSet", "PYTHON"]
 _MISSING = object()
 
 # The running interpreter's major and minor version: a marker in every code
-# hash, and what driver and host compare before comparing hashes.
+# hash, and what main process and host compare before comparing hashes.
 PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
@@ -137,7 +137,7 @@ def _dist_version(top: str) -> str | None:
 # is the name of the directory the tree was unpacked into), so it is set
 # once and no manifest is walked there.
 
-_project_hash_here: str | None = None  # set on a worker; None on the driver
+_project_hash_here: str | None = None  # set on a worker; None on the main process
 _walk = threading.local()  # .project_hashes: identities computed by the walk in progress
 
 

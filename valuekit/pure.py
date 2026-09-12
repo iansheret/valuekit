@@ -410,8 +410,8 @@ def _pure(fn: Callable, *, local: bool):
         function_hash, spans = reach.hash, reach.spans
         runlog.current_run(store)  # the run begins with its first memoised call
 
-        # In a worker whose store is the driver's, a @pure_local call is
-        # the driver's to make: it has the environment, and it does its own
+        # In a worker whose store is the main process's, a @pure_local call is
+        # the main process's to make: it has the environment, and it does its own
         # lookup, so nothing is asked of the cache from here.
         if local:
             local_call = getattr(store, "local_call", None)

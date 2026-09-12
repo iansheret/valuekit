@@ -612,8 +612,8 @@ class TestNativeExtensions:
         monkeypatch.setenv("VALUEKIT_PROJECT_HASH", "7" * 40)
         assert _handshake(_hello(m.process, project_hash="7" * 40)) == ""
         assert functionhash._project_hash_here == "7" * 40
-        # A worker in some other tree than the one the driver meant refuses.
-        assert "the driver meant" in _handshake(_hello(m.process, project_hash="8" * 40))
+        # A worker in some other tree than the one the main process meant refuses.
+        assert "the main process meant" in _handshake(_hello(m.process, project_hash="8" * 40))
         mod, path = fake_extension
         assert _classify(mod.__name__, mod.__file__)[1] == "ext:_fake_ext=" + "7" * 40
 
@@ -2818,10 +2818,10 @@ def _locked_files(build=True):
         check=True, capture_output=True,
     )
     [whl] = list((d / "wheels").glob("*.whl"))
-    # numpy is pinned to the driver's: a package's version is part of the
+    # numpy is pinned to the main process's: a package's version is part of the
     # function_hash of every function that uses it, and a host whose numpy
-    # differed would refuse the driver's functions as out of sync.  The
-    # Python is the driver's minor, which is what a host is built for; a
+    # differed would refuse the main process's functions as out of sync.  The
+    # Python is the main process's minor, which is what a host is built for; a
     # wider range would make uv resolve for Pythons the pin cannot serve.
     from importlib.metadata import version
 
@@ -3220,11 +3220,11 @@ class TestBatches:
         m, _ = _write_batch_module(tmp_path)
 
         @pure
-        def driver(n):
+        def main process(n):
             return vk.run_all(m.process, list(range(1, n + 1))).values
 
-        assert driver(2) == [11, 21]
-        _, t = _record_of(cache, driver)
+        assert main process(2) == [11, 21]
+        _, t = _record_of(cache, main process)
         key = m.process._valuekit_reachable().hash
         assert [c[:2] for c in t["calls"]] == [["process", key]] * 2
         assert {c[2] for c in t["calls"]} == {r.record_hash for r in vk.batch("process")}
@@ -3479,7 +3479,7 @@ class TestMonitor:
     def test_state_folds_placement_hosts_and_per_machine_counts(self):
         st = self._state(
             [
-                {"ev": "process", "pid": 1, "role": "driver", "argv": ["drive.py"]},
+                {"ev": "process", "pid": 1, "role": "main", "argv": ["drive.py"]},
                 {"ev": "host", "id": 1, "name": "mac", "ok": True, "capacity": 8},
                 {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
                 {"ev": "placement", "id": 1, "mode": "all", "capacities": {"mac": 8, "pc": 0, "local": 4}},
@@ -3504,7 +3504,7 @@ class TestMonitor:
 
         st = self._state(
             [
-                {"ev": "process", "pid": 1, "role": "driver", "argv": ["drive.py"]},
+                {"ev": "process", "pid": 1, "role": "main", "argv": ["drive.py"]},
                 {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
                 {"ev": "placement", "id": 1, "mode": "all", "capacities": {"mac": 8, "pc": 0, "local": 4}},
                 {"ev": "start", "id": 1, "i": 0, "host": "mac"},
@@ -3519,7 +3519,7 @@ class TestMonitor:
         assert "dropped: ssh failed" in pc
         local = next(l for l in text.splitlines() if l.strip().startswith("local"))
         assert local.split()[:2] == ["local", "4"]
-        # With no driver yet, the applied mode is unknown and nothing is claimed.
+        # With no main process yet, the applied mode is unknown and nothing is claimed.
         assert "(applied: -)" in "\n".join(monitor._render(monitor._State(), 80, requested="local"))
 
     def test_keys_set_the_mode_line(self, tmp_path):
@@ -3575,7 +3575,7 @@ class TestSweep:
         m = self._module(tmp_path, "np.arange(1000.0) * x")
         vk.run_all(m.f, [1, 2], max_workers=1)
         vk.run_all(m.g, [1], max_workers=1)
-        vk.log({"q": "note"}, np.arange(5.0))  # from the driver: no record names it
+        vk.log({"q": "note"}, np.arange(5.0))  # from the main process: no record names it
         old_key = m.f._valuekit_reachable().hash
         g_key = m.g._valuekit_reachable().hash
         n_objects = len([p for p in (cache / "objects").rglob("*") if p.is_file()])
@@ -3741,7 +3741,7 @@ class TestEventLog:
         # does not work on Windows.
         assert all(len(files) == 1 for files in by_pid.values())
         roles = [e["role"] for _, e in _records(cache, "process")]
-        assert roles.count("driver") == 1 and roles.count("worker") == 3
+        assert roles.count("main") == 1 and roles.count("worker") == 3
 
     def test_sequential_fallback_still_reports(self, cache, tmp_path, monkeypatch):
         import bdb
@@ -4007,18 +4007,18 @@ class TestRemoteMachine:
         vk.run_all(m.process, [1, 2])
         assert len(counts()) == n  # second round: all hits, zero executions
 
-    def test_workers_write_nothing_and_report_through_the_driver(self, cache, tmp_path):
-        # A worker's store is the driver's: its hits, misses, call records and
+    def test_workers_write_nothing_and_report_through_the_main_process(self, cache, tmp_path):
+        # A worker's store is the main process's: its hits, misses, call records and
         # values all arrive here, and it opens no run file of its own.
         m, _ = _write_batch_module(tmp_path)
         vk.run_all(m.process, [1, 2])
         roles = [e["role"] for _, e in _records(cache, "process")]
-        assert roles == ["driver"]
+        assert roles == ["main"]
         misses = [e["fn"] for _, e in _records(cache, "miss")]
         assert sorted(misses) == ["analyse", "analyse", "load", "load", "process", "process"]
         assert LocalStore(cache).get_records(m.load._valuekit_reachable().hash)
 
-    def test_a_pure_local_call_in_a_worker_runs_on_the_driver(self, cache, tmp_path):
+    def test_a_pure_local_call_in_a_worker_runs_in_the_main_process(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
         r = vk.run_all(m.via_local, [1, 2])
         assert r.values == [os.getpid()] * 2  # this process, not a worker
@@ -4026,18 +4026,18 @@ class TestRemoteMachine:
         assert b[1].logs.where(q="where").one().value == os.getpid()
         assert [c.result for c in b[1].calls] == [os.getpid()]
         assert vk.logs().where(q="where", x=1).one().value == os.getpid()
-        # The driver stored the call's record; the worker's row names it.
+        # The main process stored the call's record; the worker's row names it.
         assert LocalStore(cache).get_records(m.here._valuekit_reachable().hash)
 
-    def test_values_logged_in_a_worker_reach_the_drivers_log(self, cache, tmp_path):
+    def test_values_logged_in_a_worker_reach_the_main_process_log(self, cache, tmp_path):
         m, counts = _write_batch_module(tmp_path)
         vk.run_all(m.with_log, [1, 2])
         assert [e["host"] for _, e in _records(cache, "start")] == ["h1", "h1"]
         L = vk.logs()
         np.testing.assert_array_equal(L.where(q="arr", sid=2).one().value, [0.0, 2.0, 4.0])
         assert len(L.where(q="twice")) == 4
-        assert len(list(L._path.glob("*.jsonl"))) == 1  # the driver's file; no worker wrote
-        # A hit inside a worker asks the driver to emit what the record
+        assert len(list(L._path.glob("*.jsonl"))) == 1  # the main process's file; no worker wrote
+        # A hit inside a worker asks the main process to emit what the record
         # recorded: outer_log misses there, with_log hits.
         vk.run_all(m.outer_log, [1])
         assert len(vk.logs().where(q="parity", sid=1)) == 2
@@ -4092,7 +4092,7 @@ class TestRemoteMachine:
 # code sync
 # ===========================================================================
 #
-# The worker runs on this host, so the driver's live tree is genuinely
+# The worker runs on this host, so the main process's live tree is genuinely
 # reachable. That is exactly why these tests matter: without the source tree and
 # the import check, a worker could import from the live tree and the whole feature
 # would look like it worked while proving nothing.
@@ -4268,7 +4268,7 @@ class TestBootstrap:
         return row
 
     def _tree(self, tmp_path, **files):
-        """A driver-side tree: its hash, its manifest and a tar of all of it."""
+        """A main process-side tree: its hash, its manifest and a tar of all of it."""
         root = tmp_path / "src"
         if root.exists():
             shutil.rmtree(root)
@@ -4303,7 +4303,7 @@ class TestBootstrap:
         build.parent.mkdir()
         build.write_text("keep me")
         second = self._tree(tmp_path, **{"fake.lock": "", "a.py": "A = 2\n", "new.py": "y\n"})
-        # The driver sends only what differs, and names what went.
+        # The main process sends only what differs, and names what went.
         changed = [(rel, h) for rel, h in second[1].items() if first[1].get(rel) != h]
         tar = sync.pack_tree(str(tmp_path / "src"), changed)
         assert sorted(rel for rel, _ in changed) == ["a.py", "new.py"]
@@ -4325,7 +4325,7 @@ class TestBootstrap:
         assert (tmp_path / "precious").exists()
 
     def test_the_sync_names_this_interpreter_when_its_minor_matches(self, tmp_path, fake_tool):
-        # A host that already has the driver's minor uses it: no download,
+        # A host that already has the main process's minor uses it: no download,
         # and none of the lock tool's search through managed installations.
         mine = "%d.%d" % sys.version_info[:2]
         th, files, tar = self._tree(tmp_path, **{"fake.lock": ""})
@@ -4378,7 +4378,7 @@ class TestBootstrap:
         lock.write_text("")  # a live one does, until the wait runs out
         monkeypatch.setattr(bootstrap, "_WAIT", 1)
         python, reason = self._prepare(root, self._tree(tmp_path, **{"fake.lock": "", "b.py": ""}))
-        assert python == "" and "another driver" in reason
+        assert python == "" and "another main process" in reason
 
     def test_stage0_is_shell_safe(self):
         assert not set(bootstrap.STAGE0) & set("$\\%^&|<>\"")
@@ -4392,7 +4392,7 @@ class TestBootstrap:
         assert out.returncode != 0 and b"Traceback" in out.stderr
 
     def test_stage_zero_exits_when_its_stream_ends_early(self):
-        # A driver that dies before sending the script closes stage 0's
+        # A main process that dies before sending the script closes stage 0's
         # stdin. Reading one byte at a time, an EOF is an empty read; it must
         # end the process, not be joined forever (this once left an orphan
         # spinning at full CPU and growing without bound on both platforms).
@@ -4506,7 +4506,7 @@ class TestSourceTree:
         completions = queue.Queue()
         first = _remote_machine(m.work, cache, completions=completions)
         assert first.ensure_ready() == ""
-        # A second driver, with an edited project, updates the host's copy.
+        # A second main process, with an edited project, updates the host's copy.
         (root / "vk_sync_mod.py").write_text(
             "from valuekit import pure\n@pure\ndef work(x):\n    return x + 999999\n"
         )

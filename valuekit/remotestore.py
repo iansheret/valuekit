@@ -1,18 +1,18 @@
-"""A worker's store: the driver's store, reached over the connection.
+"""A worker's store: the main process's store, reached over the connection.
 
 A worker keeps no cache of its own.  Every value and record it produces is
-sent to the driver, every lookup asks the driver, and every event
-goes there too, so the driver's directory is the one place a batch's
+sent to the main process, every lookup asks the main process, and every event
+goes there too, so the main process's directory is the one place a batch's
 results exist wherever the work ran.  This is also what lets a
-``@pure_local`` function called in a worker run on the driver instead:
+``@pure_local`` function called in a worker run on the main process instead:
 the call is a request like any other, and the answer is a value.
 
 The conversation is strictly sequential on this side -- one request, then
 its reply -- so nothing here multiplexes.  Replies are read off the same
 stream the task arrived on; an OBJECT message at any point is one more
-object the driver has sent, and is kept.
+object the main process has sent, and is kept.
 
-Objects sent and objects received are both remembered by hash: the driver
+Objects sent and objects received are both remembered by hash: the main process
 has all of them, so none is sent twice, and a reply can name any of them
 without repeating it.
 """
@@ -40,7 +40,7 @@ class RemoteStore:
     # -- objects ----------------------------------------------------------
 
     def receive(self, body: bytes) -> None:
-        """Keep one OBJECT message the driver sent."""
+        """Keep one OBJECT message the main process sent."""
         protocol.recv_object(body, self._objects)
         self._seen.add(body[:20].hex())
 
@@ -77,32 +77,32 @@ class RemoteStore:
         protocol.write_message(self._tx, protocol.RECORD, protocol.strings(function_hash, json.dumps(record)))
         return record_hash(record)
 
-    # -- the driver's side of the run log ------------------------------------
+    # -- the main process's side of the run log ------------------------------------
 
     def emit(self, record: dict) -> None:
         protocol.write_message(self._tx, protocol.EVENT, json.dumps(record).encode())
 
-    # -- the driver's side of the run's log ------------------------------------
+    # -- the main process's side of the run's log ------------------------------------
 
     def emit_line(self, line: str) -> None:
         protocol.write_message(self._tx, protocol.LOGGED, line.encode())
 
     def reemit(self, function_hash: str, h: str) -> None:
-        """Have the driver emit what the call record *h* recorded; CacheMiss if it
+        """Have the main process emit what the call record *h* recorded; CacheMiss if it
         could not read the whole subtree, in which case it emitted nothing."""
         protocol.write_message(self._tx, protocol.REEMIT, protocol.strings(function_hash, h))
         reason = self._reply(protocol.REEMITTED)
         if reason:
             raise CacheMiss(f"{h}: {reason.decode('utf-8', 'replace')}")
 
-    # -- a call that must run on the driver ----------------------------------
+    # -- a call that must run on the main process ----------------------------------
 
     def local_call(self, module: str, qualname: str, args: tuple, kwargs: dict):
-        """Run ``module:qualname(*args, **kwargs)`` on the driver.
+        """Run ``module:qualname(*args, **kwargs)`` on the main process.
 
-        Returns ``(value, record_hash)``; the hash is empty if the driver
+        Returns ``(value, record_hash)``; the hash is empty if the main process
         stored no call record for the call.  A failure there raises here, with
-        the driver's traceback as the message.
+        the main process's traceback as the message.
         """
         root = self.put_value((args, kwargs))
         protocol.write_message(self._tx, protocol.CALL, protocol.strings(module, qualname, root))
@@ -111,7 +111,7 @@ class RemoteStore:
             result_root, h = protocol.unstrings(body[1:])
             return self.unpack(result_root), h
         kind, text, tb = protocol.unstrings(body[1:])
-        raise RuntimeError(f"{qualname} failed on the driver: {kind}: {text}\n{tb}")
+        raise RuntimeError(f"{qualname} failed on the main process: {kind}: {text}\n{tb}")
 
     # -- replies ----------------------------------------------------------------
 
@@ -120,7 +120,7 @@ class RemoteStore:
         while True:
             message = protocol.read_message(self._rx)
             if message is None:
-                raise protocol.ProtocolError("the driver went away mid-request")
+                raise protocol.ProtocolError("the main process went away mid-request")
             got, body = message
             if got == protocol.OBJECT:
                 self.receive(body)

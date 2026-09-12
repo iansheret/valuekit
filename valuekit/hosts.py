@@ -24,7 +24,7 @@ already knows how to attribute.
 
 Two hosts.  :class:`LocalHost` spawns a process per input on this
 host.  :class:`RemoteHost` holds one connection to a *host process*
-(:mod:`valuekit.host`), on this machine or over ssh, which starts a worker
+(:mod:`valuekit.hostprocess`), on this machine or over ssh, which starts a worker
 per task and carries each worker's stream as a numbered channel.  A worker
 on a host holds no cache: its store is this process's store, so the messages
 that arrive on a channel are not only its answer but a call record to keep, a
@@ -101,12 +101,12 @@ class Backend(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def _child_main(conn, cache_dir: str | None, fn, x, run=None) -> None:
+def _local_worker_main(conn, cache_dir: str | None, fn, x, run=None) -> None:
     """Runs in the worker process: configure the cache, run one input, send
     one message back: ("ok", value) or ("err", exc, tb) or, when the
     exception or value cannot be pickled, ("err_str", type_name, text, tb).
-    *run* is the driver's ``(name, id)``: what this worker logs goes
-    into the driver's runlog.
+    *run* is the main process's ``(name, id)``: what this worker logs goes
+    into the main process's runlog.
     """
     try:
         if cache_dir is not None:
@@ -192,7 +192,7 @@ class LocalHost:
 
     Isolation is the point: a timeout kills exactly one process and a
     segfault loses exactly one input.  Processes are daemonic, so they are
-    cleaned up if the driver exits.
+    cleaned up if the main process exits.
     """
 
     name = "local"
@@ -208,7 +208,7 @@ class LocalHost:
 
         recv_end, send_end = self._ctx.Pipe(duplex=False)
         proc = self._ctx.Process(
-            target=_child_main,
+            target=_local_worker_main,
             args=(send_end, self._cache_dir, self._fn, x, runlog.current()),
             daemon=True,
         )
@@ -402,7 +402,7 @@ class _Handle:
         elif tag == protocol.GET_VALUE:
             try:
                 if store is None:
-                    raise CacheMiss("the driver has no cache directory")
+                    raise CacheMiss("the main process has no cache directory")
                 v = store.get_value(body.hex())
             except CacheMiss as e:
                 self._write_message(protocol.VALUE, str(e).encode())
@@ -426,7 +426,7 @@ class _Handle:
             reason = b""
             try:
                 if store is None:
-                    raise CacheMiss("the driver has no cache directory")
+                    raise CacheMiss("the main process has no cache directory")
                 runlog.reemit(store, function_hash, h, store.get_record(function_hash, h))
             except CacheMiss as e:
                 reason = str(e).encode() or b"unreadable"
@@ -680,7 +680,7 @@ class RemoteHost:
         python, cpus, pid = (protocol.unstrings(message[1]) + ["", "", ""])[:3]
         if python != PYTHON:
             self._connection.close()
-            return f"driver runs Python {PYTHON}, host {self.name!r} runs {python}"
+            return f"main process runs Python {PYTHON}, host {self.name!r} runs {python}"
         if self.capacity is None:
             self.capacity = max(1, int(cpus))
         self.pid = int(pid) if pid.isdigit() else None
@@ -751,7 +751,7 @@ class RemoteHost:
         Returns "" when the host can take work, else why not.  A failure
         is a fact about the host, recorded once rather than against every
         input that would have gone there.  The connection carries the
-        project over and builds its environment; a readiness worker then
+        project over and builds its environment; a readiness check then
         imports the function from it and checks what it got.
         """
         from . import protocol

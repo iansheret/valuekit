@@ -14,10 +14,10 @@ The monitor also shows where work is going and lets you change it.  The
 *mode* (see :mod:`valuekit.placement`) is a line in the project's local
 file, ``valuekit.local.toml``; keys ``l``, ``r`` and ``a`` set it to
 ``local``, ``remote`` or ``all``, and that line is the only thing the
-monitor ever writes.  The driver reads the file whenever it starts a task
+monitor ever writes.  The main process reads the file whenever it starts a task
 and records the mode it is applying, so the header shows both the mode
 asked for and the mode in force; they differ until the next task starts,
-or while no driver is running.  ``--mode <mode>`` sets the line and exits,
+or while no main process is running.  ``--mode <mode>`` sets the line and exits,
 for scripts.
 
 The cache directory is taken as an argument, falling back to
@@ -73,14 +73,14 @@ class _State:
         t = e.get("t", 0.0)
         run = self.runs.setdefault(
             source,
-            {"pid": None, "argv": [], "role": "driver", "started": t, "last": t},
+            {"pid": None, "argv": [], "role": "main", "started": t, "last": t},
         )
         run["last"] = max(run["last"], t)
 
         if ev == "process":
             run["pid"] = e.get("pid")
             run["argv"] = e.get("argv") or []
-            run["role"] = e.get("role", "driver")
+            run["role"] = e.get("role", "main")
             run["started"] = t
             return
 
@@ -165,7 +165,7 @@ class _State:
         del self.failures[:-_MAX_FAILURES]
 
     def current(self) -> set[str]:
-        """The sources belonging to the newest run: its driver and the
+        """The sources belonging to the newest run: its main process and the
         workers it spawned.
 
         Scoping matters for the hit rate.  Aggregated over every run file in
@@ -173,14 +173,14 @@ class _State:
         the number stops meaning anything; what a watcher wants is the run
         in front of them.
         """
-        drivers = [r for r in self.runs.values() if r["role"] != "worker"]
-        if not drivers:
+        mains = [r for r in self.runs.values() if r["role"] != "worker"]
+        if not mains:
             return set(self.runs)
-        # No grace window: a driver writes its batch record before spawning
+        # No grace window: a main process writes its batch record before spawning
         # anything, so its own file always predates its workers'. Allowing
         # slack here instead lets the previous run's stragglers leak in and
         # quietly spoil the rate.
-        since = max(r["started"] for r in drivers)
+        since = max(r["started"] for r in mains)
         return {s for s, r in self.runs.items() if r["started"] >= since}
 
     def applied(self, scope: set[str]) -> dict | None:
@@ -237,11 +237,11 @@ def _render(
     out: list[str] = []
 
     live = [r for r in state.runs.values() if now - r["last"] < _LIVE_AFTER]
-    drivers = [r for r in live if r["role"] != "worker"]
-    workers = len(live) - len(drivers)
+    mains = [r for r in live if r["role"] != "worker"]
+    workers = len(live) - len(mains)
     idle = len(state.runs) - len(live)
     extra = f", {workers} worker{'s' if workers != 1 else ''}" if workers else ""
-    out.append(f"runs: {len(drivers)} live{extra}, {idle} finished")
+    out.append(f"runs: {len(mains)} live{extra}, {idle} finished")
 
     scope = state.current()
     applied = state.applied(scope)
@@ -254,12 +254,12 @@ def _render(
         out.append(line)
     out.append("")
 
-    for r in sorted(drivers, key=lambda r: r["started"]):
+    for r in sorted(mains, key=lambda r: r["started"]):
         script = os.path.basename(r["argv"][0]) if r["argv"] else "?"
         out.append(
             f"  pid {str(r['pid']):<8} {script:<28} up {_fmt_dur(now - r['started'])}"
         )
-    if drivers:
+    if mains:
         out.append("")
 
     # Every host that is configured, applied, or has done anything.

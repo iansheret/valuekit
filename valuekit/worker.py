@@ -1,4 +1,4 @@
-"""A worker that runs the driver's code, from a copy of the driver's source.
+"""A worker that runs the main process's code, from a copy of the main process's source.
 
 ``python -m valuekit.worker`` reads framed messages on stdin and writes them
 on stdout.  It comes in two shapes.  ``--ready`` makes one process per host
@@ -13,11 +13,11 @@ into the first task would report it against whichever input happened to go
 first.  Getting that wrong would break the one property `run_all` is built
 around: every failure recorded against the input that caused it.
 
-    driver -> HELLO   Python version, module, qualname, function hash, project hash, import roots
+    main   -> HELLO   Python version, module, qualname, function hash, project hash, import roots
     worker -> READY   empty if accepted, else why not
-    driver -> OBJECT* the input's object graph            (task workers only)
-    driver -> TASK    the input's root hash
-    ...               store traffic: the worker's cache is the driver's
+    main   -> OBJECT* the input's object graph            (task workers only)
+    main   -> TASK    the input's root hash
+    ...               store traffic: the worker's cache is the main process's
     worker -> OBJECT* the result's object graph
     worker -> RESULT  ok and a root hash, or a failure
 
@@ -25,19 +25,19 @@ The source tree is already here, and so is the environment it needs: the
 bootstrap (:mod:`valuekit.bootstrap`) received the tree and built the
 environment before this interpreter -- the environment's own -- started,
 and named the tree in ``VALUEKIT_TREE``.  The HELLO message says which tree the
-driver meant, and a worker in the wrong one refuses.
+main process meant, and a worker in the wrong one refuses.
 
 A worker holds no cache.  Its store is a :class:`~valuekit.remotestore.RemoteStore`,
-which sends every value, call record and event to the driver and asks the
-driver for every lookup, so a batch's results exist in one place however
+which sends every value, call record and event to the main process and asks the
+main process for every lookup, so a batch's results exist in one place however
 many machines ran it.
 
 Three checks guard the result, and they are deliberately independent.  The
 source tree decides what is on ``sys.path``; the *check_imports* then confirms that
 what was actually imported came from there, because a path entry can still
 lose to some other finder on ``sys.meta_path``; and the function hash
-handshake confirms the code means what the driver thinks.  The check_imports
-matters most: it is the difference between running the driver's code and
+handshake confirms the code means what the main process thinks.  The check_imports
+matters most: it is the difference between running the main process's code and
 running whatever the worker happened to have.
 
 The transport carries values, never code.  What crosses is the fixed set of
@@ -72,7 +72,7 @@ def _resolve(module: str, qualname: str):
 
 def _take_project_hash(project_hash: str) -> None:
     """A native extension here was built from the tree named *project_hash*, so
-    that is its marker, exactly as it is on the driver.  See
+    that is its marker, exactly as it is on the main process.  See
     :mod:`valuekit.functionhash`."""
     from . import functionhash
 
@@ -83,7 +83,7 @@ def _tree(project_hash: str) -> tuple[Path | None, str]:
     """The source tree this worker runs from, or why it cannot.
 
     Named by the bootstrap in the environment; the HELLO message says which tree
-    the driver meant, and they must agree.  No tree at all (an empty id and
+    the main process meant, and they must agree.  No tree at all (an empty id and
     nothing in the environment) means the tests' in-process worker, which
     imports as this process does.
     """
@@ -95,7 +95,7 @@ def _tree(project_hash: str) -> tuple[Path | None, str]:
     started_with = os.environ.get("VALUEKIT_PROJECT_HASH", "")
     if started_with != project_hash:
         return None, (
-            f"this worker's tree is {started_with[:12]}, the driver meant {project_hash[:12]}"
+            f"this worker's tree is {started_with[:12]}, the main process meant {project_hash[:12]}"
         )
     return Path(here), ""
 
@@ -151,7 +151,7 @@ def _check_imports(source: Path) -> str:
     if strays:
         return (
             "these modules were imported from outside the source tree, so this "
-            "worker would not be running the driver's code:\n  "
+            "worker would not be running the main process's code:\n  "
             + "\n  ".join(sorted(strays))
             + f"\nExpected everything under {real}."
         )
@@ -163,11 +163,11 @@ def _accept(python: str, module: str, qualname: str, function_hash: str) -> str:
     from .functionhash import PYTHON, reachable_set
 
     if PYTHON != python:
-        return f"driver runs Python {python}, this worker runs {PYTHON}"
+        return f"main process runs Python {python}, this worker runs {PYTHON}"
     if module == "__main__":
         return (
             "the function is defined in __main__; a worker cannot import a "
-            "driver script. Move it to a module and import it."
+            "main script. Move it to a module and import it."
         )
     try:
         fn = _resolve(module, qualname)
@@ -181,10 +181,10 @@ def _accept(python: str, module: str, qualname: str, function_hash: str) -> str:
         if _tree_replaced():
             return (
                 f"the project on this host was replaced by a later run since this "
-                f"batch started; {module}:{qualname} here is no longer the driver's"
+                f"batch started; {module}:{qualname} here is no longer the main process's"
             )
         return (
-            f"{module}:{qualname} differs here: driver has {function_hash[:12]}, "
+            f"{module}:{qualname} differs here: main process has {function_hash[:12]}, "
             f"this worker has {theirs[:12]}. The code is not in sync."
         )
     return ""
@@ -198,7 +198,7 @@ def _handshake(rx: BinaryIO, tx: BinaryIO, check_imports: bool) -> tuple[bool, s
     """
     message = protocol.read_message(rx)
     if message is None:
-        return False, ""  # the driver went away before saying anything
+        return False, ""  # the main process went away before saying anything
     tag, body = message
     if tag != protocol.HELLO:
         protocol.write_message(tx, protocol.READY, b"expected a HELLO message")

@@ -37,29 +37,29 @@ with `uv sync` from a lock file. The suite therefore needs `uv` on the PATH.
 `run_all` runs a batch across this machine and any hosts named in the project's
 `valuekit.local.toml`. The sequence for a host:
 
-1. The driver refuses before connecting if the project cannot go: no lock file valuekit
+1. The main process refuses before connecting if the project cannot go: no lock file valuekit
    knows, or user code outside the project tree (`sync.Project.refusal`).
-2. The driver opens one connection: `ssh -T -o BatchMode=yes <target> "<python> -c
+2. The main process opens one connection: `ssh -T -o BatchMode=yes <target> "<python> -c
    <stage 0>"`, where stage 0 is a one-line Python program that reads a script off stdin
-   up to a NUL byte and runs it. The driver sends `valuekit/bootstrap.py` as that script.
+   up to a NUL byte and runs it. The main process sends `valuekit/bootstrap.py` as that script.
 3. The bootstrap speaks a short JSON-line protocol on the same streams: it says whether
    `source_root/<project>` already holds this project hash, else reports the files it has;
-   the driver sends the names to delete and a tar of the files whose hash differs; the
+   the main process sends the names to delete and a tar of the files whose hash differs; the
    bootstrap applies both in place, runs the lock tool's sync (`uv sync --frozen --python
-   <driver's minor>`), writes the manifest beside the directory (project hash, interpreter,
-   every file's hash), and starts `python -m valuekit.host` from that interpreter with
+   <main process's minor>`), writes the manifest beside the directory (project hash, interpreter,
+   every file's hash), and starts `python -m valuekit.hostprocess` from that interpreter with
    `VALUEKIT_TREE` and `VALUEKIT_PROJECT_HASH` set, on the same streams, in the environment
    activated (its interpreter's directory first on `PATH`, `VIRTUAL_ENV` set).
 4. The host process's first message carries its Python version, CPU count and pid. On a
-   readiness channel the driver sends HELLO (Python version, function, function hash, project hash,
+   readiness channel the main process sends HELLO (Python version, function, function hash, project hash,
    import roots); the host
    starts `valuekit.worker --ready`, which puts the tree's roots on `sys.path`, imports the
    function, checks that every user module came from the tree, and compares function hashes.
    Readiness runs on a thread per host; the batch never waits for it.
 5. Each task is a channel: one `valuekit.worker` per task. The worker's store is a
-   `RemoteStore`, so its values, call records, logged values and events go to the driver, its lookups ask
-   the driver, and a `@pure_local` call is sent to the driver to run there.
-6. The driver records each outcome under the host it ran on. An input whose host
+   `RemoteStore`, so its values, call records, logged values and events go to the main process, its lookups ask
+   the main process, and a `@pure_local` call is sent to the main process to run there.
+6. The main process records each outcome under the host it ran on. An input whose host
    connection closed, or whose task worker was refused because a later run replaced the
    host's copy of the project, is requeued elsewhere, once; a worker that exits with a
    code fails its input as a local one would.
@@ -73,9 +73,9 @@ join as they become ready.
 ```
 Connection    bytes to a process on the host       hosts.ProcessConnection (later: a socket)
 bootstrap     tree -> environment -> host process   bootstrap.py, both halves, stdlib-only
-host          workers as numbered channels          host.py
+host          workers as numbered channels          hostprocess.py
 worker        check the function hash, run one task      worker.py
-store         the driver's store over the channel   remotestore.py
+store         the main process's store over the channel   remotestore.py
 ```
 
 ## Module map
@@ -86,7 +86,7 @@ store         the driver's store over the channel   remotestore.py
 | `valuekit/placement.py` | The local file (hosts, worker cap, mode, project name), capacities per mode, the worker environment allowlist. |
 | `valuekit/hosts.py` | `Connection`/`ProcessConnection`, `LocalHost` (a process per input), `RemoteHost` (one connection, a channel per task), and the handle that answers a worker's store requests and runs its `@pure_local` calls. |
 | `valuekit/bootstrap.py` | How a tree becomes an environment on a host: the lock-tool table, the layout under `source_root`, extraction, the sync, starting the host process. Both halves of its protocol. Stdlib only. |
-| `valuekit/host.py` | The host process: starts a worker per channel, multiplexes their streams, exits on EOF. |
+| `valuekit/hostprocess.py` | The host process: starts a worker per channel, multiplexes their streams, exits on EOF. |
 | `valuekit/worker.py` | The worker process: a readiness mode and a single-task mode; install, admit, audit. |
 | `valuekit/remotestore.py` | `RemoteStore`: the worker's side of the store, over its channel. |
 | `valuekit/protocol.py` | Message framing, channel framing, and value transfer as content-addressed object graphs. |
@@ -104,7 +104,7 @@ store         the driver's store over the channel   remotestore.py
 **A project runs remotely iff its tree carries a lock file from a tool valuekit can
 invoke, and that tool is on the host.** The capability needed is: given the tree and
 nothing else, produce an interpreter on the host that imports the project with the
-versions the driver has. Lock tools provide it; the requirement is the capability, not
+versions the main process has. Lock tools provide it; the requirement is the capability, not
 uv. Detection is by lock filename through a table (`bootstrap._TOOLS`) with one row per
 tool; uv is the first row because it is what can be validated between the two machines
 to hand. Nothing above the bootstrap knows which row was used. The README says
@@ -131,7 +131,7 @@ build of a native extension: CMake keys its cache on the source path. Now
 it holds and every file's hash, and an update sends only the difference and touches
 nothing the manifest never listed, so `build/` and the environment persist. The manifest
 is removed before an update and written after; a lock file beside the directory says an
-update is in progress, a second driver waits for it, and a lock older than an hour is
+update is in progress, a second main process waits for it, and a lock older than an hour is
 broken. A sync that fails keeps the tree and drops the manifest, so the next update starts
 from what is there. The cost is that a host holds one version at a time: a later run
 evicts an earlier batch from that host (its remaining inputs are requeued elsewhere, once,
@@ -143,7 +143,7 @@ binary from the same sources, so the tree is what they share; a key computed any
 equals a key computed anywhere else with nothing sent between them. The cost is coarseness
 (any edit in the project re-keys functions that reach an extension) and reliance on the
 build being current: the key describes the sources, so a build backend that rebuilds on
-import is what keeps the driver honest. On a worker the hash is the tree's name,
+import is what keeps the main process honest. On a worker the hash is the tree's name,
 known before anything is imported. An extension with no project marker above it at all is
 identified by its binary, which is all there is.
 
@@ -171,11 +171,11 @@ by a function hash, and where a call ran must not be able to affect its result.
 function that produced them, an already-cached input needs no worker, and a function whose
 effects do not matter is the only kind that can safely run elsewhere.
 
-**Workers hold no cache.** The worker's store is the driver's store over the connection.
+**Workers hold no cache.** The worker's store is the main process's store over the connection.
 The only things a host keeps are source trees and their environments, under `source_root`.
 
-**`@pure_local` runs on the driver.** A function that reads outside its arguments reads an
-environment, and environments differ between machines. The driver has the credentials and
+**`@pure_local` runs on the main process.** A function that reads outside its arguments reads an
+environment, and environments differ between machines. The main process has the credentials and
 the files; a worker sends the call back as a request and receives a value. There is no
 credential forwarding.
 
@@ -223,11 +223,14 @@ every test tree gets those files. The cost is `uv` in CI and a few seconds per n
 **Terminology.** "Source tree": the project's files on a host, one directory per project.
 "Project hash": its manifest hash, what the host's manifest names and a native extension's marker. "Event log": the diagnostic record of
 what happened during a run, for the monitor. "Call record": a memoised call's recorded reads, result, nested calls and
-logged values. "Batch record": what `run_all` writes under a name. "Run": one driver
+logged values. "Batch record": what `run_all` writes under a name. "Run": one main process
 process running a script. "Run log": the values a run logged, under `logs/`. "Host": a machine that can run
 workers, this one included; a remote host is one reached over ssh. "Host process": the process on a
-remote host that starts its workers. "Driver": the process in which `run_all` is called; it owns the
-cache, schedules the batch, and answers the workers. "Mode": which hosts are used. "Connection": the
+remote host that starts its workers. "Main process": the process the user started, in which the script runs; it owns the cache,
+and during a batch it schedules the inputs and answers the workers. "Worker": a process that runs
+one input and exits, started by the main process here or by a host process on a remote host.
+"Readiness check": the worker-module process that imports the function on a host and checks it,
+running no input. "Mode": which hosts are used. "Connection": the
 link to a remote host.
 
 ## Outstanding work
@@ -236,7 +239,7 @@ link to a remote host.
 
 **Validation progress (2026-09-08).** The Mac (`pidge.local`, user `ians`, 18 cores) and
 the PC (`hunk.local`, user `iansh`, 28 cores, Windows, sshd default shell `cmd.exe`) log
-into each other by key. Mac-as-driver, PC-as-host is verified: tree shipped and synced
+into each other by key. Mac-as-main process, PC-as-host is verified: tree shipped and synced
 under `C:\Users\iansh\.cache\valuekit\source`, outcomes recorded under the host, a
 second run skipped the transfer (host ready in 1s instead of 4s), mode `all` shared a
 60-input batch between both machines, and `valuekit.batch()` read the record back. Two
@@ -245,13 +248,13 @@ defects found and fixed on the way, both in `bootstrap.py`:
 - *uv could not inspect its managed Pythons on the PC* ("untrusted mount point", os
   error 448): sshd gives an administrator an elevated token, and Windows refuses an
   elevated process the junctions uv makes for its minor-version links. The bootstrap now
-  hands the lock tool its own interpreter's path when that interpreter has the driver's
+  hands the lock tool its own interpreter's path when that interpreter has the main process's
   minor, and the bare minor otherwise; uv then does no discovery.
-- *Stage 0 never ended at EOF*: a driver that died before sending the script left it
+- *Stage 0 never ended at EOF*: a main process that died before sending the script left it
   joining empty reads forever, at full CPU and growing without bound (seen on both
   machines). It now exits.
 
-**PC-as-driver, Mac-as-host is verified (2026-09-08).** From a PowerShell on the PC
+**PC-as-main process, Mac-as-host is verified (2026-09-08).** From a PowerShell on the PC
 (`C:\Users\iansh\trial`, `venv\Scripts\python.exe drive.py`, `VALUEKIT_HOSTS` naming
 `ians@pidge.local`): the tree was shipped and synced under
 `/Users/ians/.cache/valuekit/source`, uv on the Mac took the bare-minor branch (its ssh
@@ -260,7 +263,7 @@ including the build; a second run skipped the transfer (host ready in 2s, batch 
 mode `all` shared 60 inputs 32 on the Mac and 28 here with no failures or requeues, local
 work starting a second before the host joined. Two things to know when repeating it:
 
-- The driver must run under Windows' own ssh client (`C:\Windows\System32\OpenSSH`,
+- The main process must run under Windows' own ssh client (`C:\Windows\System32\OpenSSH`,
   which PowerShell's PATH gives) with a console. The key is passphrase-protected and held
   by the Windows ssh-agent service; Git Bash's MSYS ssh offers the key file, cannot ask
   for the passphrase under `BatchMode`, and is refused. A piped stdin is forwarded only
@@ -269,7 +272,7 @@ work starting a second before the host joined. Two things to know when repeating
   "started" and left the "never ran the bootstrap" host event in the trial's event log.
 - The bootstrap finds uv in `~/.local/bin` on the Mac; the non-interactive PATH there is
   `~/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
-- The trial's `venv` drives with the checkout as an editable install, so the driver side
+- The trial's `venv` drives with the checkout as an editable install, so the main process side
   is the working tree; the host side is the wheel named in the lock (`proj/wheels/`),
   rebuilt from the checkout with `uv build --wheel` and relocked with `uv lock --refresh`
   (a plain `uv lock` keeps the old hash when the filename is unchanged).
@@ -299,11 +302,11 @@ old binary on the new source; extracted files now take the host's current time.
 C compiler at all; Visual Studio Build Tools 2022 with the C++ workload (MSVC 14.44) was
 installed for this through winget. Then:
 
-- *PC driver, Mac host.* `uv sync --frozen` on the PC built the extension with MSVC
+- *PC main process, Mac host.* `uv sync --frozen` on the PC built the extension with MSVC
   (scikit-build-core finds the compiler itself; no developer prompt) and, with
   `hosts-mac.toml`, three inputs ran on the Mac in 4.0s from a cold tree: a `.pyd` here,
   a `.so` there, readiness passed, so one key for both binaries.
-- *Mac driver, PC host.* The Mac's copy carries the `s + 1` edit, so its project hash is the
+- *Mac main process, PC host.* The Mac's copy carries the `s + 1` edit, so its project hash is the
   one the Mac's own same-machine trial had produced; the PC built that tree under sshd
   (elevated token, no console) with MSVC, using the Visual Studio generator (the binary
   sits under `build/<tag>/Release/`), and readiness passed: 22.7s cold including the
@@ -315,8 +318,8 @@ protected, and a non-interactive session on the Mac has no agent, so `ssh -A` fr
 forwarded the Windows agent into the session (`ssh -A -T ians@pidge.local "cd ~/exttrial
 && PATH=$PWD/.venv/bin:$HOME/.local/bin:$PATH VALUEKIT_HOSTS=$PWD/hosts-pc.toml
 .venv/bin/python drive.py 7 8 9"`). The Mac's `~/.ssh/agent/` socket from June is stale
-and hangs `ssh-add`; do not use it. The driver's own venv must be activated (or its
-`Scripts`/`bin` put on PATH) for the import-time rebuild on the driver, which is the
+and hangs `ssh-add`; do not use it. The main process's own venv must be activated (or its
+`Scripts`/`bin` put on PATH) for the import-time rebuild on the main process, which is the
 user's shell's job, as the README says.
 
 1. ~~**Validate between the PC and the Mac, both directions.**~~ Done both ways (above).
@@ -332,7 +335,7 @@ user's shell's job, as the README says.
 
 4. **The Python version marker covers only `major.minor`.** Adding `micro` converts a silent
    risk into an explicit refusal, at the cost of a format-version bump. Less pressing now that
-   the bootstrap asks the lock tool for the driver's minor.
+   the bootstrap asks the lock tool for the main process's minor.
 
 5. **Verify a reported instability in `_unit_digest`** (a frozenset constant's `repr`
    varying with `PYTHONHASHSEED`). The evidence offered did not support the claim.
@@ -341,7 +344,7 @@ user's shell's job, as the README says.
 
 6. **A websocket `Connection` and a container image**, for Cloud Run services. The image is the
    toolchain; the bootstrap is the entrypoint; requeue covers a recycled instance. The
-   real limit is bandwidth to the driver's store; a bucket holding objects by hash would
+   real limit is bandwidth to the main process's store; a bucket holding objects by hash would
    be a second tier, after the streaming version works.
 
 7. **Collapse `LocalBackend` into a host process launched as a subprocess.** One code path;
@@ -350,7 +353,7 @@ user's shell's job, as the README says.
 8. **Moving a running task.** A mode switch applies to the next task started; a task
    already running finishes where it is. Correctness never needs more.
 
-9. **A cap on concurrent `@pure_local` calls on the driver.** They run on a thread pool
+9. **A cap on concurrent `@pure_local` calls on the main process.** They run on a thread pool
    sized by CPU count; a download-heavy batch may want a smaller number.
 
 ## Open questions
@@ -369,9 +372,9 @@ uv sync && uv run pytest -ra
 The repository is itself a locked project: `uv.lock` pins the suite's environment, and
 CI syncs from it. The host tests build a test project's environment with `uv` (which
 must therefore be on the PATH; they skip with a message when it is absent), pinning
-numpy to the driver's version and Python to the driver's minor, because a package's
+numpy to the main process's version and Python to the main process's minor, because a package's
 version is part of the function hash of every function that uses it and a host whose
-numpy differed would refuse the driver's functions as out of sync.
+numpy differed would refuse the main process's functions as out of sync.
 
 To exercise a host by hand without ssh, point the private hook at a Python on this
 machine and set a mode:

@@ -1,8 +1,8 @@
 """Getting the user's code to the machine that will run it.
 
-A worker must run the code the driver meant, and the driver must not have to
+A worker must run the code the main process meant, and the main process must not have to
 remember to copy it there -- an edit loop that needs a manual sync step is an
-edit loop nobody uses.  So the driver describes its project as a *manifest*,
+edit loop nobody uses.  So the main process describes its project as a *manifest*,
 the worker unpacks an immutable copy of it -- a *source tree* -- and imports
 from that rather than from whatever happens to be on its own disk.
 
@@ -154,7 +154,7 @@ def user_span_files(spans: Iterable[tuple[str, int, int]]) -> list[str]:
 
     Spans record ``co_filename`` unmodified, so they carry synthetic names
     (``<string>`` for a dataclass's generated methods, or anything exec'd),
-    the driver script itself, and genuine stdlib or site-packages paths -- a
+    the main script itself, and genuine stdlib or site-packages paths -- a
     user class whose methods came from elsewhere drags those in.  Only what
     survives all three filters is a file worth syncing.
     """
@@ -252,7 +252,7 @@ class Project:
         valuekit knows, since no host could build its environment; and a
         dependency in a sibling checkout the tree never contained, which
         would surface on the host as "cannot import X", with nothing to say
-        that X lives somewhere the driver never offered to send.
+        that X lives somewhere the main process never offered to send.
         """
         from . import bootstrap
         from .functionhash import reachable_set
