@@ -60,9 +60,8 @@ with `uv sync` from a lock file. The suite therefore needs `uv` on the PATH.
    `RemoteStore`, so its values, call records, logged values and events go to the main process, its lookups ask
    the main process, and a `@pure_local` call is sent to the main process to run there.
 6. The main process records each outcome under the host it ran on. An input whose host
-   connection closed, or whose task worker was refused because a later run replaced the
-   host's copy of the project, is requeued elsewhere, once; a worker that exits with a
-   code fails its input as a local one would.
+   connection closed is requeued elsewhere, once; a worker that exits with a code fails
+   its input as a local one would.
 
 The `mode` line of `valuekit.local.toml` is read each time a task is started and defaults to
 `all`. A switch to a mode that needs hosts not yet synced starts their sync; they
@@ -134,9 +133,11 @@ nothing the manifest never listed, so `build/` and the environment persist. The 
 is removed before an update and written after; a lock file beside the directory says an
 update is in progress, a second main process waits for it, and a lock older than an hour is
 broken. A sync that fails keeps the tree and drops the manifest, so the next update starts
-from what is there. The cost is that a host holds one version at a time: a later run
-evicts an earlier batch from that host (its remaining inputs are requeued elsewhere, once,
-like a lost connection). The project hash still says whether a host is current and still
+from what is there. A host holds one version at a time: while a host process runs, its
+bootstrap keeps a busy marker (refreshed every few seconds; ignored once stale) naming
+the run, and a run wanting a different version is refused with that name rather than
+updating the directory under a running batch. Starting a second run before stopping the
+first is the user's error, and the refusal says what to stop. The project hash still says whether a host is current and still
 stands for a native extension in the function hash.
 
 **A native extension's marker is the project hash of the tree it was built from.** Each host builds its own

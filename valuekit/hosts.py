@@ -45,7 +45,9 @@ import json
 import multiprocessing
 import os
 import queue
+import socket
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -266,7 +268,6 @@ class _Handle:
     __slots__ = (
         "ch", "objects", "seen", "completions", "out", "_machine", "_failure",
         "_buf", "_result", "_eof", "_exit", "_stderr", "_lock", "_messages", "_raw",
-        "_refused",
     )
 
     def __init__(self, host: RemoteHost, ch: int, completions: queue.Queue, raw: bool = False):
@@ -285,7 +286,6 @@ class _Handle:
         self._lock = threading.Lock()  # the channel is written from two threads
         self._messages: list[tuple[bytes, bytes]] = []  # raw messages, the check only
         self._raw = raw  # the check: keep messages as they are, interpret nothing
-        self._refused: str | None = None  # a task worker's ACCEPTED reason, if any
 
     # -- what arrives ---------------------------------------------------------
 
@@ -337,13 +337,12 @@ class _Handle:
                     protocol.store_object(store, body)
             elif tag == protocol.ACCEPTED:
                 if body:
-                    # Readiness passed once, so a refusal now means the host
-                    # has changed under this batch (its project directory was
-                    # updated by a later run).  The input is neither done nor
-                    # failed: the host is lost to this batch, and the
-                    # scheduler runs the input elsewhere.
-                    self._refused = body.decode("utf-8", "replace")
-                    self._machine.evict(self._refused)
+                    self._result = (
+                        "err_str",
+                        "RuntimeError",
+                        body.decode("utf-8", "replace"),
+                        "",
+                    )
             elif tag == protocol.RESULT:
                 if body[:1] == b"o":
                     self._result = (
@@ -461,12 +460,7 @@ class _Handle:
     # -- the scheduler's view --------------------------------------------------
 
     def settled(self) -> bool:
-        return (
-            self._failure is not None
-            or self._result is not None
-            or self._refused is not None
-            or self._eof
-        )
+        return self._failure is not None or self._result is not None or self._eof
 
     def recv(self) -> tuple | None:
         if self._failure is not None:
@@ -485,8 +479,6 @@ class _Handle:
         self._machine._forget(self.ch)
 
     def lost(self) -> bool:
-        if self._refused is not None:
-            return True
         return (
             self._eof
             and self._exit is None
@@ -631,6 +623,7 @@ class RemoteHost:
         self._next = 1
         self._pool: ThreadPoolExecutor | None = None
         self._ready = False
+        self._started = time.strftime("%H:%M:%S")
 
         self._hello = protocol.strings(
             PYTHON,
@@ -662,6 +655,8 @@ class RemoteHost:
                 PYTHON,
                 self._project.entries,
                 self._project.pack,
+                f"a run of {os.path.basename(sys.argv[0]) or 'python'} on "
+                f"{socket.gethostname()} (pid {os.getpid()}, started {self._started})",
             )
         except (OSError, ValueError) as e:
             reason = f"the connection to host {self.name!r} broke: {e}"
@@ -777,13 +772,6 @@ class RemoteHost:
             handle.reap()
         self._ready = True
         return ""
-
-    def evict(self, reason: str) -> None:
-        """This host can take no more of this batch's inputs: its copy of the
-        project was replaced.  Inputs running there finish; the rest run
-        elsewhere."""
-        self.failure = reason
-        self.dead = True
 
     def _fail(self, handle: _Handle, reason: str) -> str:
         tail = handle._stderr.decode("utf-8", "replace").strip()

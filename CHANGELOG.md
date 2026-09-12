@@ -79,8 +79,8 @@ call-record layout changed (each call record is its own file, under
   edit made a new directory named by the project hash and a from-scratch
   build. A manifest beside the directory names the project hash it holds, and
   a lock file serialises updates. A host holds one version at a time: a
-  later run that updates the directory takes the host from an earlier
-  batch still using it, whose remaining inputs run elsewhere, once.
+  run that wants a different version while an earlier run still uses the
+  host is refused, naming that run; stop it or wait.
 
 - Names say what things are. The *function hash* (was fingerprint, with a
   salted key on top) names a function's *call records* (were traces), kept

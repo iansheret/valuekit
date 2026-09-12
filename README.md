@@ -599,10 +599,11 @@ those removed, and touches nothing else there, so the build directory and
 the environment persist and a native extension rebuilds incrementally. An
 unchanged project costs one comparison. Two checkouts of one project that
 should not share a host directory give one of them a different `project`
-name. Because a host holds one version at a time, a run that updates the
-directory while an earlier batch is still using that host takes the host
-from that batch: the inputs already running there finish, the rest run
-elsewhere, and the reason is recorded once.
+name. A host holds one version at a time: a run that wants a different
+version while an earlier run is still using that host is refused, with the
+earlier run named, and continues on its other hosts and this machine.
+Stop the earlier run, or wait for it. A run that wants the same version
+joins.
 
 Where work goes is a *mode*, the `mode` line of `valuekit.local.toml`:
 

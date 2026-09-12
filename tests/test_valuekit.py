@@ -3925,7 +3925,7 @@ class TestWorkerHandshake:
 _HOST_CMD = [sys.executable]  # a Python 3 to bootstrap with, as a host entry names one
 
 
-def _remote_machine(fn, cache, name="h1", completions=None):
+def _remote_host(fn, cache, name="h1", completions=None):
     """A RemoteHost over a host process launched on this host."""
     import queue
     from valuekit.hosts import RemoteHost
@@ -4425,7 +4425,7 @@ class TestSourceTree:
         root = _project(tmp_path)
         m = _load(root)
         completions = queue.Queue()
-        host = _remote_machine(m.work, cache, completions=completions)
+        host = _remote_host(m.work, cache, completions=completions)
         assert host.sync() == ""
         # Delete the source outright. If the worker were resolving imports
         # against the live tree this cannot survive.
@@ -4465,21 +4465,21 @@ class TestSourceTree:
 
     def test_an_unchanged_tree_is_not_resent(self, cache, tmp_path):
         m = _load(_project(tmp_path))
-        first = _remote_machine(m.work, cache)
+        first = _remote_host(m.work, cache)
         assert first.sync() == ""
         first.close()
-        before = (cache / "source").stat().st_mtime_ns
+        before = (cache / "source" / "p.manifest").stat().st_mtime_ns
         # A second host over the same tree finds the source tree already there
         # and asks for nothing.
-        second = _remote_machine(m.work, cache)
+        second = _remote_host(m.work, cache)
         assert second.sync() == ""
         second.close()
-        assert (cache / "source").stat().st_mtime_ns == before
+        assert (cache / "source" / "p.manifest").stat().st_mtime_ns == before
         assert len(_trees(cache)) == 1
 
     def test_a_tree_without_a_manifest_is_resent_whole(self, cache, tmp_path):
         m = _load(_project(tmp_path))
-        host = _remote_machine(m.work, cache)
+        host = _remote_host(m.work, cache)
         # A directory with no manifest (a failed or interrupted update) is
         # not trusted: every file is sent and written over what is there.
         half = cache / "source" / "p"
@@ -4491,32 +4491,34 @@ class TestSourceTree:
         host.close()
         assert vk.run_all(m.work, [1]).values == [101]
 
-    def test_a_later_run_evicts_the_batch_using_the_host(self, cache, tmp_path):
-        import queue
-
+    def test_a_host_in_use_refuses_a_run_with_different_code(self, cache, tmp_path):
         root = _project(tmp_path)
         m = _load(root)
-        completions = queue.Queue()
-        first = _remote_machine(m.work, cache, completions=completions)
+        first = _remote_host(m.work, cache)
         assert first.sync() == ""
-        # A second main process, with an edited project, updates the host's copy.
+        # The same code again joins: nothing to update.
+        same = _remote_host(m.work, cache)
+        assert same.sync() == ""
+        same.close()
+        # Different code is refused while the first run holds the host, and
+        # the refusal says which run: the person stops it or waits.
         (root / "vk_sync_mod.py").write_text(
             "from valuekit import pure\n@pure\ndef work(x):\n    return x + 999999\n"
         )
         m2 = _load(root)
-        second = _remote_machine(m2.work, cache)
-        assert second.sync() == ""
-        second.close()
-        # The first batch's next task is refused: not failed, not done, and
-        # the host takes no more of that batch.
-        handle = first.start(7)
-        _settle(handle, completions)
-        try:
-            assert handle.recv() is None and handle.lost()
-            assert first.dead and "replaced by a later run" in first.failure
-        finally:
-            handle.reap()
-            first.close()
+        second = _remote_host(m2.work, cache)
+        reason = second.sync()
+        assert "in use by a run of" in reason and "different version" in reason
+        assert "999999" not in (cache / "source" / "p" / "vk_sync_mod.py").read_text()
+        first.close()
+        # Once the first run has gone its marker goes, and the update proceeds.
+        deadline = time.monotonic() + 10
+        while list((cache / "source").glob("p.busy-*")) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        third = _remote_host(m2.work, cache)
+        assert third.sync() == ""
+        third.close()
+        assert "999999" in (cache / "source" / "p" / "vk_sync_mod.py").read_text()
 
     def test_a_project_without_a_lock_is_refused_before_anything_is_sent(
         self, cache, tmp_path
@@ -4557,7 +4559,7 @@ class TestSourceTree:
 
     def test_a_failed_sync_is_one_reason_not_one_per_input(self, cache, tmp_path):
         m = _load(_project(tmp_path))
-        host = _remote_machine(m.work, cache)
+        host = _remote_host(m.work, cache)
         parts = protocol.unstrings(host._hello)
         host._hello = protocol.strings("wrong-python", *parts[1:])
         reason = host.sync()

@@ -103,21 +103,6 @@ def _tree(project_hash: str) -> tuple[Path | None, str]:
     return Path(here), ""
 
 
-def _tree_replaced() -> bool:
-    """Whether a later run has updated this host's copy of the project since
-    the host process started: the manifest beside the tree names a tree
-    hash other than the one in this process's environment."""
-    here = os.environ.get("VALUEKIT_TREE", "")
-    if not here:
-        return False
-    try:
-        with open(here + ".manifest", encoding="utf-8") as f:
-            current = json.load(f).get("project_hash")
-    except (OSError, ValueError, AttributeError):
-        return True  # mid-update: no manifest
-    return current != os.environ.get("VALUEKIT_PROJECT_HASH", "")
-
-
 def _install(source: Path, roots: list[str]) -> None:
     """Put the source tree's import roots ahead of everything else."""
     for rel in reversed(roots):
@@ -181,11 +166,6 @@ def _accept(python: str, module: str, qualname: str, function_hash: str) -> str:
     except Exception as e:
         return f"cannot hash {module}:{qualname} here ({e})"
     if theirs != function_hash:
-        if _tree_replaced():
-            return (
-                f"the project on this host was replaced by a later run since this "
-                f"batch started; {module}:{qualname} here is no longer the main process's"
-            )
         return (
             f"{module}:{qualname} differs here: main process has {function_hash[:12]}, "
             f"this worker has {theirs[:12]}. The code is not in sync."

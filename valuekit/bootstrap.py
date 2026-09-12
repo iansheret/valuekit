@@ -14,7 +14,8 @@ connection, a one-line Python program (:data:`STAGE0`) reads it and runs
 it, and it then speaks a short protocol on the same two streams::
 
     main   -> the source of this module, then a NUL byte
-    main   -> {"root": ..., "project": ..., "project_hash": <project hash>, "python": "3.13"}
+    main   -> {"root": ..., "project": ..., "project_hash": ..., "python": "3.13",
+               "run": "<who is asking>"}
     host   -> {"have": true}                    the tree here is this one already
             | {"have": false, "files": {...}}   what is here: relpath -> file hash
     main   -> {"delete": [...], "files": {...}}  only if not have: what to remove,
@@ -48,6 +49,13 @@ being updated or was left by a failed sync; either way the next main process
 updates it in place.  A lock file beside the directory says an update is
 in progress; a second main process waits for it, then proceeds with its own if
 the tree is still not the one it wants.
+
+*A host holds one version at a time.*  While a host process runs, its
+bootstrap keeps a busy marker beside the directory, refreshed every few
+seconds, naming the run it serves.  A run that wants a different version
+while a live marker exists is refused with that name: stop the earlier run
+or wait.  A run that wants the same version joins.  A marker that has
+stopped being refreshed belongs to a run that died and is ignored.
 """
 
 from __future__ import annotations
@@ -59,6 +67,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 
 __all__ = [
@@ -96,6 +105,8 @@ KNOWN_LOCKS = tuple(_TOOLS)
 STAGE0 = "import os;exec(b''.join(iter(lambda:os.read(0,1) or os._exit(1),bytes(1))))"
 
 _STALE = 3600  # seconds after which a lock counts as abandoned
+_HEARTBEAT = 5  # seconds between refreshes of a busy marker
+_BUSY_STALE = 60  # seconds without a refresh after which a busy marker is ignored
 _WAIT = 600  # seconds to wait for another main process's update to finish
 _TAIL = 64 << 10
 
@@ -134,18 +145,22 @@ def _script() -> bytes:
     return _source
 
 
-def offer(rx, tx, source_root: str, project: str, project_hash: str, py_minor: str, entries, pack) -> str:
+def offer(rx, tx, source_root: str, project: str, project_hash: str, py_minor: str, entries, pack, run: str = "") -> str:
     """Bring the host at the far end of *rx*/*tx* to a running host process.
 
     *entries* is the manifest, ``(relpath, hash)`` pairs; *pack* is called
-    with the subset of them the host lacks, only if it lacks any.  Returns
-    "" once the host process is about to send its first message, else why
-    not.
+    with the subset of them the host lacks, only if it lacks any.  *run*
+    names the main process, for the refusal a busy host gives another run.
+    Returns "" once the host process is about to send its first message,
+    else why not.
     """
     tx.write(_script() + b"\0")
     tx.write(
         json.dumps(
-            {"root": source_root, "project": project, "project_hash": project_hash, "python": py_minor}
+            {
+                "root": source_root, "project": project, "project_hash": project_hash,
+                "python": py_minor, "run": run,
+            }
         ).encode()
         + b"\n"
     )
@@ -219,6 +234,55 @@ def _send(obj: dict) -> None:
     while data:
         n = os.write(1, data)
         data = data[n:]
+
+
+def _busy(tree: str) -> str:
+    """The run a live busy marker beside *tree* names, or ""."""
+    root, name = os.path.split(tree)
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return ""
+    for n in names:
+        if not n.startswith(name + ".busy-"):
+            continue
+        path = os.path.join(root, n)
+        try:
+            if time.time() - os.stat(path).st_mtime > _BUSY_STALE:
+                os.remove(path)  # its run died without cleaning up
+                continue
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip() or "another run"
+        except OSError:
+            continue
+    return ""
+
+
+def _hold_busy(tree: str, run: str):
+    """Create this run's busy marker and keep refreshing it; returns the
+    function that removes it."""
+    path = f"{tree}.busy-{os.getpid()}"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(run + "\n")
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(_HEARTBEAT):
+            try:
+                os.utime(path, None)
+            except OSError:
+                return
+
+    threading.Thread(target=beat, daemon=True).start()
+
+    def release() -> None:
+        stop.set()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    return release
 
 
 def _paths(root: str, project: str) -> tuple[str, str, str]:
@@ -456,6 +520,14 @@ def main() -> int:
     tree, manifest, _ = _paths(root, project)
     current = _read_manifest(manifest)
     have = current is not None and current.get("project_hash") == project_hash
+    busy = "" if have else _busy(tree)
+    if busy:
+        _send({"have": True})  # nothing to send: the update is refused
+        _send({"ok": False, "reason": (
+            f"the project directory on this host is in use by {busy}, which runs a "
+            "different version; stop that run or wait for it"
+        )})
+        return 1
     if have:
         _send({"have": True})
         python, reason = current["python"], ""
@@ -477,6 +549,7 @@ def main() -> int:
         _send({"ok": False, "reason": reason})
         return 1
     _send({"ok": True, "python": python})
+    release = _hold_busy(tree, req.get("run") or "another run")
     env = dict(os.environ)
     env["VALUEKIT_TREE"] = tree
     env["VALUEKIT_PROJECT_HASH"] = project_hash
@@ -487,7 +560,10 @@ def main() -> int:
     bindir = os.path.dirname(python)
     env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     env["VIRTUAL_ENV"] = os.path.dirname(bindir)
-    return subprocess.call([python, "-m", "valuekit.hostprocess"], env=env)
+    try:
+        return subprocess.call([python, "-m", "valuekit.hostprocess"], env=env)
+    finally:
+        release()
 
 
 if __name__ == "__main__":
