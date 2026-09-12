@@ -9,7 +9,7 @@ its names resolve to.  The walk stops at boundaries:
   package invalidates; edits inside site-packages are invisible);
 * native extensions whose version cannot describe them -- anything installed
   from a local directory, editable or not, and so rebuilt in place --
-  contribute the hash of the project tree they were built from;
+  contribute the hash of their binary on the main process;
 * the standard library contributes ``std:<module>`` (the Python version is
   already part of the global salt);
 * user modules referenced *as modules* (``mymod.helper()``) contribute a hash
@@ -60,14 +60,17 @@ PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
 class ReachableSet:
-    """Everything reachable by name from a function's code, as its hash and
-    the source spans of the user code objects in it."""
+    """Everything reachable by name from a function's code: its hash, the
+    source spans of the user code objects in it, and the marker of each
+    native extension in it (module name -> binary hash), which a worker on
+    another machine is given rather than computing."""
 
-    __slots__ = ("hash", "spans")
+    __slots__ = ("hash", "spans", "extensions")
 
-    def __init__(self, hash: str, spans: list[tuple[str, int, int]]):
+    def __init__(self, hash: str, spans: list[tuple[str, int, int]], extensions: dict[str, str]):
         self.hash = hash
         self.spans = spans
+        self.extensions = extensions
 
 
 # ---------------------------------------------------------------------------
@@ -118,27 +121,23 @@ def _dist_version(top: str) -> str | None:
 # Where its version can stand for it -- a distribution installed from a
 # released artefact changes only through a reinstall, which moves the
 # version -- the version is its marker.  One built from a local directory,
-# editable or not, is rebuilt in place under the same version, so something
-# else has to identify it: the *project it was built from*, as the hash
-# of that tree (see :func:`valuekit.sync.project_hash`).
+# editable or not, is rebuilt in place under the same version, so its
+# marker is the hash of its binary: the code that actually runs, which
+# changes exactly when the build did.  Read once per build, memoised on the
+# file's size and modification time.
 #
-# The sources rather than the binary, deliberately.  A batch may run on
-# several machines, and each builds its own binary from the same tree; the
-# tree is what they share, so a key computed anywhere equals a key computed
-# anywhere else, with nothing sent between them to make it so.  The cost is
-# coarseness -- any edit in the project re-keys every function that reaches
-# one of its extensions -- and a reliance on the build being current: the key
-# describes the sources, so a stale binary that no longer matches them runs
-# under a key it does not deserve.  A build backend that rebuilds on import
-# is what keeps that honest, and is what a project needs anyway to be
-# checked out and run.
-#
-# On a worker the tree's hash is known before anything is imported (it
-# is the name of the directory the tree was unpacked into), so it is set
-# once and no manifest is walked there.
+# A worker never hashes its own binary, which is built on another machine
+# and may differ byte for byte.  The main process sends the markers its walk
+# met, one per extension module, and a worker substitutes them wherever its
+# own walk meets those modules.  Results the worker computes are therefore
+# keyed by the main process's build; the sync guarantees the worker's binary
+# was built from the same sources.  An extension the main process never
+# reached has no marker on the worker, so the hashes differ and the worker
+# is refused rather than trusted.
 
-_project_hash_here: str | None = None  # set on a worker; None on the main process
-_walk = threading.local()  # .project_hashes: identities computed by the walk in progress
+_markers_here: dict[str, str] | None = None  # set on a worker; None on the main process
+_walk = threading.local()  # .extensions: the markers the walk in progress has met
+_binary_hashes: dict[str, tuple[tuple[int, int], str]] = {}  # path -> ((size, mtime_ns), hash)
 
 
 def _is_extension_file(filename: str) -> bool:
@@ -176,31 +175,36 @@ def _is_live_extension(filename: str, top: str) -> bool:
     return dist is None or _dist_dir(dist) is not None
 
 
-def _source_project_hash(filename: str, top: str) -> str:
-    """What stands for the live extension at *filename*.
-
-    The hash of the project tree it was built from, found through its
-    distribution's install directory, or failing that the nearest project
-    marker above the binary.  An extension with no project around it at all
-    is identified by its binary, which is all there is.
-    """
-    if _project_hash_here is not None:
-        return _project_hash_here
+def _binary_hash(filename: str) -> str:
+    """The content hash of the file at *filename*, memoised on its size and
+    modification time so a build is read once."""
     from . import sync
 
-    dist = _distribution(top)
-    root = _dist_dir(dist) if dist is not None else None
-    if root is None:
-        root = sync.find_root(filename)
-    if root is None:
-        return sync._file_hash(filename) or "?"
-    ids = getattr(_walk, "project_hashes", None)
-    if ids is not None and root in ids:
-        return ids[root]
-    tid = sync.project_hash(root)
-    if ids is not None:
-        ids[root] = tid
-    return tid
+    try:
+        st = os.stat(filename)
+        key = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return "?"
+    cached = _binary_hashes.get(filename)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    h = sync._file_hash(filename) or "?"
+    _binary_hashes[filename] = (key, h)
+    return h
+
+
+def _extension_hash(module_name: str | None, filename: str) -> str:
+    """What stands for the live extension *module_name* at *filename*: on the
+    main process its binary's hash; on a worker the marker the main process
+    sent for it, or a value no marker can equal."""
+    name = module_name or ""
+    if _markers_here is not None:
+        return _markers_here.get(name, "?not-reached-by-the-main-process")
+    h = _binary_hash(filename)
+    met = getattr(_walk, "extensions", None)
+    if met is not None:
+        met[name] = h
+    return h
 
 
 def _extension_marker(module_name: str | None) -> str | None:
@@ -255,9 +259,9 @@ def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
         mod = sys.modules.get(module_name or "")
         filename = getattr(mod, "__file__", None)
     if filename and _is_live_extension(filename, top):
-        # An extension rebuilt in place under a fixed version: the project
-        # it was built from identifies it.
-        return _PKG, f"ext:{module_name}={_source_project_hash(filename, top)}"
+        # An extension rebuilt in place under a fixed version: its binary,
+        # or on a worker the main process's, stands for it.
+        return _PKG, f"ext:{module_name}={_extension_hash(module_name, filename)}"
     if filename and _is_installed(filename, top):
         ver = _dist_version(top)
         return _PKG, f"pkg:{top}=={ver or '?'}"
@@ -512,20 +516,20 @@ def reachable_set(fn: Callable, *, code: types.CodeType | None = None) -> Reacha
     @pure, which captures it at decoration time, before any debugger patches
     bytecode).
     """
-    # A tree's hash is computed at most once per walk, however many of its
-    # extensions the walk reaches; a walk nested in another (a function
-    # hashed as a value) shares the outer one's.
-    outer = getattr(_walk, "project_hashes", None)
+    # The extensions met are collected for the whole walk; a walk nested in
+    # another (a function hashed as a value) adds to the outer one's.
+    outer = getattr(_walk, "extensions", None)
     if outer is None:
-        _walk.project_hashes = {}
+        _walk.extensions = {}
     try:
         w = _Walker()
         w._mark(f"python:{PYTHON}")
         w.add_function(fn, code=code)  # type: ignore[arg-type]
+        extensions = dict(_walk.extensions)
     finally:
         if outer is None:
-            _walk.project_hashes = None
-    return ReachableSet(w.h.hexdigest(), w.spans)
+            _walk.extensions = None
+    return ReachableSet(w.h.hexdigest(), w.spans, extensions)
 
 
 # ---------------------------------------------------------------------------

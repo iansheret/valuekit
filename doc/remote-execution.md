@@ -140,14 +140,16 @@ updating the directory under a running batch. Starting a second run before stopp
 first is the user's error, and the refusal says what to stop. The project hash still says whether a host is current and still
 stands for a native extension in the function hash.
 
-**A native extension's marker is the project hash of the tree it was built from.** Each host builds its own
-binary from the same sources, so the tree is what they share; a key computed anywhere
-equals a key computed anywhere else with nothing sent between them. The cost is coarseness
-(any edit in the project re-keys functions that reach an extension) and reliance on the
-build being current: the key describes the sources, so a build backend that rebuilds on
-import is what keeps the main process honest. On a worker the hash is the tree's name,
-known before anything is imported. An extension with no project marker above it at all is
-identified by its binary, which is all there is.
+**A native extension's marker is the hash of the main process's binary, sent to workers.**
+The marker was the project hash for a while, on the reasoning that each host builds its own
+binary and the tree is what they share. That was too coarse (any edit anywhere re-keyed
+every function reaching an extension) and the reasoning missed that a worker never computes
+the marker: it takes the main process's from HELLO. So the main process hashes its own
+build, per extension, and sends the markers; the walk on a worker substitutes them. Results
+computed anywhere are keyed by the main process's build; the sync guarantees a host's
+binary was built from the same sources. An extension the main process never reached has
+no marker on the worker, and the worker is refused. A released wheel keeps its version
+marker, as before.
 
 **Modes stay; the default is `all`; syncing never blocks.** On review, modes are a
 preset over per-host capacities, which is the shape the extra-cores model wants

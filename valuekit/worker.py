@@ -16,7 +16,8 @@ missing dependency, a build error or a function that will not import is a
 fact about the *host*, reported once, rather than against whichever input
 happened to go there first.
 
-    main   -> HELLO   Python version, module, qualname, function hash, project hash, import roots
+    main   -> HELLO   Python version, module, qualname, function hash, project hash,
+                      extension markers, import roots
     worker -> ACCEPTED   empty if accepted, else why not
     main   -> OBJECT* the input's object graph            (task workers only)
     main   -> TASK    the input's root hash
@@ -73,13 +74,14 @@ def _resolve(module: str, qualname: str):
     return obj
 
 
-def _take_project_hash(project_hash: str) -> None:
-    """A native extension here was built from the tree named *project_hash*, so
-    that is its marker, exactly as it is on the main process.  See
-    :mod:`valuekit.functionhash`."""
+def _take_markers(extensions: str) -> None:
+    """The main process's markers for the native extensions the function
+    reaches, module name -> hash of its binary there.  This worker's binaries
+    were built from the same sources on another machine and are never
+    hashed; see :mod:`valuekit.functionhash`."""
     from . import functionhash
 
-    functionhash._project_hash_here = project_hash or None
+    functionhash._markers_here = json.loads(extensions) if extensions else {}
 
 
 def _tree(project_hash: str) -> tuple[Path | None, str]:
@@ -187,15 +189,15 @@ def _handshake(rx: BinaryIO, tx: BinaryIO, check_imports: bool) -> tuple[bool, s
         protocol.write_message(tx, protocol.ACCEPTED, b"expected a HELLO message")
         return False, ""
     parts = protocol.unstrings(body)
-    python, module, qualname, function_hash, project_hash = parts[:5]
-    roots = [r for r in parts[5:] if r]
+    python, module, qualname, function_hash, project_hash, extensions = parts[:6]
+    roots = [r for r in parts[6:] if r]
 
     source, reason = _tree(project_hash)
     if not reason:
         # The tree goes on the path before _accept, which imports.
         if source is not None:
             _install(source, roots)
-        _take_project_hash(project_hash)
+        _take_markers(extensions)
         reason = _accept(python, module, qualname, function_hash)
     if not reason and check_imports and source is not None:
         # After the import, and before the function hash is trusted: a

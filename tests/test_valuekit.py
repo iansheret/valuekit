@@ -49,6 +49,9 @@ def cache(tmp_path):
 @pytest.fixture(autouse=True)
 def _no_cache_by_default(monkeypatch):
     vk.set_cache_dir(None)
+    # An in-process worker handshake installs the main process's extension
+    # markers; no test starts with another test's.
+    monkeypatch.setattr(functionhash, "_markers_here", None)
     yield
     vk.set_cache_dir(None)
 
@@ -548,7 +551,7 @@ def fake_extension(tmp_path, monkeypatch):
     mod.__file__ = str(path)
     monkeypatch.setitem(sys.modules, "_fake_ext", mod)
     monkeypatch.setattr(_NativeCallable, "__module__", "_fake_ext")
-    monkeypatch.setattr(functionhash, "_project_hash_here", None)
+    monkeypatch.setattr(functionhash, "_markers_here", None)
     return mod, path
 
 
@@ -568,54 +571,69 @@ def _ext_user(x):
 
 
 class TestNativeExtensions:
-    def test_the_project_tree_identifies_the_extension(self, fake_extension):
+    def test_the_binary_identifies_the_extension(self, fake_extension):
         mod, path = fake_extension
         kind, marker = _classify(mod.__name__, mod.__file__)
-        assert marker == f"ext:_fake_ext={sync.project_hash(str(path.parent))}"
+        assert marker == f"ext:_fake_ext={sync._file_hash(str(path))}"
 
-    def test_editing_a_source_invalidates_its_callers(self, fake_extension):
+    def test_a_rebuild_invalidates_its_callers(self, fake_extension):
         # The case this exists for: a @pure function calls into C++, the C++
         # is edited and rebuilt, and the result must not be served from cache.
         mod, path = fake_extension
         fn = _using_global("solve", _NativeCallable())
         before = _fp(fn)
         (path.parent / "native.cpp").write_text("int solve(int x) { return x + 1; }\n")
+        assert _fp(fn) == before  # an edit alone changes nothing: the build is the code that runs
+        path.write_bytes(b"compiled bytes, version two")
         assert _fp(fn) != before
 
-    def test_the_binary_alone_is_not_the_identity(self, fake_extension):
-        # Every host builds its own binary from the same tree; the tree is
-        # what they share, so a rebuild that changes no source changes no key.
+    def test_a_walk_records_the_markers_it_met(self, fake_extension):
         mod, path = fake_extension
         fn = _using_global("solve", _NativeCallable())
-        before = _fp(fn)
-        path.write_bytes(b"compiled bytes, version two -- rebuilt elsewhere")
-        assert _fp(fn) == before
+        reach = reachable_set(fn)
+        assert reach.extensions == {"_fake_ext": sync._file_hash(str(path))}
+        plain = reachable_set(lambda x: x)
+        assert plain.extensions == {}
 
-    def test_one_walk_reads_the_tree_once(self, fake_extension, monkeypatch):
+    def test_the_binary_is_read_once_per_build(self, fake_extension, monkeypatch):
+        mod, path = fake_extension
         calls = []
-        real = sync.project_hash
-        monkeypatch.setattr(sync, "project_hash", lambda root: calls.append(root) or real(root))
+        real = sync._file_hash
+        monkeypatch.setattr(sync, "_file_hash", lambda p: calls.append(p) or real(p))
         ns = {"a": _NativeCallable(), "b": _NativeCallable()}
         exec("def f(x):\n    return a(x) + b(x)", ns)
         _fp(ns["f"])
+        _fp(ns["f"])
         assert len(calls) == 1
+        path.write_bytes(b"compiled bytes, version two")
+        _fp(ns["f"])
+        assert len(calls) == 2
 
-    def test_a_worker_takes_the_project_hash_from_hello(
-        self, fake_extension, tmp_path, monkeypatch
-    ):
-        # On a worker the tree's hash comes from the environment the
-        # bootstrap set; nothing is walked.
+    def test_a_worker_takes_the_markers_from_hello(self, fake_extension, tmp_path, monkeypatch):
+        # On a worker an extension's marker is what the main process sent;
+        # this worker's own binary is never read.
+        m, _ = _write_batch_module(tmp_path)
+        mod, path = fake_extension
+        calls = []
+        real = sync._file_hash
+        monkeypatch.setattr(sync, "_file_hash", lambda p: calls.append(p) or real(p))
+        assert _handshake(_hello(m.process, extensions={"_fake_ext": "7" * 40})) == ""
+        assert functionhash._markers_here == {"_fake_ext": "7" * 40}
+        assert _classify(mod.__name__, mod.__file__)[1] == "ext:_fake_ext=" + "7" * 40
+        assert calls == []
+        # An extension the main process never reached gets no marker, so the
+        # hashes differ and the worker is refused rather than trusted.
+        assert _classify("_other_ext", mod.__file__)[1] == "ext:_other_ext=?not-reached-by-the-main-process"
+
+    def test_a_worker_takes_the_project_hash_from_hello(self, tmp_path, monkeypatch):
+        # The project hash says which source tree the worker must be in.
         m, _ = _write_batch_module(tmp_path)
         tree = tmp_path / "src" / "p"
         tree.mkdir(parents=True)
         monkeypatch.setenv("VALUEKIT_TREE", str(tree))
         monkeypatch.setenv("VALUEKIT_PROJECT_HASH", "7" * 40)
         assert _handshake(_hello(m.process, project_hash="7" * 40)) == ""
-        assert functionhash._project_hash_here == "7" * 40
-        # A worker in some other tree than the one the main process meant refuses.
         assert "the main process meant" in _handshake(_hello(m.process, project_hash="8" * 40))
-        mod, path = fake_extension
-        assert _classify(mod.__name__, mod.__file__)[1] == "ext:_fake_ext=" + "7" * 40
 
     def test_a_released_distribution_keeps_its_version_marker(
         self, fake_extension, monkeypatch
@@ -632,16 +650,16 @@ class TestNativeExtensions:
         monkeypatch.setattr(functionhash, "_distribution", lambda top: _ReleasedDist())
         assert _classify(mod.__name__, mod.__file__)[1] == "pkg:_fake_ext==1.2.3"
 
-    def test_a_local_install_is_identified_by_its_directory(
+    def test_a_local_install_is_identified_by_its_binary(
         self, fake_extension, tmp_path, monkeypatch
     ):
         # An editable install puts the binary wherever the build backend likes;
-        # direct_url.json says which project it came from.
+        # direct_url.json says it is a local install, so the binary is hashed.
         mod, path = fake_extension
         elsewhere = tmp_path / "site-packages"
         elsewhere.mkdir()
         binary = elsewhere / path.name
-        binary.write_bytes(path.read_bytes())
+        binary.write_bytes(b"compiled elsewhere")
         mod.__file__ = str(binary)
         url = path.parent.as_uri()
 
@@ -652,9 +670,7 @@ class TestNativeExtensions:
                 return json.dumps({"url": url, "dir_info": {"editable": True}})
 
         monkeypatch.setattr(functionhash, "_distribution", lambda top: _LocalDist())
-        assert _classify(mod.__name__, mod.__file__)[1] == (
-            f"ext:_fake_ext={sync.project_hash(str(path.parent))}"
-        )
+        assert _classify(mod.__name__, mod.__file__)[1] == f"ext:_fake_ext={sync._file_hash(str(binary))}"
 
     def test_an_extension_module_is_tracked_as_a_module(self, fake_extension):
         mod, path = fake_extension
@@ -662,12 +678,10 @@ class TestNativeExtensions:
         # A module global resolves by name, so the reference is to the module
         # itself rather than to anything it defines.
         before = _fp(fn)
-        (path.parent / "native.cpp").write_text("// edited\n")
+        path.write_bytes(b"compiled bytes, version two")
         assert _fp(fn) != before
 
     def test_an_extension_with_no_project_is_its_binary(self, tmp_path):
-        # Nothing above it says what it was built from: the contents are all
-        # there is.
         path = tmp_path / f"_intree{EXTENSION_SUFFIXES[0]}"
         path.write_bytes(b"compiled bytes, version one")
         before = _classify("_intree", str(path))[1]
@@ -679,7 +693,7 @@ class TestNativeExtensions:
         mod, path = fake_extension
         fn = _using_global("solve", _NativeCallable())
         path.unlink()
-        _fp(fn)  # the tree still identifies it
+        _fp(fn)
 
 
 # ===========================================================================
@@ -3861,7 +3875,7 @@ class TestWire:
             protocol.unpack(root, objs)
 
 
-def _hello(fn, python=None, function_hash=None, project_hash=""):
+def _hello(fn, python=None, function_hash=None, project_hash="", extensions=None):
     # An empty project hash means "no source tree": the worker imports the way
     # it always did, which is what the handshake tests are about.
     return protocol.strings(
@@ -3870,6 +3884,7 @@ def _hello(fn, python=None, function_hash=None, project_hash=""):
         fn.__qualname__,
         function_hash or reachable_set(fn).hash,
         project_hash,
+        json.dumps(extensions if extensions is not None else reachable_set(fn).extensions),
     )
 
 
@@ -3913,12 +3928,13 @@ class TestWorkerHandshake:
             "work",
             reachable_set(m.process).hash,
             "",
+            "{}",
         )
         reason = _handshake(body)
         assert "__main__" in reason and "Move it to a module" in reason
 
     def test_an_unimportable_module_refuses(self):
-        body = protocol.strings(PYTHON, "no_such_module_xyz", "f", "0" * 40, "")
+        body = protocol.strings(PYTHON, "no_such_module_xyz", "f", "0" * 40, "", "{}")
         assert "cannot import" in _handshake(body)
 
 

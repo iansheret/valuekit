@@ -578,12 +578,12 @@ never `valuekit.local.toml`) into `source_root/<project>`, the lock tool syncs i
 that interpreter if the host lacks it), and workers run in the environment
 that produced. A native extension is built on the host from the same
 sources, by the project's own build backend. Its binary differs from yours,
-and that is expected: an extension's marker in the function hash is the project
-hash of the tree it was built from, which is the same everywhere. That does mean any
-edit in the project re-keys functions that reach an extension, and that
-the key describes the sources rather than the binary, so a build backend
-that rebuilds on import (scikit-build-core with `editable.rebuild`, or
-meson-python) is what keeps your own machine honest. Such a backend runs
+and that is expected: an extension's marker in the function hash is the
+hash of *your* build of it, and a worker is given that marker rather than
+hashing its own binary, so results computed anywhere are keyed by what you
+ran. The host's binary must then be a build of the same sources, which the
+sync guarantees, kept current by a build backend that rebuilds on import
+(scikit-build-core with `editable.rebuild`, or meson-python). Such a backend runs
 `cmake` by name at import time, so put the build tools in the project
 (`cmake` and `ninja` are on PyPI) and build without isolation (for uv,
 `no-build-isolation-package` under `[tool.uv]`, with `scikit-build-core`

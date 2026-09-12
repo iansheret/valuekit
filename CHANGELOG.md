@@ -62,6 +62,12 @@ call-record layout changed (each call record is its own file, under
 
 ### Changed
 
+- A native extension's marker in the function hash is the hash of the
+  main process's build of it, per extension, sent to workers rather than
+  computed by them. Editing a file the extension's build does not read no
+  longer re-keys the functions that reach it; the project hash keeps its
+  other job of saying whether a host's copy of the project is current.
+
 - Remote configuration is one file per checkout, `valuekit.local.toml`
   beside `pyproject.toml`: the hosts, this machine's worker cap, the mode
   (`all`, `local` or `remote`) and the project's directory name on each

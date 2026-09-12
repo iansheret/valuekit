@@ -625,12 +625,14 @@ class RemoteHost:
         self._ready = False
         self._started = time.strftime("%H:%M:%S")
 
+        reach = reachable_set(fn)
         self._hello = protocol.strings(
             PYTHON,
             getattr(fn, "__module__", "") or "",
             getattr(fn, "__qualname__", "") or "",
-            reachable_set(fn).hash,
+            reach.hash,
             project.project_hash,
+            json.dumps(reach.extensions, sort_keys=True),
             *project.roots,
         )
 
