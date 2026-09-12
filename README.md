@@ -639,7 +639,8 @@ actually happening, from a separate process:
 $ python -m valuekit.monitor ~/.cache/mypipeline
 
 runs: 1 live, 9 workers, 0 finished
-mode: all  (applied: all)        l local  r remote  a all  q quit
+mode: all          l local  r remote  a all  q quit
+  new tasks go to mac, here
 
   pid 97702    process_scenarios.py         up 2.7s
 
@@ -668,11 +669,13 @@ watching from the beginning. Watching has no effect on the run. The one
 thing the monitor writes is the `mode` line of the project's
 `valuekit.local.toml`, on a keystroke: `l`, `r` and `a` set `local`,
 `remote` and `all`. The project is the one enclosing the directory the
-monitor is run from. The header shows the mode asked
-for and, beside it, the mode the running main process has applied; they differ
-until the main process next starts a task. The `hosts` block shows each host's
-capacity under the applied mode, what is running and finished there, and
-whether the host was reached.
+monitor is run from. The header shows the mode and, while a batch runs,
+what it means for the next task given which hosts are ready: under
+`remote` with the host still syncing, "waiting for mac to sync; none
+start here". Tasks already running finish where they are. The `hosts`
+block shows each host's state (syncing, ready, or dropped with the
+reason), its capacity under the mode, and what is running and finished
+there.
 
 The event log goes in `events/` inside the cache directory, one file per process, and
 nothing is recorded until `set_cache_dir` has been called — the same rule as

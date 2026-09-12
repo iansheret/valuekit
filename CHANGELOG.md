@@ -166,8 +166,8 @@ call-record layout changed (each call record is its own file, under
   (the default: every configured host, plus this machine), `local`, or
   `remote` (as little here as possible). The main process re-reads it each time it
   starts a task, so a switch mid-batch moves the next task. The monitor
-  shows the requested mode beside the mode the main process has applied, and sets
-  it on a keystroke; `--mode` sets it from a script. That line is the only
+  shows the mode and what it means for the next task, and sets it on a
+  keystroke; `--mode` sets it from a script. That line is the only
   thing the monitor writes.
 - Preparing a host never holds the batch back: this machine starts at once
   and a host joins when ready. Under `remote` this machine stays idle while

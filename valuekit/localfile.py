@@ -26,15 +26,9 @@ file, built on the host.  Nothing of the project's, valuekit included, has
 to be installed there.  A Windows host has ``python`` rather than
 ``python3``.
 
-The *mode*: ``all`` uses every reachable remote host and this machine at
-full capacity; ``local`` runs everything on this machine; ``remote`` runs as
-little here as possible, which means nothing here while any host is
-reachable or still syncing, and everything here when none is.  Absent,
-it is ``all``: a host in the file is there to be used, the way a core is.
-The scheduler reads the file each time it is about to start a task, so an
-edit takes effect for the next task started; tasks already running finish
-where they are.  The monitor's keys and its ``--mode`` flag edit the
-``mode`` line in place and touch nothing else in the file.
+The *mode* is one line of this file; :mod:`valuekit.modes` says what each
+mode means.  The monitor's keys and its ``--mode`` flag edit that line in
+place and touch nothing else in the file.
 
 The file is never part of the source tree sent to a host and never part of
 any hash: it says where a computation runs, which must not be able to
@@ -49,23 +43,19 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from .modes import DEFAULT_MODE, MODES
 from .store import _atomic_write
 
 __all__ = [
     "LOCAL_FILE",
-    "MODES",
     "HostEntry",
     "LocalConfig",
     "load_local",
     "read_mode",
     "write_mode",
-    "capacities",
-    "worker_env",
 ]
 
 LOCAL_FILE = "valuekit.local.toml"
-MODES = ("local", "remote", "all")
-DEFAULT_MODE = "all"
 DEFAULT_SOURCE_ROOT = "~/.cache/valuekit/source"
 DEFAULT_PYTHON = "python3"
 
@@ -187,55 +177,3 @@ def write_mode(root: str | os.PathLike, mode: str) -> None:
     else:
         lines.insert(0, new)
     _atomic_write(p, "".join(lines).encode("utf-8"))
-
-
-def capacities(
-    mode: str, local: int, remote: dict[str, int], syncing: bool = False
-) -> dict[str, int]:
-    """How many tasks each host may run at once under *mode*.
-
-    *remote* maps each host to its capacity, 0 until it is ready; *syncing*
-    says whether any host is still syncing.  Every name is present in the
-    result, at 0 where the mode excludes it, so a display can show what is
-    switched off as well as what is on.
-
-    Under ``remote`` this machine stays idle while a remote host is still on
-    its way: the person who chose that mode wants their machine free, and a
-    short batch would otherwise be over before the host arrived.
-    """
-    if mode == "local":
-        return {**{name: 0 for name in remote}, "local": local}
-    if mode == "all":
-        return {**remote, "local": local}
-    if mode == "remote":
-        if any(remote.values()) or syncing:
-            return {**remote, "local": 0}
-        return {**remote, "local": local}
-    raise ValueError(f"unknown mode {mode!r}")
-
-
-# ---------------------------------------------------------------------------
-# what a worker process is given
-# ---------------------------------------------------------------------------
-
-# What a process needs from the environment to start and to find its
-# interpreter's own files; everything else stays with the main process.  No
-# PYTHONPATH (imports must resolve through the source tree, or the check
-# that they did proves nothing) and no credentials, which a @pure_local
-# call keeps on the main process.
-_WORKER_ENV = frozenset(
-    {
-        "PATH", "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL",
-        "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "WINDIR",
-        "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "USERNAME", "USER",
-        "PYTHONHOME", "PYTHONUTF8", "PYTHONIOENCODING", "VIRTUAL_ENV",
-    }
-)
-
-
-def worker_env() -> dict[str, str]:
-    return {
-        k: v
-        for k, v in os.environ.items()
-        if k.upper() in _WORKER_ENV or k.upper().startswith("VALUEKIT_")
-    }

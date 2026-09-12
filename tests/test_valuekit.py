@@ -2852,7 +2852,7 @@ def _lay_project(root):
 def _local_file(tmp_path, text):
     """Write the test project's valuekit.local.toml (the project is
     tmp_path/proj, which _write_batch_module and _project create)."""
-    from valuekit.placement import LOCAL_FILE
+    from valuekit.localfile import LOCAL_FILE
 
     root = tmp_path / "proj"
     root.mkdir(parents=True, exist_ok=True)
@@ -3230,30 +3230,30 @@ class TestBatches:
         assert {c[2] for c in t["calls"]} == {r.record_hash for r in vk.batch("process")}
 
 
-class TestPlacement:
+class TestLocalFile:
     def test_no_local_file_means_local_only(self, tmp_path):
-        from valuekit import placement
+        from valuekit import localfile
 
         for root in (tmp_path, None):
-            c = placement.load_local(root)
+            c = localfile.load_local(root)
             assert c.hosts == () and c.local_workers == (os.cpu_count() or 1)
             assert c.mode == "all" and c.project is None
 
     def test_local_file_parses_with_defaults(self, tmp_path):
-        from valuekit import placement
+        from valuekit import localfile
 
-        p = tmp_path / placement.LOCAL_FILE
+        p = tmp_path / localfile.LOCAL_FILE
         p.write_text(
             "project = 'exp'\nmode = 'remote'\n"
             "[local]\nworkers = 3\n"
             "[hosts.mac]\nssh = 'ian@mac.local'\npython = '/usr/bin/python3'\n"
             "[hosts.pc]\nssh = 'pc'\npython = 'py'\nworkers = 2\nsource_root = 'D:/vk'\n"
         )
-        c = placement.load_local(tmp_path)
+        c = localfile.load_local(tmp_path)
         assert (c.project, c.mode, c.local_workers) == ("exp", "remote", 3)
         mac, pc = c.hosts
         assert (mac.name, mac.ssh, mac.python, mac.workers) == ("mac", "ian@mac.local", "/usr/bin/python3", None)
-        assert mac.source_root == placement.DEFAULT_SOURCE_ROOT
+        assert mac.source_root == localfile.DEFAULT_SOURCE_ROOT
         assert (pc.workers, pc.source_root) == (2, "D:/vk")
 
     @pytest.mark.parametrize(
@@ -3268,37 +3268,37 @@ class TestPlacement:
         ],
     )
     def test_malformed_local_file_names_the_file(self, tmp_path, text):
-        from valuekit import placement
+        from valuekit import localfile
 
-        (tmp_path / placement.LOCAL_FILE).write_text(text)
+        (tmp_path / localfile.LOCAL_FILE).write_text(text)
         with pytest.raises(RuntimeError, match="valuekit.local.toml"):
-            placement.load_local(tmp_path)
+            localfile.load_local(tmp_path)
 
     def test_the_mode_line(self, tmp_path):
-        from valuekit import placement
+        from valuekit import localfile
 
         cache = tmp_path / "cache"
         # Absent means every configured host is used, as a core would be;
         # no cache directory means nowhere for a host's results to land.
-        assert placement.read_mode(tmp_path, cache) == "all"
-        assert placement.read_mode(tmp_path, None) == "local"
-        assert placement.read_mode(None, cache) == "all"
-        placement.write_mode(tmp_path, "remote")
-        assert placement.read_mode(tmp_path, cache) == "remote"
-        p = tmp_path / placement.LOCAL_FILE
+        assert localfile.read_mode(tmp_path, cache) == "all"
+        assert localfile.read_mode(tmp_path, None) == "local"
+        assert localfile.read_mode(None, cache) == "all"
+        localfile.write_mode(tmp_path, "remote")
+        assert localfile.read_mode(tmp_path, cache) == "remote"
+        p = tmp_path / localfile.LOCAL_FILE
         assert p.read_text() == 'mode = "remote"\n'
         # Only the mode line changes; comments and other lines stay.
         p.write_text("# mine\nproject = 'x'\n  mode='local'  # was\n[local]\nworkers = 2\n")
-        placement.write_mode(tmp_path, "all")
+        localfile.write_mode(tmp_path, "all")
         assert p.read_text() == "# mine\nproject = 'x'\nmode = \"all\"\n[local]\nworkers = 2\n"
-        assert placement.load_local(tmp_path).local_workers == 2
+        assert localfile.load_local(tmp_path).local_workers == 2
         p.write_text("nonsense [[[\n")
-        assert placement.read_mode(tmp_path, cache) == "all"  # unreadable: the default
+        assert localfile.read_mode(tmp_path, cache) == "all"  # unreadable: the default
         with pytest.raises(ValueError):
-            placement.write_mode(tmp_path, "everywhere")
+            localfile.write_mode(tmp_path, "everywhere")
 
     def test_capacities_per_mode(self):
-        from valuekit.placement import capacities
+        from valuekit.modes import capacities
 
         remote = {"mac": 8, "pc": 4}
         assert capacities("local", 6, remote) == {"mac": 0, "pc": 0, "local": 6}
@@ -3314,7 +3314,7 @@ class TestPlacement:
         assert capacities("all", 6, {"mac": 0}, syncing=True) == {"mac": 0, "local": 6}
 
     def test_worker_env_is_an_allowlist(self, monkeypatch):
-        from valuekit.placement import worker_env
+        from valuekit.hostprocess import worker_env
 
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
         monkeypatch.setenv("VALUEKIT_CACHE", "y")
@@ -3336,13 +3336,13 @@ class TestPlacementScheduling:
         _local_file(tmp_path, f"[local]\nworkers = {n}\n")
 
     def test_mode_all_fills_remote_places_first(self, cache, tmp_path, monkeypatch):
-        from valuekit import placement
+        from valuekit import localfile
 
         monkeypatch.setattr(
             parallel, "_host_commands", {"h1": (_HOST_CMD, 1), "h2": (_HOST_CMD, 1)}
         )
         self._local_workers(tmp_path, monkeypatch, 2)
-        placement.write_mode(tmp_path / "proj", "all")
+        localfile.write_mode(tmp_path / "proj", "all")
         m, _ = _write_batch_module(tmp_path)
         # Enough work that both hosts have joined before it runs out.
         r = vk.run_all(m.slow, list(range(1, 13)))
@@ -3352,59 +3352,45 @@ class TestPlacementScheduling:
             by_host.setdefault(e["host"], []).append(e["i"])
         assert set(by_host) == {"h1", "h2", "local"}
         assert len(by_host["h1"]) >= 1 and len(by_host["h2"]) >= 1
-        # Local starts at once; each host joins when ready.
-        events = [e for _, e in _records(cache, "placement")]
-        assert events[0]["capacities"]["local"] == 2
-        assert events[-1]["mode"] == "all"
-        assert events[-1]["capacities"] == {"h1": 1, "h2": 1, "local": 2}
         assert sorted(e["name"] for _, e in _records(cache, "host")) == ["h1", "h2"]
         assert all(e["ok"] for _, e in _records(cache, "host"))
 
     def test_mode_remote_keeps_local_idle(self, cache, tmp_path, monkeypatch):
-        from valuekit import placement
+        from valuekit import localfile
 
         monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
-        placement.write_mode(tmp_path / "proj", "remote")
+        localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
         assert vk.run_all(m.process, [1, 2, 4, 5]).failures == []
         assert {e["host"] for _, e in _records(cache, "outcome")} == {"h1"}
-        events = [e for _, e in _records(cache, "placement")]
-        assert all(e["capacities"]["local"] == 0 for e in events)
-        assert events[-1]["capacities"]["h1"] == 2
+        [(_, h)] = _records(cache, "host")
+        assert h["ok"] and h["capacity"] == 2
 
     def test_remote_mode_with_no_host_runs_locally_and_says_so(self, cache, tmp_path, monkeypatch):
-        from valuekit import placement
+        from valuekit import localfile
 
         monkeypatch.setattr(parallel, "_host_commands", {})
-        placement.write_mode(tmp_path / "proj", "remote")
+        localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
         assert vk.run_all(m.process, [1]).values == [11]
-        [(_, p)] = _records(cache, "placement")
-        assert p["mode"] == "remote" and list(p["capacities"]) == ["local"]
-        assert p["capacities"]["local"] > 0
+        [(_, o)] = _records(cache, "outcome")
+        assert o["host"] == "local" and not _records(cache, "host")
 
     def test_switching_the_mode_mid_batch_moves_later_tasks(self, cache, tmp_path, monkeypatch):
         import threading
 
-        from valuekit import placement
+        from valuekit import localfile
 
         monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
         self._local_workers(tmp_path, monkeypatch, 1)
-        placement.write_mode(tmp_path / "proj", "local")
+        localfile.write_mode(tmp_path / "proj", "local")
         m, _ = _write_batch_module(tmp_path)
-        threading.Timer(2.0, lambda: placement.write_mode(tmp_path / "proj", "remote")).start()
+        threading.Timer(2.0, lambda: localfile.write_mode(tmp_path / "proj", "remote")).start()
         r = vk.run_all(m.slow, [1, 2, 3, 4, 5, 6, 7, 8])
         assert r.failures == []
         outcomes = [e for _, e in _records(cache, "outcome")]
         hosts = [e["host"] for e in sorted(outcomes, key=lambda e: e["t"])]
         assert hosts[0] == "local" and hosts[-1] == "h1"
-        # One event when the mode changes (the host still syncing, so
-        # nothing runs anywhere), another when the host joins.
-        events = [e for _, e in _records(cache, "placement")]
-        assert [e["mode"] for e in events] == ["local", "remote", "remote"]
-        assert events[0]["capacities"]["local"] == 1
-        assert events[1]["capacities"] == {"h1": 0, "local": 0}
-        assert events[-1]["capacities"] == {"h1": 2, "local": 0}
 
     def test_a_host_that_dies_loses_nothing(self, cache, tmp_path, monkeypatch):
         # The inputs running there are not done and not failed: they run
@@ -3412,10 +3398,10 @@ class TestPlacementScheduling:
         import threading
 
         from valuekit import hosts as machines_mod
-        from valuekit import placement
+        from valuekit import localfile
 
         monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
-        placement.write_mode(tmp_path / "proj", "remote")
+        localfile.write_mode(tmp_path / "proj", "remote")
         real_sync = machines_mod.RemoteHost.sync
 
         def sync_then_die(self):
@@ -3441,16 +3427,14 @@ class TestPlacementScheduling:
             e["name"] == "h1" and not e["ok"] and "closed" in e["reason"]
             for _, e in _records(cache, "host")
         )
-        modes = [(e["mode"], e["capacities"]["local"] > 0) for _, e in _records(cache, "placement")]
-        assert modes[0] == ("remote", False) and modes[-1] == ("remote", True)
 
     def test_an_input_that_loses_two_hosts_is_a_failure(self, cache, tmp_path, monkeypatch):
         from valuekit import hosts as machines_mod
-        from valuekit import placement
+        from valuekit import localfile
 
         monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 1), "h2": (_HOST_CMD, 1)})
         self._local_workers(tmp_path, monkeypatch, 0)
-        placement.write_mode(tmp_path / "proj", "remote")
+        localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
         # Every host dies as soon as it is given a task.
         real_start = machines_mod.RemoteHost.start
@@ -3476,13 +3460,12 @@ class TestMonitor:
             st.apply("run.jsonl", {"t": time.time(), **e})
         return st
 
-    def test_state_folds_placement_hosts_and_per_machine_counts(self):
+    def test_state_folds_hosts_and_per_host_counts(self):
         st = self._state(
             [
                 {"ev": "process", "pid": 1, "role": "main", "argv": ["drive.py"]},
                 {"ev": "host", "id": 1, "name": "mac", "ok": True, "capacity": 8},
                 {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
-                {"ev": "placement", "id": 1, "mode": "all", "capacities": {"mac": 8, "pc": 0, "local": 4}},
                 {"ev": "batch", "id": 1, "fn": "process", "name": "nightly", "n": 3},
                 {"ev": "start", "id": 1, "i": 0, "host": "mac"},
                 {"ev": "start", "id": 1, "i": 1, "host": "mac"},
@@ -3493,8 +3476,7 @@ class TestMonitor:
                 {"ev": "requeue", "id": 1, "i": 3, "host": "mac"},
             ]
         )
-        applied = st.applied(st.current())
-        assert applied["mode"] == "all" and applied["capacities"]["mac"] == 8
+        assert st.hosts[("run.jsonl", "mac")]["capacity"] == 8
         assert st.per_machine["run.jsonl"]["mac"] == {"running": 1, "done": 1, "failed": 0}
         assert st.per_machine["run.jsonl"]["local"] == {"running": 0, "done": 1, "failed": 1}
         assert st.hosts[("run.jsonl", "pc")]["ok"] is False
@@ -3502,49 +3484,60 @@ class TestMonitor:
     def test_render_shows_the_mode_and_the_hosts(self):
         from valuekit import monitor
 
-        st = self._state(
-            [
-                {"ev": "process", "pid": 1, "role": "main", "argv": ["drive.py"]},
-                {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
-                {"ev": "placement", "id": 1, "mode": "all", "capacities": {"mac": 8, "pc": 0, "local": 4}},
-                {"ev": "start", "id": 1, "i": 0, "host": "mac"},
-            ]
-        )
-        text = "\n".join(monitor._render(st, 120, requested="remote", configured=("mac", "pc"), keys=True))
-        assert "mode: remote  (applied: all)" in text
+        events = [
+            {"ev": "process", "pid": 1, "role": "main", "argv": ["drive.py"]},
+            {"ev": "batch", "id": 1, "fn": "process", "name": "nightly", "n": 3},
+            {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
+            {"ev": "start", "id": 1, "i": 0, "host": "mac"},
+        ]
+        st = self._state(events)
+        text = "\n".join(monitor._render(st, 120, mode="remote", configured=("mac", "pc"), local_workers=4, keys=True))
+        assert "mode: remote" in text and "applied" not in text
         assert "l local  r remote  a all  q quit" in text
+        # mac has not answered its sync yet: under remote, nothing starts here.
+        assert "waiting for mac to sync; none start here" in text
         mac = next(l for l in text.splitlines() if l.strip().startswith("mac "))
-        assert mac.split() == ["mac", "8", "1", "0", "0", "not", "tried"]
+        assert mac.split() == ["mac", "0", "1", "0", "0", "syncing"]
         pc = next(l for l in text.splitlines() if l.strip().startswith("pc"))
         assert "dropped: ssh failed" in pc
         local = next(l for l in text.splitlines() if l.strip().startswith("local"))
-        assert local.split()[:2] == ["local", "4"]
-        # With no main process yet, the applied mode is unknown and nothing is claimed.
-        assert "(applied: -)" in "\n".join(monitor._render(monitor._State(), 80, requested="local"))
+        assert local.split() == ["local", "0", "0", "0", "0", "idle", "under", "remote"]
+        # Once mac is ready, new tasks go there.
+        st = self._state(events + [{"ev": "host", "id": 1, "name": "mac", "ok": True, "capacity": 8}])
+        text = "\n".join(monitor._render(st, 120, mode="remote", configured=("mac", "pc"), local_workers=4))
+        assert "new tasks go to mac; none start here" in text
+        # Under all, this machine works too; under local, hosts are not used.
+        text = "\n".join(monitor._render(st, 120, mode="all", configured=("mac", "pc"), local_workers=4))
+        assert "new tasks go to mac, here" in text
+        text = "\n".join(monitor._render(st, 120, mode="local", configured=("mac", "pc"), local_workers=4))
+        assert "everything runs here; remote hosts are not used" in text
+        # With no batch running, the mode is shown and nothing is claimed.
+        text = "\n".join(monitor._render(monitor._State(), 80, mode="local"))
+        assert "mode: local" in text and "runs here" not in text
 
     def test_keys_set_the_mode_line(self, tmp_path):
-        from valuekit import monitor, placement
+        from valuekit import monitor, localfile
 
         cache = tmp_path / "cache"
         assert monitor._apply_key(str(tmp_path), None) is True
         assert monitor._apply_key(str(tmp_path), "r") is True
-        assert placement.read_mode(tmp_path, cache) == "remote"
+        assert localfile.read_mode(tmp_path, cache) == "remote"
         assert monitor._apply_key(str(tmp_path), "A") is True
-        assert placement.read_mode(tmp_path, cache) == "all"
+        assert localfile.read_mode(tmp_path, cache) == "all"
         assert monitor._apply_key(str(tmp_path), "x") is True  # unknown keys do nothing
-        assert placement.read_mode(tmp_path, cache) == "all"
+        assert localfile.read_mode(tmp_path, cache) == "all"
         assert monitor._apply_key(None, "r") is True  # no project: nothing written
         assert not list(tmp_path.glob("**/placement"))
         assert monitor._apply_key(str(tmp_path), "q") is False
 
     def test_mode_flag_sets_the_line_and_exits(self, tmp_path, capsys, monkeypatch):
-        from valuekit import monitor, placement
+        from valuekit import monitor, localfile
 
         cache = tmp_path / "cache"
         (tmp_path / "pyproject.toml").write_text("[project]\nname = 'p'\nversion = '0'\n")
         monkeypatch.chdir(tmp_path)
         assert monitor.main(["--mode", "remote", str(cache)]) == 0
-        assert placement.read_mode(tmp_path, cache) == "remote"
+        assert localfile.read_mode(tmp_path, cache) == "remote"
         assert monitor.main(["--mode", "sideways", str(cache)]) == 2
         assert monitor.main(["--mode"]) == 2
         monkeypatch.chdir(tmp_path.parent)  # no project here
@@ -3964,7 +3957,7 @@ class TestRemoteMachine:
 
     @pytest.fixture(autouse=True)
     def _use_host(self, monkeypatch, cache, tmp_path):
-        from valuekit import placement
+        from valuekit import localfile
 
         _locked_files()
         monkeypatch.setattr(parallel, "_host_commands", {"h1": _HOST_CMD})
@@ -4405,7 +4398,7 @@ class TestBootstrap:
 class TestSourceTree:
     @pytest.fixture(autouse=True)
     def _use_host(self, monkeypatch, cache, tmp_path):
-        from valuekit import placement
+        from valuekit import localfile
 
         _locked_files()
         monkeypatch.setattr(parallel, "_host_commands", {"h1": _HOST_CMD})

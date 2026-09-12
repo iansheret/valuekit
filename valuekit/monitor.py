@@ -11,13 +11,12 @@ promises and the one thing that is otherwise invisible -- a step that ought
 to be hitting and silently is not looks exactly like a slow step.
 
 The monitor also shows where work is going and lets you change it.  The
-*mode* (see :mod:`valuekit.placement`) is a line in the project's local
+*mode* (see :mod:`valuekit.modes`) is a line in the project's local
 file, ``valuekit.local.toml``; keys ``l``, ``r`` and ``a`` set it to
 ``local``, ``remote`` or ``all``, and that line is the only thing the
-monitor ever writes.  The main process reads the file whenever it starts a task
-and records the mode it is applying, so the header shows both the mode
-asked for and the mode in force; they differ until the next task starts,
-or while no main process is running.  ``--mode <mode>`` sets the line and exits,
+monitor ever writes.  The main process reads the file whenever it starts a task.  The header
+shows the mode and, while a batch runs, what it means for the next task
+given which hosts are ready.  ``--mode <mode>`` sets the line and exits,
 for scripts.
 
 The cache directory is taken as an argument, falling back to
@@ -35,13 +34,31 @@ import sys
 import time
 from pathlib import Path
 
-from . import placement
+from . import localfile, modes
 
 _REFRESH = 0.5  # seconds between redraws
 _LIVE_AFTER = 5.0  # a run with no record for longer than this reads as idle
 _MAX_FAILURES = 8
 
 _KEYS = {"l": "local", "r": "remote", "a": "all"}
+
+
+def _consequence(mode: str, remote_caps: dict, syncing: list, names: list) -> str:
+    """What the mode means for the next task, given the hosts' states."""
+    usable = sorted(n for n, c in remote_caps.items() if c)
+    if mode == "local":
+        return "everything runs here" + ("; remote hosts are not used" if names else "")
+    if mode == "all":
+        parts = ["new tasks go to " + ", ".join([*usable, "here"])]
+        if syncing:
+            parts.append(f"{', '.join(syncing)} still syncing")
+        return "; ".join(parts)
+    if usable:
+        return f"new tasks go to {', '.join(usable)}; none start here"
+    if syncing:
+        return f"waiting for {', '.join(syncing)} to sync; none start here"
+    return "no remote host is usable, so this machine runs the batch"
+
 
 
 def _fmt_dur(seconds: float) -> str:
@@ -64,7 +81,6 @@ class _State:
         self.fns: dict[str, dict] = {}
         self.batches: dict[tuple, dict] = {}
         self.failures: list[tuple] = []
-        self.placement: dict[str, dict] = {}  # source -> the latest placement event
         self.hosts: dict[tuple, dict] = {}  # (source, host) -> the sync's outcome
         self.per_machine: dict[str, dict[str, dict]] = {}  # source -> host -> counts
 
@@ -140,14 +156,6 @@ class _State:
                 b["ended"] = t
             return
 
-        if ev == "placement":
-            self.placement[source] = {
-                "mode": e.get("mode", "?"),
-                "capacities": e.get("capacities") or {},
-                "t": t,
-            }
-            return
-
         if ev == "host":
             self.hosts[(source, e.get("name", "?"))] = {
                 "ok": bool(e.get("ok")),
@@ -182,11 +190,6 @@ class _State:
         # quietly spoil the rate.
         since = max(r["started"] for r in mains)
         return {s for s, r in self.runs.items() if r["started"] >= since}
-
-    def applied(self, scope: set[str]) -> dict | None:
-        """The newest placement event among *scope*, or None."""
-        found = [p for s, p in self.placement.items() if s in scope]
-        return max(found, key=lambda p: p["t"]) if found else None
 
 
 class _Tail:
@@ -229,8 +232,9 @@ class _Tail:
 def _render(
     state: _State,
     width: int,
-    requested: str | None = None,
+    mode: str | None = None,
     configured: tuple[str, ...] = (),
+    local_workers: int = 0,
     keys: bool = False,
 ) -> list[str]:
     now = time.time()
@@ -244,14 +248,38 @@ def _render(
     out.append(f"runs: {len(mains)} live{extra}, {idle} finished")
 
     scope = state.current()
-    applied = state.applied(scope)
+    batch_live = any(
+        b["ended"] is None and src in scope for (src, _), b in state.batches.items()
+    )
 
-    if requested is not None:
-        in_force = applied["mode"] if applied else "-"
-        line = f"mode: {requested}  (applied: {in_force})"
+    # Every remote host that is configured or has done anything, with what
+    # the sync said about it.
+    names: list[str] = []
+    for name in (
+        *configured,
+        *(h for s, h in state.hosts if s in scope),
+        *(h for s in scope for h in state.per_machine.get(s, ())),
+    ):
+        if name not in names and name != "local":
+            names.append(name)
+    synced = {
+        n: h for (s, n), h in state.hosts.items() if s in scope and n in names
+    }
+    remote_caps = {n: (synced[n]["capacity"] or 0) if n in synced and synced[n]["ok"] else 0 for n in names}
+    syncing = [n for n in names if n not in synced] if batch_live else []
+    caps = (
+        modes.capacities(mode, local_workers, remote_caps, bool(syncing))
+        if mode in modes.MODES
+        else {}
+    )
+
+    if mode is not None:
+        line = f"mode: {mode}"
         if keys:
-            line += "        l local  r remote  a all  q quit"
+            line += "          l local  r remote  a all  q quit"
         out.append(line)
+        if batch_live and mode in modes.MODES:
+            out.append("  " + _consequence(mode, remote_caps, syncing, names))
     out.append("")
 
     for r in sorted(mains, key=lambda r: r["started"]):
@@ -262,38 +290,26 @@ def _render(
     if mains:
         out.append("")
 
-    # Every host that is configured, applied, or has done anything.
-    names: list[str] = []
-    for name in (
-        *configured,
-        *(applied["capacities"] if applied else ()),
-        *(h for s, h in state.hosts if s in scope),
-        *(h for s in scope for h in state.per_machine.get(s, ())),
-    ):
-        if name not in names and name != "local":
-            names.append(name)
-    if names or applied:
+    if names or batch_live:
         out.append("hosts")
         out.append(f"  {'host':<16}{'capacity':>10}{'running':>9}{'done':>7}{'failed':>8}  state")
         for name in (*names, "local"):
-            cap = applied["capacities"].get(name) if applied else None
+            cap = caps.get(name) if caps else None
             counts = {"running": 0, "done": 0, "failed": 0}
             for s in scope:
                 c = state.per_machine.get(s, {}).get(name)
                 if c:
                     for k in counts:
                         counts[k] += c[k]
-            ready = next(
-                (h for (s, n), h in state.hosts.items() if s in scope and n == name), None
-            )
+            h = synced.get(name)
             if name == "local":
-                status = ""
-            elif ready is None:
-                status = "not tried"
-            elif ready["ok"]:
+                status = "idle under remote" if caps and caps.get("local") == 0 and mode == "remote" else ""
+            elif h is None:
+                status = "syncing" if batch_live and mode != "local" else "not used"
+            elif h["ok"]:
                 status = "ready"
             else:
-                status = f"dropped: {ready['reason'].splitlines()[0][:40]}"
+                status = f"dropped: {h['reason'].splitlines()[0][:40]}"
             out.append(
                 f"  {name:<16}{'-' if cap is None else cap:>10}"
                 f"{counts['running']:>9}{counts['done']:>7}{counts['failed']:>8}  {status}"
@@ -435,7 +451,7 @@ def _apply_key(project: str | None, key: str | None) -> bool:
     mode = _KEYS.get(key.lower())
     if mode is not None and project is not None:
         try:
-            placement.write_mode(project, mode)
+            localfile.write_mode(project, mode)
         except OSError:
             pass
     return True
@@ -479,7 +495,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         del args[at : at + 2]
     root = args[0] if args else os.environ.get("VALUEKIT_CACHE")
-    if not root or mode is not None and mode not in placement.MODES:
+    if not root or mode is not None and mode not in modes.MODES:
         _usage()
         return 2
     root_path = Path(os.path.expanduser(root))
@@ -489,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
         if project is None:
             print(f"no project (pyproject.toml or .git) encloses {os.getcwd()}", file=sys.stderr)
             return 2
-        placement.write_mode(project, mode)
+        localfile.write_mode(project, mode)
         print(f"mode for {project}: {mode}")
         return 0
 
@@ -499,10 +515,11 @@ def main(argv: list[str] | None = None) -> int:
     tty = sys.stdout.isatty()
     keys = _Keys()
     try:
-        configured = tuple(h.name for h in placement.load_local(project).hosts)
+        config = localfile.load_local(project)
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
-        configured = ()
+        config = localfile.load_local(None)
+    configured = tuple(h.name for h in config.hosts)
     if project is None:
         print(f"no project encloses {os.getcwd()}: the mode cannot be shown or set", file=sys.stderr)
     print(f"watching {runs}", file=sys.stderr)
@@ -514,7 +531,8 @@ def main(argv: list[str] | None = None) -> int:
             tail.poll(state)
             width, height = shutil.get_terminal_size((100, 40))
             lines = _render(
-                state, width, placement.read_mode(project, root_path) if project else "-", configured, keys.enabled
+                state, width, localfile.read_mode(project, root_path) if project else None,
+                configured, config.local_workers, keys.enabled
             )
             if tty:
                 # Home the cursor and clear to end of screen, rather than

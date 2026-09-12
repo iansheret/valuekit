@@ -83,7 +83,8 @@ store         the main process's store over the channel   remotestore.py
 | File | Responsibility |
 |---|---|
 | `valuekit/parallel.py` | Scheduling: capacities per host from the local file's mode, deadlines, input ordering, failure attribution, requeue on host loss, cached-input short-circuit, batch recording. |
-| `valuekit/placement.py` | The local file (hosts, worker cap, mode, project name), capacities per mode, the worker environment allowlist. |
+| `valuekit/localfile.py` | The local file: hosts, worker cap, mode, project name; reading and setting the mode line. |
+| `valuekit/modes.py` | What each mode means: the capacity each host has under it. |
 | `valuekit/hosts.py` | `Connection`/`ProcessConnection`, `LocalHost` (a process per input), `RemoteHost` (one connection, a channel per task), and the handle that answers a worker's store requests and runs its `@pure_local` calls. |
 | `valuekit/bootstrap.py` | How a tree becomes an environment on a host: the lock-tool table, the layout under `source_root`, extraction, the sync, starting the host process. Both halves of its protocol. Stdlib only. |
 | `valuekit/hostprocess.py` | The host process: starts a worker per channel, multiplexes their streams, exits on EOF. |
@@ -96,8 +97,8 @@ store         the main process's store over the channel   remotestore.py
 | `valuekit/batches.py` | Batch records: written by `run_all`, read by `valuekit.batch()`. |
 | `valuekit/runlog.py` | The run's log: the values a run logged, under `logs/<script>/`, written as steps log or hit, read by `valuekit.logs()`. |
 | `valuekit/sweep.py` | Retention: delete what the current code cannot reach. |
-| `valuekit/events.py` | Records hits, misses, forced runs, errors, batch progress, placement, host and requeue events. |
-| `valuekit/monitor.py` | Reads the event log; shows and sets the placement mode. |
+| `valuekit/events.py` | Records hits, misses, forced runs, errors, batch progress, host and requeue events. |
+| `valuekit/monitor.py` | Reads the event log; shows the mode and what it means for the next task; sets the mode. |
 
 ## Decisions taken
 
@@ -382,7 +383,7 @@ machine and set a mode:
 ```python
 import sys
 import valuekit as vk
-from valuekit import parallel, placement
+from valuekit import parallel, localfile
 
 vk.set_cache_dir(cache)
 parallel._host_commands = {"here": [sys.executable]}

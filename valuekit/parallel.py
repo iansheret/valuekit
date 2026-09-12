@@ -70,7 +70,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Iterable, Iterator
 
-from . import bootstrap, runlog, placement, events, sync
+from . import bootstrap, events, localfile, modes, runlog, sync
 from .hosts import RemoteHost, LocalHost, ProcessConnection
 from .batches import BatchWriter
 from .functionhash import reachable_set
@@ -314,7 +314,6 @@ class _Hosts:
         self._store = store
         self._batch = batch
         self._cache_dir = cache_dir
-        self._applied: tuple | None = None
         self._closed = False
         # The local file lives in the function's project; a function with
         # no project (defined in __main__, or exec'd) has no file and so no
@@ -323,7 +322,7 @@ class _Hosts:
             self._root: str | None = sync.sync_root(fn)
         except sync.SyncError:
             self._root = None
-        config = placement.load_local(self._root)
+        config = localfile.load_local(self._root)
         self.local_workers = config.local_workers
         if _host_commands is not None:
             project = sync.Project(fn, config.project) if _host_commands else None
@@ -390,7 +389,7 @@ class _Hosts:
         start at once and a host joins when it is ready, whether the mode
         named it from the start or a switch mid-batch brought it in.
         """
-        mode = placement.read_mode(self._root, self._cache_dir)
+        mode = localfile.read_mode(self._root, self._cache_dir)
         if mode != "local" and self.hosts:
             self.sync(wait=False)
         remote = {}
@@ -405,11 +404,7 @@ class _Hosts:
                     self._store, "host", id=self._batch, name=b.name, ok=False,
                     reason=b.failure or "the connection closed", capacity=b.capacity,
                 )
-        caps = placement.capacities(mode, self.local_workers, remote, self.syncing())
-        if (mode, caps) != self._applied:
-            self._applied = (mode, caps)
-            events.record(self._store, "placement", id=self._batch, mode=mode, capacities=caps)
-        return mode, caps
+        return mode, modes.capacities(mode, self.local_workers, remote, self.syncing())
 
     def close(self) -> None:
         self._closed = True

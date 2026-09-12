@@ -35,7 +35,6 @@ from typing import BinaryIO
 
 from . import protocol
 from .functionhash import PYTHON
-from .placement import worker_env
 
 __all__ = ["main", "serve"]
 
@@ -49,6 +48,30 @@ class _Worker:
         self.proc = proc
         self.stderr = bytearray()
         self.lock = threading.Lock()
+
+
+# What a process needs from the environment to start and to find its
+# interpreter's own files; everything else stays with the main process.  No
+# PYTHONPATH (imports must resolve through the source tree, or the check
+# that they did proves nothing) and no credentials, which a @pure_local
+# call keeps on the main process.
+_WORKER_ENV = frozenset(
+    {
+        "PATH", "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL",
+        "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "WINDIR",
+        "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "USERNAME", "USER",
+        "PYTHONHOME", "PYTHONUTF8", "PYTHONIOENCODING", "VIRTUAL_ENV",
+    }
+)
+
+
+def worker_env() -> dict[str, str]:
+    """The environment a worker is started with: an allowlist."""
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k.upper() in _WORKER_ENV or k.upper().startswith("VALUEKIT_")
+    }
 
 
 def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
