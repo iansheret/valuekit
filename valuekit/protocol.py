@@ -37,7 +37,7 @@ __all__ = ["ProtocolError", "read_message", "write_message", "pack", "unpack"]
 MAX_MESSAGE = 1 << 31
 
 HELLO = b"\x01"  # main   -> worker: ids, project hash, import roots
-READY = b"\x02"  # worker -> main process: empty if accepted, else the reason
+ACCEPTED = b"\x02"  # worker -> main process: empty if accepted, else the reason
 OBJECT = b"\x03"  # either way: one content-addressed object
 TASK = b"\x04"  # main   -> worker: the root hash of the input
 RESULT = b"\x05"  # worker -> main process: ok or error
@@ -59,7 +59,7 @@ REEMITTED = b"\x19"  # main   -> worker: empty once emitted, or why not
 # Between the main process and a host process (valuekit.hostprocess), which runs one
 # worker per task and carries each worker's stream as a numbered channel.
 HOST = b"\x11"  # host -> main process: on start, its salt, CPU count and pid
-OPEN = b"\x12"  # main   -> host: channel id, then "ready" or "task"
+OPEN = b"\x12"  # main   -> host: channel id, then "check" or "task"
 DATA = b"\x13"  # both: channel id, then bytes of that worker's stdin or stdout
 CLOSE = b"\x14"  # main   -> host: channel id; close the worker's stdin
 KILL = b"\x15"  # main   -> host: channel id; kill the worker

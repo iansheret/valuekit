@@ -51,11 +51,11 @@ with `uv sync` from a lock file. The suite therefore needs `uv` on the PATH.
    `VALUEKIT_TREE` and `VALUEKIT_PROJECT_HASH` set, on the same streams, in the environment
    activated (its interpreter's directory first on `PATH`, `VIRTUAL_ENV` set).
 4. The host process's first message carries its Python version, CPU count and pid. On a
-   readiness channel the main process sends HELLO (Python version, function, function hash, project hash,
+   check channel the main process sends HELLO (Python version, function, function hash, project hash,
    import roots); the host
-   starts `valuekit.worker --ready`, which puts the tree's roots on `sys.path`, imports the
+   starts `valuekit.worker --check`, which puts the tree's roots on `sys.path`, imports the
    function, checks that every user module came from the tree, and compares function hashes.
-   Readiness runs on a thread per host; the batch never waits for it.
+   A host syncs on its own thread; the batch never waits for it.
 5. Each task is a channel: one `valuekit.worker` per task. The worker's store is a
    `RemoteStore`, so its values, call records, logged values and events go to the main process, its lookups ask
    the main process, and a `@pure_local` call is sent to the main process to run there.
@@ -65,7 +65,7 @@ with `uv sync` from a lock file. The suite therefore needs `uv` on the PATH.
    code fails its input as a local one would.
 
 The `mode` line of `valuekit.local.toml` is read each time a task is started and defaults to
-`all`. A switch to a mode that needs hosts not yet prepared starts their readiness; they
+`all`. A switch to a mode that needs hosts not yet synced starts their sync; they
 join as they become ready.
 
 ## Layers
@@ -87,7 +87,7 @@ store         the main process's store over the channel   remotestore.py
 | `valuekit/hosts.py` | `Connection`/`ProcessConnection`, `LocalHost` (a process per input), `RemoteHost` (one connection, a channel per task), and the handle that answers a worker's store requests and runs its `@pure_local` calls. |
 | `valuekit/bootstrap.py` | How a tree becomes an environment on a host: the lock-tool table, the layout under `source_root`, extraction, the sync, starting the host process. Both halves of its protocol. Stdlib only. |
 | `valuekit/hostprocess.py` | The host process: starts a worker per channel, multiplexes their streams, exits on EOF. |
-| `valuekit/worker.py` | The worker process: a readiness mode and a single-task mode; install, admit, audit. |
+| `valuekit/worker.py` | The worker process: a check mode and a single-task mode; install, admit, audit. |
 | `valuekit/remotestore.py` | `RemoteStore`: the worker's side of the store, over its channel. |
 | `valuekit/protocol.py` | Message framing, channel framing, and value transfer as content-addressed object graphs. |
 | `valuekit/codec.py` | The structural value format, and the child-hash walk the sweep uses. |
@@ -147,12 +147,12 @@ import is what keeps the main process honest. On a worker the hash is the tree's
 known before anything is imported. An extension with no project marker above it at all is
 identified by its binary, which is all there is.
 
-**Modes stay; the default is `all`; readiness never blocks.** On review, modes are a
+**Modes stay; the default is `all`; syncing never blocks.** On review, modes are a
 preset over per-host capacities, which is the shape the extra-cores model wants
 underneath; the objection to them was aesthetic. What the model concretely requires was
 changed instead: configured hosts are used without a keystroke, local work starts at once
 and hosts join when ready, and (under `remote` only) this machine stays idle while a host
-is still preparing, so that mode keeps its meaning for a short batch.
+is still syncing, so that mode keeps its meaning for a short batch.
 
 **An input whose host connection closed is requeued, once.** From the scheduler's view the
 input is neither done nor failed; `@pure` makes the retry safe. A worker that exits with a
@@ -229,7 +229,7 @@ workers, this one included; a remote host is one reached over ssh. "Host process
 remote host that starts its workers. "Main process": the process the user started, in which the script runs; it owns the cache,
 and during a batch it schedules the inputs and answers the workers. "Worker": a process that runs
 one input and exits, started by the main process here or by a host process on a remote host.
-"Readiness check": the worker-module process that imports the function on a host and checks it,
+"Check": the worker-module process that imports the function on a host and checks it,
 running no input. "Mode": which hosts are used. "Connection": the
 link to a remote host.
 
@@ -283,7 +283,7 @@ C function, `editable.rebuild`, `build-dir = "build/{wheel_tag}"`, `cmake` and `
 from PyPI, non-isolated build; `drive.py` uses `parallel._host_commands` when
 `VALUEKIT_HOSTS` is unset, `hosts-mac.toml` and `hosts-pc.toml` otherwise). Copied to
 `/Users/ians/exttrial` and driven there in mode `remote`: the host built its own binary in
-its tree under `cache/source/<project hash>/build/`, readiness passed (the worker compares
+its tree under `cache/source/<project hash>/build/`, the check passed (the worker compares
 function hashes and refuses a difference, so they matched), three inputs ran through the
 host in 3.1s from a cold tree. Editing `_core.c` (`s + 1`) produced a new project hash, a fresh
 host build, and the changed sums, again in 3.0s; nothing was sent but sources. On the way
@@ -305,11 +305,11 @@ installed for this through winget. Then:
 - *PC main process, Mac host.* `uv sync --frozen` on the PC built the extension with MSVC
   (scikit-build-core finds the compiler itself; no developer prompt) and, with
   `hosts-mac.toml`, three inputs ran on the Mac in 4.0s from a cold tree: a `.pyd` here,
-  a `.so` there, readiness passed, so one key for both binaries.
+  a `.so` there, the check passed, so one key for both binaries.
 - *Mac main process, PC host.* The Mac's copy carries the `s + 1` edit, so its project hash is the
   one the Mac's own same-machine trial had produced; the PC built that tree under sshd
   (elevated token, no console) with MSVC, using the Visual Studio generator (the binary
-  sits under `build/<tag>/Release/`), and readiness passed: 22.7s cold including the
+  sits under `build/<tag>/Release/`), and the check passed: 22.7s cold including the
   build, 7.1s warm with the transfer skipped. Outcomes were recorded under `hunk`, and
   the sums carry the edit.
 

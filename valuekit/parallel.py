@@ -301,8 +301,8 @@ def _launcher(command: list[str]):
 class _Hosts:
     """The hosts a batch may run on, and how many tasks each may hold.
 
-    Remote hosts come from the local file (or the test hook); readiness
-    runs on a thread per host and a host counts only once it is ready.  The
+    Remote hosts come from the local file (or the test hook); each syncs
+    on its own thread and counts only once it is ready.  The
     mode is re-read from the file every time capacities are asked for, so a
     switch made while the batch runs applies to the next task started.
     """
@@ -310,7 +310,7 @@ class _Hosts:
     def __init__(self, fn, cache_dir: str | None, completions: queue.Queue, store, batch: int):
         self.local = LocalHost(fn, cache_dir, completions)
         self.hosts: list[RemoteHost] = []
-        self._states: dict[str, str] = {}  # name -> pending | ready | failed
+        self._states: dict[str, str] = {}  # name -> syncing | ready | failed
         self._store = store
         self._batch = batch
         self._cache_dir = cache_dir
@@ -355,22 +355,22 @@ class _Hosts:
     def all(self) -> list:
         return [*self.hosts, self.local]
 
-    def prepare(self, wait: bool) -> None:
-        """Run readiness for every host not yet tried; block if *wait*."""
+    def sync(self, wait: bool) -> None:
+        """Sync every host not yet tried; block if *wait*."""
         threads = []
         for b in self.hosts:
             if b.name in self._states:
                 continue
-            self._states[b.name] = "pending"
-            t = threading.Thread(target=self._prepare_one, args=(b,), daemon=True)
+            self._states[b.name] = "syncing"
+            t = threading.Thread(target=self._sync_one, args=(b,), daemon=True)
             t.start()
             threads.append(t)
         if wait:
             for t in threads:
                 t.join()
 
-    def _prepare_one(self, b: RemoteHost) -> None:
-        reason = b.ensure_ready()
+    def _sync_one(self, b: RemoteHost) -> None:
+        reason = b.sync()
         self._states[b.name] = "failed" if reason else "ready"
         if self._closed:
             return  # the batch ended first; nothing to report it to
@@ -379,20 +379,20 @@ class _Hosts:
             reason=reason or None, capacity=b.capacity,
         )
 
-    def pending(self) -> bool:
-        """Whether any host is still preparing, and so may yet take work."""
-        return any(s == "pending" for s in self._states.values())
+    def syncing(self) -> bool:
+        """Whether any host is still syncing, and so may yet take work."""
+        return any(s == "syncing" for s in self._states.values())
 
     def capacities(self) -> tuple[str, dict[str, int]]:
         """The mode in force and each host's capacity under it.
 
-        Readiness is started here, never waited for: this machine's workers
+        Syncing is started here, never waited for: this machine's workers
         start at once and a host joins when it is ready, whether the mode
         named it from the start or a switch mid-batch brought it in.
         """
         mode = placement.read_mode(self._root, self._cache_dir)
         if mode != "local" and self.hosts:
-            self.prepare(wait=False)
+            self.sync(wait=False)
         remote = {}
         for b in self.hosts:
             if b.name not in self._states:
@@ -405,7 +405,7 @@ class _Hosts:
                     self._store, "host", id=self._batch, name=b.name, ok=False,
                     reason=b.failure or "the connection closed", capacity=b.capacity,
                 )
-        caps = placement.capacities(mode, self.local_workers, remote, self.pending())
+        caps = placement.capacities(mode, self.local_workers, remote, self.syncing())
         if (mode, caps) != self._applied:
             self._applied = (mode, caps)
             events.record(self._store, "placement", id=self._batch, mode=mode, capacities=caps)
@@ -556,7 +556,7 @@ def run_all(
             if not running:
                 if not pending:
                     break
-                if not hosts.pending():
+                if not hosts.syncing():
                     raise RuntimeError(
                         "no host can run this batch: every capacity is zero"
                     )

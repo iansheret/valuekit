@@ -616,10 +616,10 @@ The default is `all`: a host in the file is there to be used, the way a
 core is. Edit the line, switch it from the monitor (below), or run
 `python -m valuekit.monitor --mode remote <cache-dir>` from inside the
 project. The main process re-reads the file each time it starts a task, so a switch during a batch applies to the next
-task; tasks already running finish where they are. Preparing a host never
+task; tasks already running finish where they are. Syncing a host never
 holds the batch back: this machine starts at once and a host joins when it
 is ready (under `remote`, this machine waits for it instead). A host that
-cannot be reached or prepared is dropped with the reason recorded once,
+cannot be reached or synced is dropped with the reason recorded once,
 and the batch continues elsewhere. A host whose connection drops mid-batch
 loses nothing: the inputs that were running there run again elsewhere,
 once, and the host takes no more.

@@ -65,7 +65,7 @@ class _State:
         self.batches: dict[tuple, dict] = {}
         self.failures: list[tuple] = []
         self.placement: dict[str, dict] = {}  # source -> the latest placement event
-        self.hosts: dict[tuple, dict] = {}  # (source, host) -> readiness
+        self.hosts: dict[tuple, dict] = {}  # (source, host) -> the sync's outcome
         self.per_machine: dict[str, dict[str, dict]] = {}  # source -> host -> counts
 
     def apply(self, source: str, e: dict) -> None:

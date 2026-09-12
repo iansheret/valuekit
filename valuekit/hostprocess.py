@@ -9,7 +9,7 @@ a thousand.  (The Windows ssh client has no connection sharing, which is
 what rules out a connection per task.)
 
     host   -> HOST    salt, CPU count, pid
-    main   -> OPEN    channel, "ready" | "task"     start a worker
+    main   -> OPEN    channel, "check" | "task"     start a worker
     main   -> DATA    channel, bytes                 to that worker's stdin
     host   -> DATA    channel, bytes                 from that worker's stdout
     main   -> CLOSE   channel                        close the worker's stdin
@@ -105,7 +105,7 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
             tag, body = message
             ch, rest = protocol.channel(body)
             if tag == protocol.OPEN:
-                args = ["--ready"] if rest == b"ready" else []
+                args = ["--check"] if rest == b"check" else []
                 proc = subprocess.Popen(
                     [python, "-m", "valuekit.worker", *args],
                     stdin=subprocess.PIPE,

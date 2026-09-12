@@ -29,7 +29,7 @@ to be installed there.  A Windows host has ``python`` rather than
 The *mode*: ``all`` uses every reachable remote host and this machine at
 full capacity; ``local`` runs everything on this machine; ``remote`` runs as
 little here as possible, which means nothing here while any host is
-reachable or still preparing, and everything here when none is.  Absent,
+reachable or still syncing, and everything here when none is.  Absent,
 it is ``all``: a host in the file is there to be used, the way a core is.
 The scheduler reads the file each time it is about to start a task, so an
 edit takes effect for the next task started; tasks already running finish
@@ -190,12 +190,12 @@ def write_mode(root: str | os.PathLike, mode: str) -> None:
 
 
 def capacities(
-    mode: str, local: int, remote: dict[str, int], pending: bool = False
+    mode: str, local: int, remote: dict[str, int], syncing: bool = False
 ) -> dict[str, int]:
     """How many tasks each host may run at once under *mode*.
 
-    *remote* maps each host to its capacity, 0 until it is ready; *pending*
-    says whether any host is still preparing.  Every name is present in the
+    *remote* maps each host to its capacity, 0 until it is ready; *syncing*
+    says whether any host is still syncing.  Every name is present in the
     result, at 0 where the mode excludes it, so a display can show what is
     switched off as well as what is on.
 
@@ -208,7 +208,7 @@ def capacities(
     if mode == "all":
         return {**remote, "local": local}
     if mode == "remote":
-        if any(remote.values()) or pending:
+        if any(remote.values()) or syncing:
             return {**remote, "local": 0}
         return {**remote, "local": local}
     raise ValueError(f"unknown mode {mode!r}")

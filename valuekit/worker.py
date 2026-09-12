@@ -1,20 +1,23 @@
 """A worker that runs the main process's code, from a copy of the main process's source.
 
 ``python -m valuekit.worker`` reads framed messages on stdin and writes them
-on stdout.  It comes in two shapes.  ``--ready`` makes one process per host
+on stdout.  It comes in two shapes.  ``--check`` makes one process per host
 that imports the function from the project's source tree, checks what it
 got, and exits; every later process then runs exactly one input against
 that same tree and exits, which is what keeps the isolation `run_all`
 already promises -- a segfault or a timeout costs one input and nothing else.
 
-Readiness is separate for a reason.  A missing dependency, a build error or
-a function that will not import is a fact about the *host*, and folding it
-into the first task would report it against whichever input happened to go
-first.  Getting that wrong would break the one property `run_all` is built
-around: every failure recorded against the input that caused it.
+The check is a separate process for three reasons.  It is the host's
+first import of the function, and with a build backend that rebuilds on
+import it is the build: done once here, rather than by every task worker
+at once in one build directory.  It is the moment a host becomes usable,
+which the modes need: under ``remote`` this machine waits for it.  And a
+missing dependency, a build error or a function that will not import is a
+fact about the *host*, reported once, rather than against whichever input
+happened to go there first.
 
     main   -> HELLO   Python version, module, qualname, function hash, project hash, import roots
-    worker -> READY   empty if accepted, else why not
+    worker -> ACCEPTED   empty if accepted, else why not
     main   -> OBJECT* the input's object graph            (task workers only)
     main   -> TASK    the input's root hash
     ...               store traffic: the worker's cache is the main process's
@@ -59,7 +62,7 @@ from typing import Any, BinaryIO
 from . import events, sync, protocol
 from .remotestore import RemoteStore
 
-__all__ = ["main", "serve", "serve_ready"]
+__all__ = ["main", "serve", "serve_check"]
 
 
 def _resolve(module: str, qualname: str):
@@ -201,7 +204,7 @@ def _handshake(rx: BinaryIO, tx: BinaryIO, check_imports: bool) -> tuple[bool, s
         return False, ""  # the main process went away before saying anything
     tag, body = message
     if tag != protocol.HELLO:
-        protocol.write_message(tx, protocol.READY, b"expected a HELLO message")
+        protocol.write_message(tx, protocol.ACCEPTED, b"expected a HELLO message")
         return False, ""
     parts = protocol.unstrings(body)
     python, module, qualname, function_hash, project_hash = parts[:5]
@@ -218,11 +221,11 @@ def _handshake(rx: BinaryIO, tx: BinaryIO, check_imports: bool) -> tuple[bool, s
         # After the import, and before the function hash is trusted: a
         # function_hash that matches the wrong file is still the wrong file.
         reason = _check_imports(source)
-    protocol.write_message(tx, protocol.READY, reason.encode("utf-8"))
+    protocol.write_message(tx, protocol.ACCEPTED, reason.encode("utf-8"))
     return not reason, f"{module}:{qualname}"
 
 
-def serve_ready(rx: BinaryIO, tx: BinaryIO) -> int:
+def serve_check(rx: BinaryIO, tx: BinaryIO) -> int:
     """Once per host: import the function from the tree and check it."""
     ok, _ = _handshake(rx, tx, check_imports=True)
     return 0 if ok else 1
@@ -291,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     rx, tx = sys.stdin.buffer, sys.stdout.buffer
     try:
-        return serve_ready(rx, tx) if "--ready" in args else serve(rx, tx)
+        return serve_check(rx, tx) if "--check" in args else serve(rx, tx)
     except protocol.ProtocolError:
         return 2
     finally:

@@ -283,9 +283,9 @@ class _Handle:
         self._exit: int | None = None
         self._stderr = b""
         self._lock = threading.Lock()  # the channel is written from two threads
-        self._messages: list[tuple[bytes, bytes]] = []  # raw messages, readiness only
-        self._raw = raw  # readiness: keep messages as they are, interpret nothing
-        self._refused: str | None = None  # a task worker's READY reason, if any
+        self._messages: list[tuple[bytes, bytes]] = []  # raw messages, the check only
+        self._raw = raw  # the check: keep messages as they are, interpret nothing
+        self._refused: str | None = None  # a task worker's ACCEPTED reason, if any
 
     # -- what arrives ---------------------------------------------------------
 
@@ -335,7 +335,7 @@ class _Handle:
                 if store is not None:
                     # The worker's results live here and nowhere else.
                     protocol.store_object(store, body)
-            elif tag == protocol.READY:
+            elif tag == protocol.ACCEPTED:
                 if body:
                     # Readiness passed once, so a refusal now means the host
                     # has changed under this batch (its project directory was
@@ -738,21 +738,22 @@ class RemoteHost:
         from . import protocol
 
         ch, self._next = self._next, self._next + 1
-        handle = _Handle(self, ch, completions, raw=kind == b"ready")
+        handle = _Handle(self, ch, completions, raw=kind == b"check")
         self._channels[ch] = handle
         self._send(protocol.OPEN, protocol.channelled(ch, kind))
         return handle
 
-    # -- readiness ---------------------------------------------------------------
+    # -- the sync -------------------------------------------------------------------
 
-    def ensure_ready(self) -> str:
-        """Bring this host up and verify it once, before it takes any input.
+    def sync(self) -> str:
+        """Make this host match the main process, once, before it takes any
+        input: update its copy of the project, build the environment, import
+        the function (which builds an extension that rebuilds on import) and
+        check that what it imported is the main process's function.
 
         Returns "" when the host can take work, else why not.  A failure
         is a fact about the host, recorded once rather than against every
-        input that would have gone there.  The connection carries the
-        project over and builds its environment; a readiness check then
-        imports the function from it and checks what it got.
+        input that would have gone there.
         """
         from . import protocol
 
@@ -764,11 +765,11 @@ class RemoteHost:
         if reason:
             self.failure = reason
             return reason
-        handle = self._open(b"ready", queue.Queue())
+        handle = self._open(b"check", queue.Queue())
         try:
             handle._write_message(protocol.HELLO, self._hello)
             message = handle.wait_message(timeout=600)
-            if message is None or message[0] != protocol.READY:
+            if message is None or message[0] != protocol.ACCEPTED:
                 return self._fail(handle, "the worker never reported")
             if message[1]:
                 return self._fail(handle, message[1].decode("utf-8", "replace"))

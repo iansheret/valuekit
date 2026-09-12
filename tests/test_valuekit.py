@@ -3308,10 +3308,10 @@ class TestPlacement:
         # is nowhere else.
         assert capacities("remote", 6, {}) == {"local": 6}
         assert capacities("remote", 6, {"mac": 0}) == {"mac": 0, "local": 6}
-        # ... but a host still preparing is somewhere else: this host
+        # ... but a host still syncing is somewhere else: this host
         # waits for it rather than taking the batch itself.
-        assert capacities("remote", 6, {"mac": 0}, pending=True) == {"mac": 0, "local": 0}
-        assert capacities("all", 6, {"mac": 0}, pending=True) == {"mac": 0, "local": 6}
+        assert capacities("remote", 6, {"mac": 0}, syncing=True) == {"mac": 0, "local": 0}
+        assert capacities("all", 6, {"mac": 0}, syncing=True) == {"mac": 0, "local": 6}
 
     def test_worker_env_is_an_allowlist(self, monkeypatch):
         from valuekit.placement import worker_env
@@ -3398,7 +3398,7 @@ class TestPlacementScheduling:
         outcomes = [e for _, e in _records(cache, "outcome")]
         hosts = [e["host"] for e in sorted(outcomes, key=lambda e: e["t"])]
         assert hosts[0] == "local" and hosts[-1] == "h1"
-        # One event when the mode changes (the host still preparing, so
+        # One event when the mode changes (the host still syncing, so
         # nothing runs anywhere), another when the host joins.
         events = [e for _, e in _records(cache, "placement")]
         assert [e["mode"] for e in events] == ["local", "remote", "remote"]
@@ -3416,18 +3416,18 @@ class TestPlacementScheduling:
 
         monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
         placement.write_mode(tmp_path / "proj", "remote")
-        real_ready = machines_mod.RemoteHost.ensure_ready
+        real_sync = machines_mod.RemoteHost.sync
 
-        def ready_then_die(self):
+        def sync_then_die(self):
             # The host process itself dies a second after it has taken work,
             # as a host going down would; the bootstrap that started it
             # is not the host, so killing the link's process would not do.
-            reason = real_ready(self)
+            reason = real_sync(self)
             if not reason:
                 threading.Timer(1.0, os.kill, (self.pid, signal.SIGTERM)).start()
             return reason
 
-        monkeypatch.setattr(machines_mod.RemoteHost, "ensure_ready", ready_then_die)
+        monkeypatch.setattr(machines_mod.RemoteHost, "sync", sync_then_die)
         m, _ = _write_batch_module(tmp_path)
         r = vk.run_all(m.slow, [1, 2, 3, 4, 5, 6])
         assert r.failures == []
@@ -3881,7 +3881,7 @@ def _hello(fn, python=None, function_hash=None, project_hash=""):
 
 
 def _handshake(body):
-    """Run a worker's handshake in-process; return the READY reason."""
+    """Run a worker's handshake in-process; return the ACCEPTED reason."""
     from valuekit import worker
 
     rx, tx = io.BytesIO(), io.BytesIO()
@@ -3890,7 +3890,7 @@ def _handshake(body):
     worker.serve(rx, tx)
     tx.seek(0)
     tag, reason = protocol.read_message(tx)
-    assert tag == protocol.READY
+    assert tag == protocol.ACCEPTED
     return reason.decode()
 
 
@@ -4433,7 +4433,7 @@ class TestSourceTree:
         m = _load(root)
         completions = queue.Queue()
         host = _remote_machine(m.work, cache, completions=completions)
-        assert host.ensure_ready() == ""
+        assert host.sync() == ""
         # Delete the source outright. If the worker were resolving imports
         # against the live tree this cannot survive.
         (root / "vk_sync_mod.py").unlink()
@@ -4473,13 +4473,13 @@ class TestSourceTree:
     def test_an_unchanged_tree_is_not_resent(self, cache, tmp_path):
         m = _load(_project(tmp_path))
         first = _remote_machine(m.work, cache)
-        assert first.ensure_ready() == ""
+        assert first.sync() == ""
         first.close()
         before = (cache / "source").stat().st_mtime_ns
         # A second host over the same tree finds the source tree already there
         # and asks for nothing.
         second = _remote_machine(m.work, cache)
-        assert second.ensure_ready() == ""
+        assert second.sync() == ""
         second.close()
         assert (cache / "source").stat().st_mtime_ns == before
         assert len(_trees(cache)) == 1
@@ -4494,7 +4494,7 @@ class TestSourceTree:
         (half / "vk_sync_mod.py").write_text(
             "from valuekit import pure\n@pure\ndef work(x):\n    return 'WRONG'\n"
         )
-        assert host.ensure_ready() == ""
+        assert host.sync() == ""
         host.close()
         assert vk.run_all(m.work, [1]).values == [101]
 
@@ -4505,14 +4505,14 @@ class TestSourceTree:
         m = _load(root)
         completions = queue.Queue()
         first = _remote_machine(m.work, cache, completions=completions)
-        assert first.ensure_ready() == ""
+        assert first.sync() == ""
         # A second main process, with an edited project, updates the host's copy.
         (root / "vk_sync_mod.py").write_text(
             "from valuekit import pure\n@pure\ndef work(x):\n    return x + 999999\n"
         )
         m2 = _load(root)
         second = _remote_machine(m2.work, cache)
-        assert second.ensure_ready() == ""
+        assert second.sync() == ""
         second.close()
         # The first batch's next task is refused: not failed, not done, and
         # the host takes no more of that batch.
@@ -4562,12 +4562,12 @@ class TestSourceTree:
             sys.path.remove(str(outside))
             sys.modules.pop("vk_sync_mod_far", None)
 
-    def test_readiness_failure_is_one_reason_not_one_per_input(self, cache, tmp_path):
+    def test_a_failed_sync_is_one_reason_not_one_per_input(self, cache, tmp_path):
         m = _load(_project(tmp_path))
         host = _remote_machine(m.work, cache)
         parts = protocol.unstrings(host._hello)
         host._hello = protocol.strings("wrong-python", *parts[1:])
-        reason = host.ensure_ready()
+        reason = host.sync()
         host.close()
         assert "wrong-python" in reason
-        assert host.ensure_ready() == reason  # remembered, not retried
+        assert host.sync() == reason  # remembered, not retried
