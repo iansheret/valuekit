@@ -105,7 +105,7 @@ KNOWN_LOCKS = tuple(_TOOLS)
 STAGE0 = "import os;exec(b''.join(iter(lambda:os.read(0,1) or os._exit(1),bytes(1))))"
 
 _STALE = 3600  # seconds after which a lock counts as abandoned
-_HEARTBEAT = 5  # seconds between refreshes of a busy marker
+_REFRESH = 5  # seconds between refreshes of a busy marker
 _BUSY_STALE = 60  # seconds without a refresh after which a busy marker is ignored
 _WAIT = 600  # seconds to wait for another main process's update to finish
 _TAIL = 64 << 10
@@ -266,14 +266,14 @@ def _hold_busy(tree: str, run: str):
         f.write(run + "\n")
     stop = threading.Event()
 
-    def beat() -> None:
-        while not stop.wait(_HEARTBEAT):
+    def refresh() -> None:
+        while not stop.wait(_REFRESH):
             try:
                 os.utime(path, None)
             except OSError:
                 return
 
-    threading.Thread(target=beat, daemon=True).start()
+    threading.Thread(target=refresh, daemon=True).start()
 
     def release() -> None:
         stop.set()

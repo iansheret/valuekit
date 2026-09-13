@@ -7,20 +7,22 @@ happens in a process on this machine or somewhere else.  This module owns
 the other half: starting a task, telling the scheduler when it has
 something to say, and killing it.
 
-A host hands back a *handle* per task.  Whenever a handle has
-something to feed -- a message, a chunk of bytes, or the news that its
-worker is gone -- the host puts ``(handle, payload)`` on the completions the
+A host returns a *handle* per task.  Whenever a handle has something to
+feed -- a message, a chunk of bytes, or the fact that its worker has
+exited -- the host puts ``(handle, payload)`` on the completions queue the
 scheduler gave it, and the scheduler calls ``handle.feed(payload)``.  One
-completions for every host is what lets a batch span hosts without the
-scheduler waiting on two kinds of thing, and a blocking read on a thread is
-the one primitive every platform gives a pipe, which is why there is no
-``select`` here.
+queue for every host is what lets a batch span hosts without the scheduler
+waiting on two kinds of thing, and a blocking read on a thread is the one
+primitive every platform gives a pipe, which is why there is no ``select``
+here.
 
-The handle carries a three-variant message back, the same union the local
-worker sends: ``("ok", value)``, ``("err", exc, tb)``, or
-``("err_str", type_name, text, tb)`` when the exception itself could not be
-sent.  A handle that yields no message at all died, which the scheduler
-already knows how to attribute.
+A handle answers one question, ``finished()``: nothing yet, or a
+:class:`Finished` saying what happened -- a result, an exception, a worker
+that exited without answering, or a connection that closed with the input
+neither done nor failed.  A worker sends its answer as one of ``("ok",
+value)``, ``("err", exc, tb)`` or ``("err_str", type_name, text, tb)`` when
+the exception itself could not be sent; the handle turns that into the
+``Finished``.
 
 Two hosts.  :class:`LocalHost` spawns a process per input on this
 host.  :class:`RemoteHost` holds one connection to a *host process*
@@ -56,37 +58,56 @@ from typing import Any, BinaryIO, Callable, Protocol
 
 from .codec import SerializationError
 
-__all__ = ["Handle", "Connection", "ProcessConnection", "LocalHost", "RemoteHost"]
+__all__ = ["Finished", "Handle", "Connection", "ProcessConnection", "LocalHost", "RemoteHost"]
+
+
+class Finished:
+    """What happened to a task.  ``kind`` is one of:
+
+    * ``"ok"``: ``value`` is the result;
+    * ``"error"``: ``exc`` is the exception the worker raised, ``tb`` its
+      traceback text;
+    * ``"error_text"``: the exception could not be sent; ``text`` names it,
+      ``tb`` is its traceback text;
+    * ``"exited"``: the worker exited without answering; ``text`` says how;
+    * ``"connection_closed"``: the connection to the host closed with the
+      input neither done nor failed, so the scheduler may run it elsewhere.
+    """
+
+    __slots__ = ("kind", "value", "exc", "text", "tb")
+
+    def __init__(self, kind: str, value: Any = None, exc: BaseException | None = None,
+                 text: str = "", tb: str = ""):
+        self.kind = kind
+        self.value = value
+        self.exc = exc
+        self.text = text
+        self.tb = tb
+
+    @classmethod
+    def from_message(cls, msg: tuple) -> "Finished":
+        """A worker's answer tuple as a Finished."""
+        if msg[0] == "ok":
+            return cls("ok", value=msg[1])
+        if msg[0] == "err":
+            return cls("error", exc=msg[1], tb=msg[2])
+        return cls("error_text", text=f"{msg[1]}: {msg[2]}", tb=msg[3])
 
 
 class Handle(Protocol):
     """One task in flight."""
 
     def feed(self, payload: Any) -> None:
-        """Take what the host put on the completions for this handle."""
+        """Take what the host put on the completions queue for this handle."""
 
-    def settled(self) -> bool:
-        """Whether there is an answer, or the worker has gone."""
-
-    def recv(self) -> tuple | None:
-        """The worker's message, or None if it died without sending one."""
+    def finished(self) -> Finished | None:
+        """What happened, or None while the task is still running."""
 
     def kill(self) -> None:
         """Stop the work now."""
 
-    def reap(self) -> None:
-        """Release what it held once it is finished."""
-
-    def death(self) -> str:
-        """A phrase describing how it died, for the failure message."""
-
-    def lost(self) -> bool:
-        """Whether the host went away with the work neither done nor failed.
-
-        A worker that exits, however badly, has failed its input; a
-        connection that closes under a worker has said nothing about the
-        input at all, and the scheduler may run it elsewhere.
-        """
+    def release(self) -> None:
+        """Let go of what the task held, once it is finished."""
 
 
 # ---------------------------------------------------------------------------
@@ -94,20 +115,17 @@ class Handle(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def _local_worker_main(conn, cache_dir: str | None, fn, x, run=None) -> None:
+def _local_worker_main(conn, cache_dir: str | None, fn, x) -> None:
     """Runs in the worker process: configure the cache, run one input, send
     one message back: ("ok", value) or ("err", exc, tb) or, when the
     exception or value cannot be pickled, ("err_str", type_name, text, tb).
-    *run* is the main process's ``(name, id)``: what this worker logs goes
-    into the main process's runlog.
+    What this worker logs goes into the main process's run, named in the
+    environment it inherited (see :mod:`valuekit.runlog`).
     """
     try:
         if cache_dir is not None:
-            from . import runlog
             from .pure import set_cache_dir
 
-            if run is not None:
-                runlog.adopt(*run)
             set_cache_dir(cache_dir)
         try:
             value = fn(x)
@@ -156,28 +174,23 @@ class _LocalHandle:
         self._msg = payload
         self._settled = True
 
-    def settled(self) -> bool:
-        return self._settled
-
-    def recv(self) -> tuple | None:
-        return self._msg
+    def finished(self) -> Finished | None:
+        if not self._settled:
+            return None
+        if self._msg is None:
+            return Finished(
+                "exited",
+                text=f"exit code {self.proc.exitcode}; a segfault or an out-of-memory kill?",
+            )
+        return Finished.from_message(self._msg)
 
     def kill(self) -> None:
         self.proc.kill()
         self.proc.join()
 
-    def reap(self) -> None:
+    def release(self) -> None:
         self.proc.join()
         self.conn.close()
-
-    def death(self) -> str:
-        return (
-            f"exit code {self.proc.exitcode}; a segfault or an "
-            f"out-of-memory kill?"
-        )
-
-    def lost(self) -> bool:
-        return False  # a local process's exit is always reported
 
 
 class LocalHost:
@@ -197,12 +210,10 @@ class LocalHost:
         self._ctx = multiprocessing.get_context("spawn")
 
     def start(self, x: Any) -> _LocalHandle:
-        from . import runlog
-
         recv_end, send_end = self._ctx.Pipe(duplex=False)
         proc = self._ctx.Process(
             target=_local_worker_main,
-            args=(send_end, self._cache_dir, self._fn, x, runlog.current()),
+            args=(send_end, self._cache_dir, self._fn, x),
             daemon=True,
         )
         proc.start()
@@ -454,40 +465,29 @@ class _Handle:
 
     # -- the scheduler's view --------------------------------------------------
 
-    def settled(self) -> bool:
-        return self._failure is not None or self._result is not None or self._eof
-
-    def recv(self) -> tuple | None:
+    def finished(self) -> Finished | None:
         if self._failure is not None:
-            return ("err_str", "RuntimeError", self._failure, "")
-        return self._result  # None means it went away without answering
+            return Finished("error_text", text=f"RuntimeError: {self._failure}")
+        if self._result is not None:
+            return Finished.from_message(self._result)
+        if not self._eof:
+            return None
+        tail = self._stderr.decode("utf-8", "replace").strip()
+        if self._exit is None:
+            return Finished("connection_closed", text=f"the connection to host {self._host.name!r} closed")
+        why = f"exit code {self._exit} on host {self._host.name!r}"
+        return Finished("exited", text=f"{why}:\n{tail}" if tail else f"{why}; a segfault or a broken pipe?")
 
     def kill(self) -> None:
         from . import protocol
 
         self._host._send(protocol.KILL, protocol.channelled(self.ch))
 
-    def reap(self) -> None:
+    def release(self) -> None:
         from . import protocol
 
         self._host._send(protocol.CLOSE, protocol.channelled(self.ch))
-        self._host._forget(self.ch)
-
-    def lost(self) -> bool:
-        return (
-            self._eof
-            and self._exit is None
-            and self._result is None
-            and self._failure is None
-        )
-
-    def death(self) -> str:
-        tail = self._stderr.decode("utf-8", "replace").strip()
-        if self._exit is None:
-            why = f"the connection to host {self._host.name!r} closed"
-        else:
-            why = f"exit code {self._exit} on host {self._host.name!r}"
-        return f"{why}:\n{tail}" if tail else f"{why}; a segfault or a broken pipe?"
+        self._host._drop_channel(self.ch)
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +723,7 @@ class RemoteHost:
             except (OSError, ValueError):
                 pass  # the host is gone; the reader thread reports it
 
-    def _forget(self, ch: int) -> None:
+    def _drop_channel(self, ch: int) -> None:
         self._channels.pop(ch, None)
 
     def _open(self, kind: bytes, completions: queue.Queue) -> _Handle:
@@ -766,7 +766,7 @@ class RemoteHost:
             if message[1]:
                 return self._fail(handle, message[1].decode("utf-8", "replace"))
         finally:
-            handle.reap()
+            handle.release()
         self._ready = True
         return ""
 

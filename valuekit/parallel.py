@@ -71,7 +71,7 @@ from collections import deque
 from typing import Any, Callable, Iterable, Iterator
 
 from . import bootstrap, events, localfile, modes, runlog, sync
-from .hosts import RemoteHost, LocalHost, ProcessConnection
+from .hosts import Finished, LocalHost, ProcessConnection, RemoteHost
 from .batches import BatchWriter
 from .functionhash import reachable_set
 from .debughook import breakpoints_force
@@ -191,45 +191,41 @@ class _RemoteTraceback(Exception):
 
 
 class _Task:
-    __slots__ = ("x", "idx", "handle", "deadline", "timed_out", "where")
+    __slots__ = ("x", "idx", "handle", "deadline", "where")
 
     def __init__(self, x, idx, handle, deadline, where: str):
         self.x = x
         self.idx = idx
         self.handle = handle
         self.deadline = deadline
-        self.timed_out = False
         self.where = where
 
 
-def _harvest(t: _Task, msg, name: str, timeout) -> Outcome:
-    """Turn a finished task into an Outcome."""
-    if msg is None:
-        if t.timed_out:
-            exc: BaseException = TimeoutError(
-                f"{name}({t.x!r}) exceeded the {timeout} s limit and was "
-                f"killed. Completed steps are cached; to debug a "
-                f"deterministic hang, call {name}({t.x!r}) and pause the "
-                f"debugger."
-            )
-        else:
-            exc = RuntimeError(
-                f"a worker died without raising while processing "
-                f"{name}({t.x!r}) ({t.handle.death()}). Completed steps are "
-                f"cached; call {name}({t.x!r}) yourself to debug it."
-            )
+def _outcome_of(t: _Task, done: Finished, name: str, timeout) -> Outcome:
+    """A finished task's answer as an Outcome against its input."""
+    if done.kind == "ok":
+        return Outcome(t.x, value=done.value)
+    if done.kind == "error":
+        exc: BaseException = done.exc
+        exc.__cause__ = _RemoteTraceback(f"\n{done.tb}")
         return Outcome(t.x, exc=exc)
-    kind = msg[0]
-    if kind == "ok":
-        return Outcome(t.x, value=msg[1])
-    if kind == "err":
-        exc = msg[1]
-        exc.__cause__ = _RemoteTraceback(f"\n{msg[2]}")
+    if done.kind == "error_text":  # the worker's exception could not be sent
+        exc = RuntimeError(done.text)
+        exc.__cause__ = _RemoteTraceback(f"\n{done.tb}")
         return Outcome(t.x, exc=exc)
-    # "err_str": the worker's exception was not picklable
-    exc = RuntimeError(f"{msg[1]}: {msg[2]}")
-    exc.__cause__ = _RemoteTraceback(f"\n{msg[3]}")
-    return Outcome(t.x, exc=exc)
+    if done.kind == "timed_out":
+        return Outcome(t.x, exc=TimeoutError(
+            f"{name}({t.x!r}) exceeded the {timeout} s limit and was "
+            f"killed. Completed steps are cached; to debug a "
+            f"deterministic hang, call {name}({t.x!r}) and pause the "
+            f"debugger."
+        ))
+    # "exited", or "connection_closed" for the second time
+    return Outcome(t.x, exc=RuntimeError(
+        f"a worker died without raising while processing "
+        f"{name}({t.x!r}) ({done.text}). Completed steps are "
+        f"cached; call {name}({t.x!r}) yourself to debug it."
+    ))
 
 
 class _BatchRecorder:
@@ -511,7 +507,7 @@ def run_all(
 
     running: list[_Task] = []
     busy: dict[str, int] = {}  # host name -> tasks running there
-    moved: set[int] = set()  # inputs already run again after losing their host
+    requeued: set[int] = set()  # inputs already run again once after losing their host
 
     def _start(host, idx: int, x: Any) -> None:
         handle = host.start(x)
@@ -520,7 +516,7 @@ def run_all(
         busy[host.name] = busy.get(host.name, 0) + 1
         events.record(store, "start", id=batch, i=idx, host=host.name)
 
-    def _accept() -> None:
+    def _start_pending() -> None:
         _, caps = hosts.capacities()
         total = max_workers or sum(caps.values())
         for host in hosts.all():
@@ -531,7 +527,7 @@ def run_all(
             ):
                 _start(host, *pending.popleft())
 
-    def _drain(block: bool) -> None:
+    def _deliver(block: bool) -> None:
         """Feed handles whatever the hosts have delivered."""
         try:
             handle, payload = completions.get(timeout=_POLL if block else 0)
@@ -547,7 +543,7 @@ def run_all(
 
     try:
         while pending or running:
-            _accept()
+            _start_pending()
             if not running:
                 if not pending:
                     break
@@ -555,35 +551,32 @@ def run_all(
                     raise RuntimeError(
                         "no host can run this batch: every capacity is zero"
                     )
-                _drain(block=True)  # a host is still syncing; wait for it
+                _deliver(block=True)  # a host is still syncing; wait for it
                 continue
-            _drain(block=True)
+            _deliver(block=True)
             now = time.monotonic()
             for t in list(running):
-                msg = None
-                if t.handle.settled():
-                    msg = t.handle.recv()
-                elif t.deadline is not None and now >= t.deadline:
+                done = t.handle.finished()
+                if done is None and t.deadline is not None and now >= t.deadline:
                     t.handle.kill()
-                    _drain(block=False)
-                    if t.handle.settled():  # finished just before the kill landed
-                        msg = t.handle.recv()
-                    t.timed_out = msg is None
-                else:
+                    _deliver(block=False)
+                    done = t.handle.finished()
+                    if done is None or done.kind in ("exited", "connection_closed"):
+                        done = Finished("timed_out")  # only an answer means it finished first
+                if done is None:
                     continue
                 running.remove(t)
                 busy[t.where] -= 1
-                t.handle.reap()
-                if msg is None and not t.timed_out and t.handle.lost():
-                    # The connection closed; the input is not done, not
-                    # failed.  Run it again elsewhere, once: an input that
-                    # takes a host down each time is a failure after all.
-                    if t.idx not in moved:
-                        moved.add(t.idx)
-                        pending.appendleft((t.idx, t.x))
-                        events.record(store, "requeue", id=batch, i=t.idx, host=t.where)
-                        continue
-                o = _harvest(t, msg, qualname, timeout)
+                t.handle.release()
+                if done.kind == "connection_closed" and t.idx not in requeued:
+                    # The input is not done, not failed.  Run it again
+                    # elsewhere, once: an input that takes a host down each
+                    # time is a failure after all.
+                    requeued.add(t.idx)
+                    pending.appendleft((t.idx, t.x))
+                    events.record(store, "requeue", id=batch, i=t.idx, host=t.where)
+                    continue
+                o = _outcome_of(t, done, qualname, timeout)
                 outcomes[t.idx] = o
                 recorder.outcome(t.idx, o, host=t.where)
     finally:

@@ -3960,7 +3960,7 @@ def _settle(handle, completions, timeout=30):
     import queue
 
     deadline = time.monotonic() + timeout
-    while not handle.settled() and time.monotonic() < deadline:
+    while handle.finished() is None and time.monotonic() < deadline:
         try:
             h, payload = completions.get(timeout=0.2)
         except queue.Empty:
@@ -4449,9 +4449,10 @@ class TestSourceTree:
         handle = host.start(7)
         _settle(handle, completions)
         try:
-            assert handle.recv() == ("ok", 107)
+            done = handle.finished()
+            assert done.kind == "ok" and done.value == 107
         finally:
-            handle.reap()
+            handle.release()
             host.close()
 
     def test_an_edit_updates_the_tree_in_place(self, cache, tmp_path):

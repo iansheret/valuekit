@@ -113,29 +113,34 @@ class _Run:
 
 
 _current: _Run | None = None
-_adopted: tuple[str, str] | None = None  # (name, id) handed down by the main process
 _begin_lock = threading.Lock()
 
+# The main process names its run in its own environment, so the workers it
+# spawns on this machine, which inherit that environment, write into the
+# same run rather than beginning their own.  The main process's pid is in
+# the value so that the process which set it never reads it back as a
+# child would.
+_RUN_ENV = "VALUEKIT_RUN"
 
-def adopt(name: str, run_id: str) -> None:
-    """Internal: a worker joins the main process's run instead of beginning
-    its own.  Must be called before the worker's first memoised call."""
-    global _adopted
-    _adopted = (name, run_id)
 
-
-def current() -> tuple[str, str] | None:
-    """Internal: ``(name, id)`` of this process's run, if begun."""
-    return None if _current is None else (_current.name, _current.id)
+def _inherited_run() -> tuple[str, str] | None:
+    """The ``(name, id)`` a parent process named, if this is its child."""
+    value = os.environ.get(_RUN_ENV, "")
+    pid, _, rest = value.partition(":")
+    run_id, _, name = rest.partition(":")
+    if not pid or pid == str(os.getpid()) or not run_id:
+        return None
+    return name, run_id
 
 
 def current_run(store: Any) -> _Run | None:
     """The run this process writes to for *store*, begun if needed.
 
     None for a store without a directory (a worker whose store is the
-    main process's sends its lines there instead).  Beginning a run
-    writes its header, points ``latest`` at it and removes the older
-    runs under the same name; a worker joins without any of that.
+    main process's sends its lines there instead).  A process spawned by
+    a main process writes into that process's run, named in the
+    environment; any other process begins its own: writes the header,
+    points ``latest`` at it and removes the older runs under the same name.
     """
     global _current
     root = getattr(store, "root", None)
@@ -150,10 +155,8 @@ def current_run(store: Any) -> _Run | None:
             return run
         if run is not None:
             run.close()
-        if _adopted is not None:
-            run = _Run(root, *_adopted)
-        else:
-            run = _begin(root)
+        inherited = _inherited_run()
+        run = _Run(root, *inherited) if inherited else _begin(root)
         _current = run
         return run
 
@@ -173,6 +176,7 @@ def _begin(root: Path) -> _Run:
     }
     _atomic_write(run.dir / "header.json", json.dumps(header).encode())
     _atomic_write(run.dir.parent / "latest", run_id.encode())
+    os.environ[_RUN_ENV] = f"{os.getpid()}:{run_id}:{name}"
     for old in list(run.dir.parent.iterdir()):
         if old.is_dir() and old.name != run_id:
             shutil.rmtree(old, ignore_errors=True)
