@@ -30,7 +30,7 @@ from valuekit import bootstrap
 from valuekit import functionhash
 from valuekit import events
 from valuekit import parallel
-from valuekit import sync
+from valuekit import project
 from valuekit import protocol
 from valuekit.functionhash import PYTHON, _classify, reachable_set
 from valuekit.store import LocalStore, CacheMiss, SerializationError, record_hash
@@ -41,19 +41,19 @@ from valuekit import debughook
 
 @pytest.fixture()
 def cache(tmp_path):
-    vk.set_cache_dir(tmp_path / "cache")
+    vk.set_store_dir(tmp_path / "cache")
     yield tmp_path / "cache"
-    vk.set_cache_dir(None)
+    vk.set_store_dir(None)
 
 
 @pytest.fixture(autouse=True)
 def _no_cache_by_default(monkeypatch):
-    vk.set_cache_dir(None)
+    vk.set_store_dir(None)
     # An in-process worker handshake installs the main process's extension
     # markers; no test starts with another test's.
     monkeypatch.setattr(functionhash, "_markers_here", None)
     yield
-    vk.set_cache_dir(None)
+    vk.set_store_dir(None)
 
 
 # ===========================================================================
@@ -574,7 +574,7 @@ class TestNativeExtensions:
     def test_the_binary_identifies_the_extension(self, fake_extension):
         mod, path = fake_extension
         kind, marker = _classify(mod.__name__, mod.__file__)
-        assert marker == f"ext:_fake_ext={sync._file_hash(str(path))}"
+        assert marker == f"ext:_fake_ext={project._file_hash(str(path))}"
 
     def test_a_rebuild_invalidates_its_callers(self, fake_extension):
         # The case this exists for: a @pure function calls into C++, the C++
@@ -591,15 +591,15 @@ class TestNativeExtensions:
         mod, path = fake_extension
         fn = _using_global("solve", _NativeCallable())
         reach = reachable_set(fn)
-        assert reach.extensions == {"_fake_ext": sync._file_hash(str(path))}
+        assert reach.extensions == {"_fake_ext": project._file_hash(str(path))}
         plain = reachable_set(lambda x: x)
         assert plain.extensions == {}
 
     def test_the_binary_is_read_once_per_build(self, fake_extension, monkeypatch):
         mod, path = fake_extension
         calls = []
-        real = sync._file_hash
-        monkeypatch.setattr(sync, "_file_hash", lambda p: calls.append(p) or real(p))
+        real = project._file_hash
+        monkeypatch.setattr(project, "_file_hash", lambda p: calls.append(p) or real(p))
         ns = {"a": _NativeCallable(), "b": _NativeCallable()}
         exec("def f(x):\n    return a(x) + b(x)", ns)
         _fp(ns["f"])
@@ -615,8 +615,8 @@ class TestNativeExtensions:
         m, _ = _write_batch_module(tmp_path)
         mod, path = fake_extension
         calls = []
-        real = sync._file_hash
-        monkeypatch.setattr(sync, "_file_hash", lambda p: calls.append(p) or real(p))
+        real = project._file_hash
+        monkeypatch.setattr(project, "_file_hash", lambda p: calls.append(p) or real(p))
         assert _handshake(_hello(m.process, extensions={"_fake_ext": "7" * 40})) == ""
         assert functionhash._markers_here == {"_fake_ext": "7" * 40}
         assert _classify(mod.__name__, mod.__file__)[1] == "ext:_fake_ext=" + "7" * 40
@@ -670,7 +670,7 @@ class TestNativeExtensions:
                 return json.dumps({"url": url, "dir_info": {"editable": True}})
 
         monkeypatch.setattr(functionhash, "_distribution", lambda top: _LocalDist())
-        assert _classify(mod.__name__, mod.__file__)[1] == f"ext:_fake_ext={sync._file_hash(str(binary))}"
+        assert _classify(mod.__name__, mod.__file__)[1] == f"ext:_fake_ext={project._file_hash(str(binary))}"
 
     def test_an_extension_module_is_tracked_as_a_module(self, fake_extension):
         mod, path = fake_extension
@@ -862,15 +862,6 @@ class TestStore:
         store_mod._atomic_write(target, b"same")
         assert target.read_bytes() == b"same"
         assert not list(tmp_path.glob(".tmp-*"))
-
-    def test_drop_records_removes_one_functions_records(self, tmp_path):
-        s = LocalStore(tmp_path)
-        s.put_record("k", {"fn": "f", "deps": {}, "result": "0" * 40})
-        s.put_record("j", {"fn": "g", "deps": {}, "result": "0" * 40})
-        s.drop_records("k")
-        assert not (tmp_path / "records" / "k").exists()
-        assert s.get_records("k") == []
-        assert len(s.get_records("j")) == 1
 
     def test_immutable_map_pickles(self, tmp_path):
         import pickle
@@ -1632,119 +1623,6 @@ class TestPure:
         assert ns["f"](1) == 3  # body changed → miss
         assert len(calls) == 2
 
-    def test_targeted_clear(self, cache):
-        calls = []
-
-        @pure
-        def f(x):
-            calls.append("f")
-            return x + 1
-
-        @pure
-        def g(x):
-            calls.append("g")
-            return x + 2
-
-        assert f(1) == 2 and g(1) == 3
-        vk.clear_cache(f)
-        assert f(1) == 2 and g(1) == 3
-        # f forgot and recomputed; unrelated g's cache was untouched:
-        assert calls == ["f", "g", "f"]
-
-    def test_clear_reaches_callers_transitively(self, cache):
-        calls = []
-
-        @pure
-        def leaf(x):
-            calls.append("c")
-            return x + 1
-
-        @pure
-        def mid(x):
-            calls.append("b")
-            return leaf(x) * 2
-
-        @pure
-        def top(x):
-            calls.append("a")
-            return mid(x) + 3
-
-        @pure
-        def bystander(x):
-            calls.append("z")
-            return x * 10
-
-        assert top(1) == 7 and bystander(1) == 10
-        calls.clear()
-
-        vk.clear_cache(leaf)  # "leaf has changed"
-        assert top(1) == 7
-        assert bystander(1) == 10
-        # The whole chain through leaf recomputed; the bystander hit:
-        assert calls == ["a", "b", "c"]
-
-    def test_clear_reaches_argument_uses(self, cache):
-        calls = []
-
-        @pure
-        def double(x):
-            return x * 2
-
-        @pure
-        def apply(x, fn):
-            calls.append(1)
-            return fn(x)
-
-        assert apply(3, double) == 6
-        assert apply(3, double) == 6
-        assert len(calls) == 1
-        vk.clear_cache(double)  # call records keyed on double-as-argument must go
-        assert apply(3, double) == 6
-        assert len(calls) == 2
-
-    def test_clear_reaches_module_attribute_callers(self, cache, tmp_path):
-        import importlib.util
-        import sys as _sys
-
-        modfile = tmp_path / "vk_steps_mod.py"
-        modfile.write_text(
-            "from valuekit import pure\n"
-            "CALLS = []\n"
-            "@pure\n"
-            "def step(x):\n"
-            "    CALLS.append(1)\n"
-            "    return x + 5\n"
-        )
-        spec = importlib.util.spec_from_file_location("vk_steps_mod", modfile)
-        mod = importlib.util.module_from_spec(spec)
-        _sys.modules["vk_steps_mod"] = mod
-        spec.loader.exec_module(mod)
-        try:
-            outer_calls = []
-            ns = {"pure": pure, "steps": mod, "outer_calls": outer_calls}
-            exec(
-                "@pure\n"
-                "def outer(x):\n"
-                "    outer_calls.append(1)\n"
-                "    return steps.step(x) * 2\n",
-                ns,
-            )
-            outer = ns["outer"]
-            assert outer(1) == 12 and outer(1) == 12
-            assert outer_calls == [1]
-            vk.clear_cache(mod.step)
-            assert outer(1) == 12
-            # outer reached step only through the module: still cleared
-            assert outer_calls == [1, 1]
-        finally:
-            del _sys.modules["vk_steps_mod"]
-
-    
-    def test_targeted_clear_rejects_undecorated(self, cache):
-        with pytest.raises(TypeError):
-            vk.clear_cache(lambda x: x)
-
-
     def test_deleting_cache_is_always_safe(self, cache):
         calls = []
 
@@ -1757,6 +1635,36 @@ class TestPure:
         vk.clear_cache()
         r = f(4)
         assert len(calls) == 2 and len(r["y"]) == 4
+
+    def test_clear_cache_deletes_everything_computed_or_logged(self, cache):
+        @pure
+        def f(x):
+            vk.log({"q": "inside"}, np.arange(x) * 1.5)
+            return x * 2
+
+        f(3)
+        vk.log({"q": "outside"}, np.ones(4))
+        assert list((cache / "objects").rglob("*.npy*"))
+        vk.clear_cache()
+        assert not any((cache / "records").iterdir())
+        assert not list((cache / "objects").rglob("*.npy*"))
+        with pytest.raises(LookupError):
+            vk.logs()
+        assert f(3) == 6  # recomputed, and records again
+
+    def test_a_record_deleted_by_another_process_is_missed_here(self, cache):
+        @pure
+        def f(x):
+            return x
+
+        f(1)
+        key = f._valuekit_reachable().hash
+        here = sys.modules["valuekit.pure"]._current_store()
+        [(h, _)] = here.get_records(key)
+        assert here.get_record(key, h)["result"]
+        LocalStore(cache).clear()  # another process's clear_cache()
+        with pytest.raises(CacheMiss):
+            here.get_record(key, h)
 
     def test_corrupt_result_file_recomputes(self, cache):
         calls = []
@@ -1900,14 +1808,14 @@ class TestTransparency:
         def f(d, items):
             return type(d).__name__, type(items).__name__, d["a"] + sum(items)
 
-        vk.set_cache_dir(None)
+        vk.set_store_dir(None)
         uncached = f({"a": 1}, [2, 3])
-        vk.set_cache_dir(tmp_path / "cache")
+        vk.set_store_dir(tmp_path / "cache")
         try:
             assert f({"a": 1}, [2, 3]) == uncached  # miss
             assert f({"a": 1}, [2, 3]) == uncached  # hit
         finally:
-            vk.set_cache_dir(None)
+            vk.set_store_dir(None)
 
     def test_recorded_map_is_an_immutable_map(self, cache):
         @pure
@@ -2380,10 +2288,10 @@ class TestCallRecords:
         np.testing.assert_array_equal(s.get_value(t["logs"][1][1]), [0.0, 2.0, 4.0])
 
     def test_log_outside_a_call_goes_to_the_log_and_noops_without_a_store(self, tmp_path):
-        vk.set_cache_dir(tmp_path)
+        vk.set_store_dir(tmp_path)
         vk.log({"q": "x"}, 1)
         assert vk.logs().where(q="x").one().value == 1
-        vk.set_cache_dir(None)
+        vk.set_store_dir(None)
         vk.log({"q": "x"}, 1)  # nothing configured: nothing happens
         with pytest.raises(LookupError):
             vk.logs()
@@ -2408,7 +2316,9 @@ class TestCallRecords:
         f(m | {"b": 3})  # a key f never read: but the log observed the whole map
         assert len(n) == 2
 
-    def test_log_in_a_forced_run_writes_nothing(self, cache, monkeypatch):
+    def test_log_in_a_forced_run_reaches_the_run_log_but_no_record(self, cache, monkeypatch):
+        # A run being debugged is one whose logged values are wanted; what
+        # a forced run must not do is leave a call record behind.
         monkeypatch.setenv("VALUEKIT_ALWAYS_RUN", "1")
 
         @pure
@@ -2416,10 +2326,10 @@ class TestCallRecords:
             vk.log({"q": "a"}, np.arange(1000.0) * x)
             return x
 
-        assert f(1) == 1  # log() neither raises nor writes
-        assert not list((cache / "objects").rglob("*.npy"))
+        assert f(1) == 1
         assert LocalStore(cache).get_records(f._valuekit_reachable().hash) == []
-        assert len(vk.logs()) == 0
+        [logged] = vk.logs()
+        assert logged.labels["q"] == "a" and logged.value[3] == 3.0
 
     def test_log_in_a_miss_containing_a_forced_run_is_discarded(self, cache, monkeypatch):
         import bdb
@@ -2507,9 +2417,7 @@ class TestCallRecords:
         g = vk.pure_local(body)
         assert f._valuekit_local is False and g._valuekit_local is True
         f(1)
-        assert g(1) == 2 and n == [1]  # same code, same key: a hit
-        vk.clear_cache(g)
-        assert g(1) == 2 and n == [1, 1]
+        assert g(1) == 2 and n == [1]  # same code, same function hash: a hit
 
     def test_recursion_records_the_calls_it_made(self, cache):
         _fib(3)
@@ -2657,45 +2565,98 @@ class TestRunLog:
         with pytest.raises(LookupError):
             vk.logs("other")
 
-    def test_a_hit_whose_logged_value_is_gone_recomputes(self, cache):
-        n = []
-
-        @pure
-        def f(x):
-            n.append(x)
-            vk.log({"q": "big"}, np.arange(100.0) * x)
-            return x
-
-        f(1)
-        [npy] = list((cache / "objects").rglob("*.npy*"))
-        npy.unlink()  # deleted: the record can no longer be served for the call
-        f(1)
-        assert n == [1, 1]
-        items = vk.logs().where(q="big")
-        assert len(items) == 2  # the miss's item, and the recomputation's
-        for it in items:  # the same content, so the second run restored the first's value too
-            np.testing.assert_array_equal(it.value, np.arange(100.0))
-
-    def test_a_hit_whose_nested_record_is_gone_recomputes(self, cache):
-        import shutil
-
+    def test_a_hit_writes_a_reference_and_the_reader_expands_it(self, cache, monkeypatch):
         n = []
 
         @pure
         def inner(x):
             n.append(x)
+            vk.log({"q": "inner"}, x * 10)
+            return x
+
+        @pure
+        def outer(x):
+            vk.log({"q": "outer"}, x)
+            return inner(x)
+
+        _new_run(monkeypatch, "physics.py")
+        outer(1)
+        assert [set(d) - {"t"} for d in _log_lines(cache)] == [{"labels", "v", "k"}] * 2
+        _new_run(monkeypatch, "physics.py")
+        outer(1)  # a hit: one line naming the record, no copy of its entries
+        [d] = _log_lines(cache)
+        assert d["record"] == [outer._valuekit_reachable().hash, outer._valuekit_lookup(1)[0]]
+        assert n == [1]
+        got = {logged.labels["q"]: logged.value for logged in vk.logs()}
+        assert got == {"inner": 10, "outer": 1}
+
+    def test_a_nested_hit_inside_a_running_call_is_expanded(self, cache, monkeypatch):
+        @pure
+        def inner(x):
+            vk.log({"q": "inner"}, x * 10)
+            return x
+
+        @pure
+        def outer(x, y):
+            vk.log({"q": "outer"}, y)
+            return inner(x)
+
+        _new_run(monkeypatch, "physics.py")
+        outer(1, 1)
+        _new_run(monkeypatch, "physics.py")
+        outer(1, 2)  # outer runs; inner hits and writes a reference
+        assert [("record" in d) for d in _log_lines(cache)] == [False, True]
+        got = {logged.labels["q"]: logged.value for logged in vk.logs()}
+        assert got == {"inner": 10, "outer": 2}
+
+    def test_a_reference_to_a_record_that_is_gone_is_reported_stale(self, cache, monkeypatch):
+        import shutil
+
+        @pure
+        def inner(x):
             vk.log({"q": "inner"}, x)
             return x
 
         @pure
         def outer(x):
+            vk.log({"q": "outer"}, x)
             return inner(x)
 
+        _new_run(monkeypatch, "physics.py")
         outer(1)
+        _new_run(monkeypatch, "physics.py")
+        outer(1)  # a hit: the log is one reference
         shutil.rmtree(cache / "records" / inner._valuekit_reachable().hash)
-        outer(1)  # outer's record names a record that is gone: run again
-        assert n == [1, 1]
-        assert len(vk.logs().where(q="inner")) == 2
+        with pytest.warns(UserWarning, match="1 logged calls .* no longer in the cache"):
+            L = vk.logs()
+        assert L.stale == 1
+        assert [logged.labels["q"] for logged in L] == ["outer"]  # the readable part stays
+        shutil.rmtree(cache / "records")
+        with pytest.warns(UserWarning):
+            L = vk.logs()
+        assert L.stale == 1 and len(L) == 0
+        _new_run(monkeypatch, "physics.py")
+        outer(1)  # a run repairs it
+        assert len(vk.logs()) == 2
+
+    def test_entries_stay_readable_when_the_records_go(self, cache, monkeypatch):
+        import shutil
+
+        @pure
+        def f(x):
+            vk.log({"q": "inside"}, x)
+            return x
+
+        _new_run(monkeypatch, "physics.py")
+        f(1)
+        _new_run(monkeypatch, "physics.py")
+        f(1)  # a reference
+        f(2)  # an entry: the call ran
+        vk.log({"q": "outside"}, 5)  # an entry with no record
+        shutil.rmtree(cache / "records")
+        with pytest.warns(UserWarning):
+            L = vk.logs()
+        assert [logged.value for logged in L] == [2, 5]
 
     def test_a_log_is_readable_while_it_grows(self, cache):
         @pure
@@ -2712,7 +2673,7 @@ class TestRunLog:
         assert len(L) == 2 and len(L.where(q="v")) == 2
 
     def test_logs_without_a_cache_raises(self):
-        with pytest.raises(LookupError, match="cache"):
+        with pytest.raises(LookupError, match="store"):
             vk.logs()
 
     def test_a_label_in_the_arguments_recomputes_when_it_changes(self, cache):
@@ -2987,7 +2948,7 @@ class TestRunAll:
     # ---- basics -----------------------------------------------------------
 
     def test_results_in_order_and_workers_cache(self, cache, tmp_path):
-        # The cache is configured only via set_cache_dir in this process
+        # The cache is configured only via set_store_dir in this process
         # (the fixture); under spawn, workers see it only through run_all's
         # initialiser. A fully cached second round proves the propagation.
         m, counts = _write_batch_module(tmp_path)
@@ -3177,7 +3138,7 @@ class TestBatches:
         with pytest.raises(LookupError):
             vk.batch("process")
         with pytest.raises(LookupError):
-            vk.batch("nightly", cache_dir=tmp_path / "elsewhere")
+            vk.batch("nightly", store_dir=tmp_path / "elsewhere")
 
     def test_logged_values_are_read_back_from_the_batch_and_the_log(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
@@ -3293,7 +3254,7 @@ class TestLocalFile:
 
         cache = tmp_path / "cache"
         # Absent means every configured host is used, as a core would be;
-        # no cache directory means nowhere for a host's results to land.
+        # no store directory means nowhere for a host's results to land.
         assert localfile.read_mode(tmp_path, cache) == "all"
         assert localfile.read_mode(tmp_path, None) == "local"
         assert localfile.read_mode(None, cache) == "all"
@@ -3331,11 +3292,11 @@ class TestLocalFile:
         from valuekit.hostprocess import worker_env
 
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
-        monkeypatch.setenv("VALUEKIT_CACHE", "y")
+        monkeypatch.setenv("VALUEKIT_STORE", "y")
         monkeypatch.setenv("PYTHONPATH", "z")
         env = worker_env()
         assert "AWS_SECRET_ACCESS_KEY" not in env and "PYTHONPATH" not in env
-        assert env["VALUEKIT_CACHE"] == "y" and "PATH" in env
+        assert env["VALUEKIT_STORE"] == "y" and "PATH" in env
 
 
 class TestScheduling:
@@ -3379,6 +3340,28 @@ class TestScheduling:
         assert {e["host"] for _, e in _records(cache, "outcome")} == {"h1"}
         [(_, h)] = _records(cache, "host")
         assert h["ok"] and h["capacity"] == 2
+
+    def test_max_workers_is_this_machines_capacity(self, cache, tmp_path, monkeypatch):
+        from valuekit.parallel import _Hosts
+
+        self._local_workers(tmp_path, monkeypatch, 1)
+        monkeypatch.setattr(parallel, "_host_commands", {})
+        m, _ = _write_batch_module(tmp_path)
+        q = __import__("queue").Queue()
+        store = sys.modules["valuekit.pure"]._current_store()
+        assert _Hosts(m.process, str(cache), q, store, 1).capacities()[1] == {"local": 1}
+        assert _Hosts(m.process, str(cache), q, store, 1, 3).capacities()[1] == {"local": 3}
+        assert _Hosts(m.process, str(cache), q, store, 1, 0).capacities()[1] == {"local": 0}
+
+    def test_no_capacity_anywhere_runs_in_this_process(self, cache, tmp_path, monkeypatch):
+        monkeypatch.setattr(parallel, "_host_commands", {})
+        m, _ = _write_batch_module(tmp_path)
+        r = vk.run_all(m.process, [1, 2], max_workers=0)
+        assert r.values == [11, 21]
+        assert {e["host"] for _, e in _records(cache, "start")} == {"main"}
+        assert {e["host"] for _, e in _records(cache, "outcome")} == {"main"}
+        r = vk.run_all(m.process, [3, 4], max_workers=0)  # process(3) raises
+        assert [x for x, _ in r.failures] == [3] and r[1].result() == 41
 
     def test_remote_mode_with_no_host_runs_locally_and_says_so(self, cache, tmp_path, monkeypatch):
         from valuekit import localfile
@@ -3613,7 +3596,7 @@ class TestSweep:
 
         self._module(tmp_path, "x")
         out = subprocess.run(
-            [sys.executable, "-m", "valuekit.sweep", "--cache", str(cache), "--dry-run",
+            [sys.executable, "-m", "valuekit.sweep", "--store", str(cache), "--dry-run",
              "vk_sweep_mod"],
             cwd=tmp_path, capture_output=True, text=True,
         )
@@ -3622,13 +3605,24 @@ class TestSweep:
         sys.modules.pop("vk_sweep_mod", None)
 
 
-def _records(cache_dir, ev=None):
-    """Every log record under a cache directory, oldest first, optionally of
+def _log_lines(store_dir):
+    """The lines of the newest run's log under *store_dir*, in file order."""
+    base = _Path(store_dir) / "logs"
+    [name] = [p for p in base.iterdir() if p.is_dir()]
+    run = name / (name / "latest").read_text().strip()
+    lines = []
+    for p in sorted(run.glob("*.jsonl")):
+        lines.extend(json.loads(raw) for raw in p.read_bytes().splitlines())
+    return lines
+
+
+def _records(store_dir, ev=None):
+    """Every log record under a store directory, oldest first, optionally of
     one kind. Reads the files back and parses them, the same out-of-band shape
     the batch tests already use for run counts."""
     events._flush()  # writes are batched on an interval; force them out
     out = []
-    runs = _Path(cache_dir) / "events"
+    runs = _Path(store_dir) / "events"
     for p in sorted(runs.glob("*.jsonl")) if runs.exists() else []:
         for line in p.read_text().splitlines():
             if line.strip():
@@ -3709,8 +3703,8 @@ class TestEventLog:
         assert err["exc"] == "ValueError" and err["fn"].endswith("step")
         assert _records(cache, "miss") == []  # nothing was stored
 
-    def test_nothing_is_written_without_a_cache_directory(self, tmp_path):
-        # The documented rule: the cache directory is where valuekit writes,
+    def test_nothing_is_written_without_a_store_directory(self, tmp_path):
+        # The documented rule: the store directory is where valuekit writes,
         # and nothing is written until one is named.
         @pure
         def step(x):
@@ -3910,7 +3904,7 @@ class TestWorkerHandshake:
     def test_a_differing_code_hash_refuses(self, tmp_path):
         m, _ = _write_batch_module(tmp_path)
         reason = _handshake(_hello(m.process, function_hash="0" * 40))
-        assert "differs here" in reason and "not in sync" in reason
+        assert "differs here" in reason and "the code differs" in reason
 
     def test_a_python_version_mismatch_names_the_interpreter(self, tmp_path):
         # The function hash covers raw bytecode, so two Python versions differ
@@ -3950,7 +3944,7 @@ def _remote_host(fn, cache, name="h1", completions=None):
 
     _locked_files()
     return RemoteHost(
-        sync.Project(fn), str(cache), completions or queue.Queue(), name,
+        project.Project(fn), str(cache), completions or queue.Queue(), name,
         lambda: ProcessConnection(bootstrap.local_command(sys.executable)), str(cache / "source"),
     )
 
@@ -4098,7 +4092,7 @@ class TestRemoteHost:
 
 
 # ===========================================================================
-# code sync
+# the project as sent to a host
 # ===========================================================================
 #
 # The worker runs on this host, so the main process's live tree is genuinely
@@ -4135,7 +4129,7 @@ def _load(root, name="vk_sync_mod"):
     return mod
 
 
-class TestSync:
+class TestProject:
     @pytest.fixture(autouse=True)
     def _cleanup(self):
         yield
@@ -4144,7 +4138,7 @@ class TestSync:
 
     def test_the_local_file_is_not_in_the_manifest(self, tmp_path):
         root = _project(tmp_path, extra={"valuekit.local.toml": "mode = 'remote'\n"})
-        names = [rel for rel, _ in sync.manifest(str(root))]
+        names = [rel for rel, _ in project.manifest(str(root))]
         assert "vk_sync_mod.py" in names and "valuekit.local.toml" not in names
 
     def test_a_tracked_local_file_warns_once(self, tmp_path, monkeypatch):
@@ -4154,17 +4148,17 @@ class TestSync:
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         subprocess.run(["git", "add", "valuekit.local.toml"], cwd=root, check=True)
         m = _load(root)
-        monkeypatch.setattr(sync, "_warned", set())
+        monkeypatch.setattr(project, "_warned", set())
         with pytest.warns(UserWarning, match="valuekit.local.toml .* tracked"):
-            sync.Project(m.work)
+            project.Project(m.work)
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            sync.Project(m.work)  # once per project
+            project.Project(m.work)  # once per project
 
     def test_untracked_files_are_included(self, tmp_path):
         # The commonest edit-loop case: a helper written and not yet added.
         root = _project(tmp_path, extra={"helper.py": "X = 1\n"})
-        rels = {rel for rel, _ in sync.manifest(str(root))}
+        rels = {rel for rel, _ in project.manifest(str(root))}
         assert {"vk_sync_mod.py", "helper.py", "pyproject.toml"} <= rels
 
     def test_build_artefacts_are_never_shipped(self, tmp_path):
@@ -4176,15 +4170,15 @@ class TestSync:
                 "__pycache__/x.cpython-311.pyc": "bytecode",
             },
         )
-        rels = {rel for rel, _ in sync.manifest(str(root))}
+        rels = {rel for rel, _ in project.manifest(str(root))}
         assert not any(r.endswith((".so", ".o", ".pyc")) for r in rels)
         assert not any("__pycache__" in r for r in rels)
 
-    def test_the_cache_directory_is_not_packed_into_its_own_source_tree(self, tmp_path):
+    def test_the_store_directory_is_not_packed_into_its_own_source_tree(self, tmp_path):
         root = _project(tmp_path)
         (root / "cache").mkdir()
         (root / "cache" / "junk").write_text("x" * 100)
-        rels = {rel for rel, _ in sync.manifest(str(root), exclude=[root / "cache"])}
+        rels = {rel for rel, _ in project.manifest(str(root), exclude=[root / "cache"])}
         assert not any(r.startswith("cache") for r in rels)
 
     def test_a_file_deleted_from_the_worktree_does_not_break_the_manifest(
@@ -4196,15 +4190,15 @@ class TestSync:
         subprocess.run(["git", "init", "-q", str(root)], check=True)
         subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
         (root / "gone.py").unlink()
-        rels = {rel for rel, _ in sync.manifest(str(root))}
+        rels = {rel for rel, _ in project.manifest(str(root))}
         assert "vk_sync_mod.py" in rels and "gone.py" not in rels
 
     def test_the_hash_is_stable_and_moves_with_content(self, tmp_path):
         root = _project(tmp_path)
-        first = sync.manifest_hash(sync.manifest(str(root)))
-        assert first == sync.manifest_hash(sync.manifest(str(root)))
+        first = project.manifest_hash(project.manifest(str(root)))
+        assert first == project.manifest_hash(project.manifest(str(root)))
         (root / "vk_sync_mod.py").write_text("from valuekit import pure\n@pure\ndef work(x):\n    return x + 999\n")
-        assert sync.manifest_hash(sync.manifest(str(root))) != first
+        assert project.manifest_hash(project.manifest(str(root))) != first
 
     def test_content_is_hashed_even_when_mtime_and_size_do_not_move(
         self, tmp_path
@@ -4216,7 +4210,7 @@ class TestSync:
         root = _project(tmp_path)
         f = root / "vk_sync_mod.py"
         before = os.stat(f)
-        first = sync.manifest_hash(sync.manifest(str(root)))
+        first = project.manifest_hash(project.manifest(str(root)))
 
         f.write_text("from valuekit import pure\n@pure\ndef work(x):\n    return x + 999\n")  # same length
         os.utime(f, ns=(before.st_atime_ns, before.st_mtime_ns))
@@ -4224,23 +4218,23 @@ class TestSync:
         assert after.st_size == before.st_size
         assert after.st_mtime_ns == before.st_mtime_ns
 
-        assert sync.manifest_hash(sync.manifest(str(root))) != first
+        assert project.manifest_hash(project.manifest(str(root))) != first
 
     def test_the_environment_is_not_user_code(self):
-        assert sync.is_environment(np.__file__)
-        assert not sync.is_environment(__file__)
+        assert project.is_environment(np.__file__)
+        assert not project.is_environment(__file__)
 
     def test_spans_that_are_not_files_are_ignored(self):
         # Spans carry <string> for generated code, and stdlib paths for a user
         # class whose methods came from elsewhere.
         spans = [("<string>", 1, 2), ("relative.py", 1, 2), (np.__file__, 1, 2)]
-        assert sync.user_span_files(spans) == []
+        assert project.user_span_files(spans) == []
 
     def test_a_packed_tree_round_trips(self, tmp_path):
         root = _project(tmp_path, extra={"pkg/__init__.py": "", "pkg/a.py": "A = 2\n"})
-        entries = sync.manifest(str(root))
+        entries = project.manifest(str(root))
         dest = tmp_path / "out"
-        assert bootstrap._extract(sync.pack_tree(str(root), entries), str(dest)) == ""
+        assert bootstrap._extract(project.pack_tree(str(root), entries), str(dest)) == ""
         assert (dest / "pkg" / "a.py").read_text() == "A = 2\n"
         assert {p.name for p in dest.rglob("*.py")} == {
             "vk_sync_mod.py", "__init__.py", "a.py"
@@ -4248,7 +4242,7 @@ class TestSync:
 
 
 def _trees(cache):
-    """The source trees under a cache directory (not their markers)."""
+    """The source trees under a store directory (not their markers)."""
     return sorted(p for p in (cache / "source").iterdir() if p.is_dir())
 
 
@@ -4268,7 +4262,7 @@ class TestBootstrap:
         )
         row = {
             "tool": sys.executable,
-            "sync": (str(made), "{python}"),
+            "install": (str(made), "{python}"),
             "interpreters": ("env/python",),
             "search": (),
         }
@@ -4284,8 +4278,8 @@ class TestBootstrap:
         root.mkdir()
         for name, text in files.items():
             (root / name).write_text(text)
-        entries = sync.manifest(str(root))
-        return sync.manifest_hash(entries), dict(entries), sync.pack_tree(str(root), entries)
+        entries = project.manifest(str(root))
+        return project.manifest_hash(entries), dict(entries), project.pack_tree(str(root), entries)
 
     def _prepare(self, root, tree, delete=(), data=None, entries=None):
         th, files, tar = tree
@@ -4314,7 +4308,7 @@ class TestBootstrap:
         second = self._tree(tmp_path, **{"fake.lock": "", "a.py": "A = 2\n", "new.py": "y\n"})
         # The main process sends only what differs, and names what went.
         changed = [(rel, h) for rel, h in second[1].items() if first[1].get(rel) != h]
-        tar = sync.pack_tree(str(tmp_path / "src"), changed)
+        tar = project.pack_tree(str(tmp_path / "src"), changed)
         assert sorted(rel for rel, _ in changed) == ["a.py", "new.py"]
         python, reason = self._prepare(root, second, delete=["old.py"], data=tar)
         assert reason == ""
@@ -4433,7 +4427,7 @@ class TestSourceTree:
         assert (tree / ".venv").is_dir()
         manifest = json.loads(tree.with_name("p.manifest").read_text())
         assert _Path(manifest["python"]).exists()
-        assert manifest["project_hash"] == sync.Project(m.work).project_hash
+        assert manifest["project_hash"] == project.Project(m.work).project_hash
 
     def test_the_worker_imports_the_source_tree_not_the_live_tree(self, cache, tmp_path):
         import queue
@@ -4470,7 +4464,7 @@ class TestSourceTree:
         assert vk.run_all(m.work, [1]).values == [1000000]  # stale .pyc
         assert _trees(cache) == [tree]  # the same directory, updated
         assert kept.read_text() == "keep"
-        assert json.loads(tree.with_name("p.manifest").read_text())["project_hash"] == sync.Project(m.work).project_hash
+        assert json.loads(tree.with_name("p.manifest").read_text())["project_hash"] == project.Project(m.work).project_hash
 
     def test_the_local_file_is_never_sent(self, cache, tmp_path):
         root = _project(tmp_path)

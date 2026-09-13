@@ -87,19 +87,6 @@ class RemoteStore:
     def emit_line(self, line: str) -> None:
         protocol.write_message(self._tx, protocol.LOGGED, line.encode())
 
-    def hit(self, function_hash: str, h: str, result: str) -> Any:
-        """Take the call record *h* as a hit: the main process writes its logged
-        values to the run's log and sends the result *result*.  CacheMiss if it
-        could not, in which case it wrote nothing."""
-        protocol.write_message(self._tx, protocol.HIT, protocol.strings(function_hash, h))
-        reason = self._reply(protocol.VALUE)
-        if reason:
-            raise CacheMiss(f"{h}: {reason.decode('utf-8', 'replace')}")
-        try:
-            return self.unpack(result)
-        except protocol.ProtocolError as e:
-            raise CacheMiss(f"{result}: {e}") from e
-
     # -- a call that must run on the main process ----------------------------------
 
     def local_call(self, module: str, qualname: str, args: tuple, kwargs: dict):

@@ -115,7 +115,7 @@ class Handle(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def _local_worker_main(conn, cache_dir: str | None, fn, x) -> None:
+def _local_worker_main(conn, store_dir: str | None, fn, x) -> None:
     """Runs in the worker process: configure the cache, run one input, send
     one message back: ("ok", value) or ("err", exc, tb) or, when the
     exception or value cannot be pickled, ("err_str", type_name, text, tb).
@@ -123,10 +123,10 @@ def _local_worker_main(conn, cache_dir: str | None, fn, x) -> None:
     environment it inherited (see :mod:`valuekit.runlog`).
     """
     try:
-        if cache_dir is not None:
-            from .pure import set_cache_dir
+        if store_dir is not None:
+            from .pure import set_store_dir
 
-            set_cache_dir(cache_dir)
+            set_store_dir(store_dir)
         try:
             value = fn(x)
         except BaseException as e:
@@ -203,9 +203,9 @@ class LocalHost:
 
     name = "local"
 
-    def __init__(self, fn, cache_dir: str | None, completions: queue.Queue):
+    def __init__(self, fn, store_dir: str | None, completions: queue.Queue):
         self._fn = fn
-        self._cache_dir = cache_dir
+        self._store_dir = store_dir
         self._completions = completions
         self._ctx = multiprocessing.get_context("spawn")
 
@@ -213,7 +213,7 @@ class LocalHost:
         recv_end, send_end = self._ctx.Pipe(duplex=False)
         proc = self._ctx.Process(
             target=_local_worker_main,
-            args=(send_end, self._cache_dir, self._fn, x),
+            args=(send_end, self._store_dir, self._fn, x),
             daemon=True,
         )
         proc.start()
@@ -403,7 +403,7 @@ class _Handle:
         elif tag == protocol.GET_VALUE:
             try:
                 if store is None:
-                    raise CacheMiss("the main process has no cache directory")
+                    raise CacheMiss("the main process has no store directory")
                 v = store.get_value(body.hex())
             except CacheMiss as e:
                 self._write_message(protocol.VALUE, str(e).encode())
@@ -420,22 +420,6 @@ class _Handle:
 
             if store is not None:
                 runlog.write_line(store, body.decode())
-        elif tag == protocol.HIT:
-            from . import runlog
-
-            function_hash, h = protocol.unstrings(body)
-            try:
-                if store is None:
-                    raise CacheMiss("the main process has no cache directory")
-                record = store.get_record(function_hash, h)
-                v = store.get_value(record["result"])
-                runlog.reemit(store, function_hash, h, record)
-            except CacheMiss as e:
-                self._write_message(protocol.VALUE, str(e).encode() or b"unreadable")
-            else:
-                with self._lock:
-                    protocol.send_value(self.out, v, self.seen)
-                    protocol.write_message(self.out, protocol.VALUE, b"")
         elif tag == protocol.CALL:
             module, qualname, root = protocol.unstrings(body)
             args, kwargs = protocol.unpack(root, self.objects, self._fallback())
@@ -589,7 +573,7 @@ class RemoteHost:
     def __init__(
         self,
         project,
-        cache_dir: str | None,
+        store_dir: str | None,
         completions: queue.Queue,
         name: str,
         connect: Callable[[], Connection],
@@ -606,7 +590,7 @@ class RemoteHost:
         self.dead = False
         self.failure: str | None = None
         self._project = project
-        self._cache_dir = cache_dir or ""
+        self._store_dir = store_dir or ""
         self._completions = completions
         self._connect = connect
         self._store = _current_store()

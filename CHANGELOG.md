@@ -17,14 +17,17 @@ call-record layout changed (each call record is its own file, under
   `logs("physics").where(quantity="residuals", sid=7).one().value`. No key
   means anything to valuekit; labels are the project's own terms. A
   script's log is the complete set of logged values its last run produced,
-  as if the code had run from scratch: a step that executes writes its
-  logged values as it makes them, and a step served from cache writes what
-  its call record holds, nested calls included, so a re-run after an edit
-  shows the current code's logged values and nothing stale. Each script's
-  log replaces its previous run's and never touches another script's.
-  Every emission is its own logged value; order carries no meaning. This is
-  the boundary between processing code and the plotting code that reads it,
-  which imports nothing.
+  as if the code had run from scratch: a step that executes writes each
+  logged value as it makes it, and a step served from cache writes one
+  line naming its call record, which holds what the step logged, nested
+  calls included, so a re-run after an edit shows the current code's
+  logged values and nothing stale. The log is as current as the cache:
+  whatever removes call records removes the logged values that came with
+  them, and `logs()` reports a line it can no longer resolve. Each
+  script's log replaces its previous run's and never touches another
+  script's. Every emission is its own logged value; order carries no
+  meaning. This is the boundary between processing code and the plotting
+  code that reads it, which imports nothing.
 
 - `run_all` records each batch under a name (default: the function's
   qualified name; `name=` to choose) and `valuekit.batch(name)` reads it
@@ -61,6 +64,21 @@ call-record layout changed (each call record is its own file, under
   directory is therefore not observable. Writing it never fails a run.
 
 ### Changed
+
+- `set_cache_dir` is `set_store_dir`, and `cache_dir=` on `logs()` and
+  `batch()` is `store_dir=`. The directory holds everything the project's
+  code produced: values, call records, batches and run logs.
+  `python -m valuekit.sweep` takes `--store` and reads `$VALUEKIT_STORE`.
+
+- A run a debugger forces (a live breakpoint, or `VALUEKIT_ALWAYS_RUN`)
+  still writes its logged values to the run's log; it writes no call
+  record, as before.
+
+- `run_all`'s `max_workers` is how many tasks run at once on this
+  machine, whatever the CPU count, and overrides the local file's
+  `[local] workers`. When no host may run anything (`max_workers=0` and
+  no usable remote host) the inputs run one at a time in the main
+  process rather than the batch raising.
 
 - A native extension's marker in the function hash is the hash of the
   main process's build of it, per extension, sent to workers rather than
@@ -99,17 +117,21 @@ call-record layout changed (each call record is its own file, under
   *project hash* (was tree id) identifies a version of the project's files. Modules follow:
   `runlog.py` holds the run's log, `events.py` the event log,
   `protocol.py` the messages, `hosts.py` the hosts,
-  `functionhash.py` the function hash.
+  `functionhash.py` the function hash, `project.py` the project's files
+  (was `sync.py`). A host *syncs* when it is brought to where it can run
+  this version of the project; the word means nothing else.
 
 - One function hash and one version number. The Python version is a marker
   inside the function hash rather than a salt applied on top, and the store's
   format version is the only version: the cache epoch is gone.
 
-- `clear_cache(fn)` deletes `fn`'s call records and nothing else. A
-  caller's record names one of them, so its next call cannot load its
-  subtree and recomputes; callers are reached transitively, each at its
-  next call. The per-function dependency index that found callers eagerly
-  is gone, with the code-object digests it was built on.
+- `clear_cache(fn)` is gone; `clear_cache()` deletes everything computed
+  or logged. To invalidate one function, edit it, or put a version in its
+  arguments: either gives it and every function that reaches it a new
+  function hash. The targeted form was the only way a live call record
+  could name a nested record that no longer existed, and so the only
+  reason a hit read its whole subtree; a hit now loads its result and
+  nothing else. The per-function dependency index is gone with it.
 
 - `run_all` requires a `@pure` or `@pure_local` function and raises
   `TypeError` otherwise. A batch's results are recorded by the function that
@@ -125,9 +147,7 @@ call-record layout changed (each call record is its own file, under
   function's whole call-record file.
 
 - A call record holds the memoised calls made inside it and its logged
-  values, in order. Matching is unchanged. A hit stands in for the call only
-  if it can emit everything the call logged; otherwise it is treated as a
-  miss.
+  values, in order. Matching is unchanged.
 
 - The Windows CI job is gating. Besides the appends, three defects were
   fixed there: replacing an object file another process has memory-mapped

@@ -10,27 +10,34 @@ code that will read it.  Retrieval selects by containment::
     for logged in sel:
         logged.labels, logged.value
 
-A *run* is one main process process running a script, named by the script's
+A *run* is one main process running a script, named by the script's
 file stem.  Its log is the complete set of logged values that run
 produced, as if the code had run from scratch: a step that executes
-writes its logged values as it makes them, and a step served from cache
-writes the ones its call record holds, nested calls included.  A new run
-under the same name replaces the last, so the log never carries a value
-from an earlier run of the script, and the main script and a debugging
-script never touch each other's.  Every emission is its own logged
-value: the same labels and value logged twice are two.
+writes each logged value as it makes it, and a step served from cache
+writes one line naming its call record, which holds what the step
+logged, nested calls included.  A new run under the same name replaces
+the last, so the log never carries a value from an earlier run of the
+script, and the main script and a debugging script never touch each
+other's.  Every emission is its own logged value: the same labels and
+value logged twice are two.
 
-Layout, under the cache directory::
+The log is as current as the cache.  A logged value is the output of a
+pure function, so whatever removes call records, ``clear_cache()`` or
+the sweep, removes the logged values that came with them; a line naming
+a call record that is gone reads as stale, and ``logs()`` says so.
+
+Layout, under the store directory::
 
     logs/<name>/latest                # the id of the newest run
     logs/<name>/<run-id>/header.json
     logs/<name>/<run-id>/<pid>.jsonl  # one file per writing process
 
-A line names the labels and the value by hash, both in the object store,
-and carries the labels' entries in encoded form so a query needs no
-decoding.  Workers on this machine write their own file into the main process's
-run; a remote worker sends its lines to the main process, which writes them.
-Nothing here imports or runs the pipeline.
+Two kinds of line.  An entry names the labels and the value by hash, both
+in the object store, and carries the labels' entries in encoded form so a
+query needs no decoding.  A reference names a call record by function
+hash and record hash.  Workers on this machine write their own file into
+the main process's run; a remote worker sends its lines to the main
+process, which writes them.  Nothing here imports or runs the pipeline.
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterator
@@ -53,7 +61,7 @@ from .values import content_hash, encode_key, freeze
 
 __all__ = ["logs", "Logs", "Selection", "LoggedValue"]
 
-LOG_VERSION = 1
+LOG_VERSION = 2
 
 
 def logs_dir(store: LocalStore) -> Path:
@@ -209,23 +217,35 @@ def emit(store: Any, labels_hash: str, value_hash: str, keys: dict[str, str]) ->
         run.write(line)
 
 
+def refer(store: Any, function_hash: str, h: str) -> None:
+    """Write a reference to call record *h* of *function_hash* to this
+    run's log: a hit's line, standing for what the record holds."""
+    line = {"record": [function_hash, h], "t": time.time()}
+    send = getattr(store, "emit_line", None)
+    if send is not None:
+        send(json.dumps(line, separators=(",", ":")))
+        return
+    run = current_run(store)
+    if run is not None:
+        run.write(line)
+
+
 def write_line(store: Any, line: str) -> None:
     """Internal: a line a remote worker sent; the main process writes it."""
     d = json.loads(line)
     run = current_run(store)
-    if run is not None:
+    if run is None:
+        return
+    if "record" in d:
+        run.write({"record": list(d["record"]), "t": d.get("t", time.time())})
+    else:
         run.write({"labels": d["labels"], "v": d["v"], "k": d["k"], "t": d.get("t", time.time())})
 
 
-def collect(store: LocalStore, record: dict, strict: bool = True) -> list[list]:
+def expand(store: LocalStore, record: dict, stale: list[str]) -> list[list]:
     """Every ``[labels, value, keys]`` entry a call record and the calls
-    nested in it hold, in call-record order.
-
-    *strict* raises :class:`CacheMiss` when any nested call record, labels or
-    value is gone, which is what a hit needs: it may only stand in for the
-    call if it can emit everything the call would have.  Lenient, the
-    missing parts are skipped.
-    """
+    nested in it hold, in call-record order.  A nested call record that
+    cannot be read is skipped, and its hash added to *stale*."""
     out: list[list] = []
 
     def walk(t: dict) -> None:
@@ -233,37 +253,13 @@ def collect(store: LocalStore, record: dict, strict: bool = True) -> list[list]:
             try:
                 sub = store.get_record(key, h)
             except CacheMiss:
-                if strict:
-                    raise
+                stale.append(h)
                 continue
             walk(sub)
-        for entry in t.get("logs", []):
-            labels, v = entry[0], entry[1]
-            if store._find(labels) is None or store._find(v) is None:
-                if strict:
-                    raise CacheMiss(v)
-                continue
-            out.append(entry)
+        out.extend(t.get("logs", []))
 
     walk(record)
     return out
-
-
-def reemit(store: Any, function_hash: str, h: str, record: dict) -> None:
-    """Emit again what a hit's call record holds, nested calls included.
-
-    Raises :class:`CacheMiss` if the subtree cannot be read whole, and then
-    emits nothing: the caller treats the hit as a miss.
-    """
-    entries = collect(store, record)
-    if not entries:
-        return
-    run = current_run(store)
-    if run is None:
-        return
-    now = time.time()
-    for labels, v, keys in entries:
-        run.write({"labels": labels, "v": v, "k": keys, "t": now})
 
 
 # ---------------------------------------------------------------------------
@@ -272,24 +268,24 @@ def reemit(store: Any, function_hash: str, h: str, record: dict) -> None:
 
 
 class LoggedValue:
-    """One logged value with its labels.  Both load when asked for; arrays
-    arrive as memory maps."""
+    """One logged value with its labels.  Both load from the store when
+    asked for; arrays arrive as memory maps."""
 
-    __slots__ = ("_logs", "_labels_hash", "_v", "_k")
+    __slots__ = ("_store", "_labels_hash", "_v", "_k")
 
-    def __init__(self, logs: Logs, ctx: str, v: str, keys: dict[str, str]):
-        self._logs = logs
-        self._labels_hash = ctx
+    def __init__(self, store: LocalStore, labels_hash: str, v: str, keys: dict[str, str]):
+        self._store = store
+        self._labels_hash = labels_hash
         self._v = v
         self._k = keys
 
     @property
     def labels(self) -> ImmutableMap:
-        return self._logs._labels(self._labels_hash)
+        return self._store.get_value(self._labels_hash)
 
     @property
     def value(self) -> Any:
-        return self._logs._store.get_value(self._v)
+        return self._store.get_value(self._v)
 
     def __repr__(self) -> str:
         try:
@@ -315,8 +311,7 @@ class Selection:
     Iterable; ``one()`` for a selection expected to hold exactly one;
     ``where()`` narrows further.  Order carries no meaning."""
 
-    def __init__(self, logs: Logs, items: list[LoggedValue], asked: dict | None = None):
-        self._logs = logs
+    def __init__(self, items: list[LoggedValue], asked: dict | None = None):
         self._items = items
         self._asked = asked or {}
 
@@ -327,7 +322,7 @@ class Selection:
             it for it in self._items
             if all(it._k.get(k) == v for k, v in want.items())
         ]
-        return Selection(self._logs, kept, asked)
+        return Selection(kept, asked)
 
     def one(self) -> LoggedValue:
         n = len(self._items)
@@ -351,34 +346,33 @@ class Selection:
         return f"Selection({len(self._items)} logged values{asked})"
 
 
-class Logs(Selection):
-    """What one run logged, or what one batch's call records hold.
-    ``refresh()`` picks up lines written since it was opened."""
+def selection(store: LocalStore, record: dict) -> Selection:
+    """The logged values a call record holds, nested calls included.  A
+    nested call record that is gone is left out."""
+    stale: list[str] = []
+    return Selection([LoggedValue(store, *entry) for entry in expand(store, record, stale)])
 
-    def __init__(self, store: LocalStore, path: Path | None = None, items: list | None = None):
-        super().__init__(self, [])
+
+class Logs(Selection):
+    """One run's log, read from its directory.  ``refresh()`` picks up
+    lines written since it was opened.  ``stale`` counts the references
+    read so far whose call record, or a record nested in it, is gone."""
+
+    def __init__(self, store: LocalStore, name: str, path: Path):
+        super().__init__([])
         self._store = store
+        self._name = name
         self._path = path
         self._offsets: dict[Path, int] = {}
-        self._contexts: dict[str, ImmutableMap] = {}
-        for entry in items or []:
-            self._items.append(LoggedValue(self, entry[0], entry[1], entry[2]))
-        if path is not None:
-            self.refresh()
-
-    def _labels(self, h: str) -> ImmutableMap:
-        ctx = self._contexts.get(h)
-        if ctx is None:
-            ctx = self._contexts[h] = self._store.get_value(h)
-        return ctx
+        self.stale = 0
+        self.refresh()
 
     def refresh(self) -> None:
-        if self._path is None:
-            return
         try:
             files = sorted(self._path.glob("*.jsonl"))
         except OSError:
             return
+        stale: list[str] = []
         for p in files:
             start = self._offsets.get(p, 0)
             try:
@@ -391,30 +385,52 @@ class Logs(Selection):
             for raw in data[:end].splitlines():
                 try:
                     d = json.loads(raw)
-                    self._items.append(LoggedValue(self, d["labels"], d["v"], d["k"]))
+                    if "record" in d:
+                        self._expand(*d["record"], stale)
+                    else:
+                        self._items.append(LoggedValue(self._store, d["labels"], d["v"], d["k"]))
                 except (ValueError, KeyError, TypeError):
                     continue
             self._offsets[p] = start + end
+        if stale:
+            self.stale += len(stale)
+            warnings.warn(
+                f"{len(stale)} logged calls of {self._name!r} are no longer in the "
+                f"cache; run the script again",
+                stacklevel=2,
+            )
+
+    def _expand(self, function_hash: str, h: str, stale: list[str]) -> None:
+        try:
+            record = self._store.get_record(function_hash, h)
+        except CacheMiss:
+            stale.append(h)
+            return
+        missing: list[str] = []
+        for entry in expand(self._store, record, missing):
+            self._items.append(LoggedValue(self._store, *entry))
+        if missing:
+            stale.append(h)
 
     def __repr__(self) -> str:
         return f"Logs({len(self._items)} logged values)"
 
 
-def logs(name: str | None = None, cache_dir: str | os.PathLike | None = None) -> Logs:
+def logs(name: str | None = None, store_dir: str | os.PathLike | None = None) -> Logs:
     """Open the newest run's log.
 
-    *name* is the script's file stem; with one script logged under the
-    cache it may be omitted.  *cache_dir* defaults to the configured one.
+    *name* is the script's file stem; with one script logged in the
+    store it may be omitted.  *store_dir* defaults to the configured one.
     Raises ``LookupError`` when nothing has been logged under that name.
     """
-    if cache_dir is None:
+    if store_dir is None:
         from .pure import _current_store
 
         store = _current_store()
         if not isinstance(store, LocalStore):
-            raise LookupError("no cache directory is configured; pass cache_dir=")
+            raise LookupError("no store directory is configured; pass store_dir=")
     else:
-        store = LocalStore(cache_dir)
+        store = LocalStore(store_dir)
     base = logs_dir(store)
     try:
         names = sorted(p.name for p in base.iterdir() if p.is_dir())
@@ -437,4 +453,4 @@ def logs(name: str | None = None, cache_dir: str | os.PathLike | None = None) ->
             raise OSError(run_id)
     except OSError as e:
         raise LookupError(f"nothing has been logged under {name!r} in {store.root}") from e
-    return Logs(store, d / run_id)
+    return Logs(store, name, d / run_id)

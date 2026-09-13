@@ -26,10 +26,10 @@ enters the cache.
 ## `@pure`
 
 ```python
-from valuekit import pure, set_cache_dir
+from valuekit import pure, set_store_dir
 
-set_cache_dir("~/.cache/mypipeline")     # nothing is cached until this is called
-                                         # (and deleted whole is always safe)
+set_store_dir("~/.cache/mypipeline")     # nothing is cached until this is called
+                                         # (and deleting the directory is always safe)
 
 @pure
 def calculate_geometry(obs, config):
@@ -96,12 +96,10 @@ This is the user's responsibility, by design:
 
 The remedy column repeats one idea: arguments are always tracked, so moving
 a dependency into the arguments makes it visible. If something invisible
-changed anyway, clear it. `clear_cache(fn)` means "`fn` has changed": it
-deletes `fn`'s call records. Every `@pure` function that computed through
-`fn`, whether it called it or received it as an argument, names one of
-those records in its own, so its next call finds nothing to stand in for
-it and recomputes; callers are reached transitively the same way, each at
-its next call. `clear_cache()` deletes everything.
+changed anyway, edit the function: any change to its source gives it a
+new function hash, and every function that reaches it a new one too, so
+all of them recompute at their next call. `clear_cache()` deletes
+everything computed or logged.
 
 Tunables belong in config maps rather than in module globals. A traced
 config read is exact per call (change an unread key and hits are kept),
@@ -157,15 +155,15 @@ def process(session_id):
 
 If the promise cannot be made for a source that does change, put the
 version in the arguments (a date, a commit, an etag), where it is tracked
-like everything else; `clear_cache(fetch_session)` says "what this function
-sees has changed". Effects that do not reach the result, such as a scratch
+like everything else; editing the function says "what this function sees
+has changed". Effects that do not reach the result, such as a scratch
 file or a download cache, are permitted, since on a hit none of them
 happen. The result must be a value, never a path: a path from this machine
 means nothing on another.
 
-Because the function reads an environment, it runs only in the main process,
-on the machine that has that environment. A batch running
-elsewhere sends such calls back here and receives the value. Expect a
+Because the function reads an environment, it runs only on this machine,
+never on a remote host. A batch running elsewhere sends such calls back
+here and receives the value. Expect a
 pipeline to have a handful of these at the top and `@pure` everywhere else;
 `@pure_local` is not the way out when `@pure` feels strict.
 
@@ -253,11 +251,12 @@ resume. Through nested `@pure` calls this applies to the path from the
 breakpoint to the root: a breakpoint in an inner function also forces its
 `@pure` callers to execute, since a cached caller would otherwise skip the
 breakpoint, while sibling stages inside a forced caller are unaffected and
-continue to hit and to record. Forced runs never write to the cache, and a
+continue to hit and to record. Forced runs write no call record, and a
 recording whose execution contained a forced run (e.g. a breakpoint added
 while paused mid-pipeline) is discarded rather than stored, so nothing done
 in a debug session, such as evaluating expressions or modifying locals, can
-enter the cache.
+enter the cache. Values a forced run logs still go to the run's log: a run
+being debugged is one whose values you want to see.
 
 Supported debuggers: pydevd (PyCharm, and VS Code's debugpy) and anything
 built on `bdb` (pdb, ipdb). Their breakpoint tables are internal APIs, so
@@ -271,13 +270,15 @@ Manual overrides, from narrowest to broadest:
 ```python
 step.uncached(obs, cfg)   # call the raw function; the cache is untouched
 VALUEKIT_ALWAYS_RUN=1     # env var: execute everything, write nothing
-clear_cache(step)         # "step changed": deletes step's results and its callers'
-clear_cache()             # or delete the cache directory; always safe
+clear_cache()             # everything computed or logged; the same as deleting the directory
 ```
 
 ## The store
 
-The cache directory holds content-addressed files: read-only arrays as
+The store directory holds the values, call records, batch records and run
+logs a project's code produced. `clear_cache()` deletes all of them, and
+so does deleting the directory; both are always safe. Values are
+content-addressed files: read-only arrays as
 `.npy`, reloaded as memory maps that `freeze` shares without copying (a hit
 on a function returning a 2 GB read-only array copies nothing), writeable
 arrays as `.npyw`, and everything else in a small structural format in which
@@ -327,8 +328,8 @@ Every file is named by the hash of its content, call records included, and is
 written whole: two processes writing the same entry write the same bytes
 under the same name, so directories can be shared between any number of
 processes, on Windows as well as POSIX, with nothing to coordinate. A
-missing or corrupt entry is treated as a miss. Deleting the cache is always
-safe. A call that raises caches nothing.
+missing or corrupt entry is treated as a miss. A call that raises caches
+nothing.
 
 ### Retention
 
@@ -343,10 +344,12 @@ python -m valuekit.sweep mypipeline.steps mypipeline.batches
 imports the named modules, takes the function hash of every `@pure` and
 `@pure_local` function they define, and deletes the call records and batch
 records of every other function hash, then every object that no remaining
-call record or batch names. Name every module whose results you want kept; a
-function that is not imported reads as gone. `--dry-run` reports without
-deleting, and `--cache` names the directory when the modules do not
-configure one.
+call record, batch or run-log entry names. A run's log that names a
+removed call record reads as stale from then on, and `logs()` says so.
+Name every module whose results you want kept; a function that is not
+imported reads as gone.
+`--dry-run` reports without deleting, and `--store` names the directory
+when the modules do not configure one.
 
 ## Parallelism
 
@@ -354,7 +357,9 @@ configure one.
 function over a batch of inputs in parallel and returns a ``BatchResult``
 of per-input outcomes, in input order. An input whose result is already
 cached is answered without a worker. Each other input runs in its own
-process, spawned per task with at most ``max_workers`` at once. Isolation
+process, spawned per task, with ``max_workers`` running at once on this
+machine (default: the ``[local] workers`` line of ``valuekit.local.toml``,
+else the CPU count). Isolation
 is the point: a timeout kills exactly one process, a segfault loses exactly
 one input, and neither affects the other inputs or the capacity available
 to the rest of the batch. The cost is one process start per input (roughly
@@ -410,13 +415,15 @@ worker processes. If a live breakpoint intersects anything reachable by
 name from ``fn``, the whole batch runs sequentially in this process, where
 breakpoints fire and the usual debugger rules apply. The sequential
 fallback does not enforce the timeout. Merely having a debugger attached
-changes nothing on its own.
+changes nothing on its own. A batch that no host may run, because
+``max_workers=0`` and no remote host is usable, likewise runs its inputs
+one at a time in this process.
 
 Two rules for using other pools (joblib, dask, a bare executor) around
 ``@pure`` code: parallelise in the main process, between ``@pure`` calls, never
 inside a ``@pure`` function's body (reads performed in worker processes are
 not recorded, which produces call records with missing dependencies and therefore
-stale results); and call ``set_cache_dir`` at module top level, since a call
+stale results); and call ``set_store_dir`` at module top level, since a call
 inside an ``if __name__ == "__main__":`` block, or in a notebook, does not
 reach spawn-based workers. (``run_all`` is exempt: it passes the cache
 directory to each worker explicitly.) To drive the location from the
@@ -424,12 +431,12 @@ environment, read the variable yourself, at top level:
 
 ```python
 import os
-from valuekit import set_cache_dir
+from valuekit import set_store_dir
 
-set_cache_dir(os.environ.get("VALUEKIT_CACHE"))   # None disables caching
+set_store_dir(os.environ.get("VALUEKIT_STORE"))   # None disables caching
 ```
 
-Nothing is cached until `set_cache_dir` is called: importing valuekit has no
+Nothing is cached until `set_store_dir` is called: importing valuekit has no
 effect on its own.
 
 ## Logging values
@@ -479,23 +486,35 @@ meaning.
 
 What `logs("physics")` holds is the complete set of logged values the
 last run of that script produced, as if the code had run from scratch. A
-step that executes writes its logged values as it makes them; a step
-served from cache writes the ones its call record holds, nested calls
-included, without the body running. So a re-run after an edit shows
-exactly the current code's logged values, the unchanged steps' from cache
-and the edited steps' fresh, and nothing from before. A hit that can no
-longer produce all of its logged values (one swept since) is treated as a
-miss and recomputed. Each
-script keeps its own log, named by its file stem, and a run replaces the
-previous run of the same script; a debugging script never touches the main
-script's log. With one script logged under a cache, `logs()` needs no
-name. `log` outside a memoised call, in the script itself, goes to
-the log with no call record; with no cache configured it does nothing.
+step that executes writes each logged value as it makes it; a step served
+from cache writes one line naming its call record, which holds what the
+step logged, nested calls included, and `logs()` reads them out of the
+record. So a re-run after an edit shows exactly the current code's logged
+values, the unchanged steps' from cache and the edited steps' fresh, and
+nothing from before. Each script keeps its own log, named by its file
+stem, and a run replaces the previous run of the same script; a debugging
+script never touches the main script's log. With one script logged under
+a store directory, `logs()` needs no name. `log` outside a memoised call,
+in the script itself, goes to the log with no call record; with no store
+directory configured it does nothing.
+
+The log is as current as the cache. A logged value is the output of a
+pure function, so whatever removes call records, `clear_cache()` or the
+sweep, removes the logged values that came with them: a line naming a
+record that is gone reads as stale, `logs()` warns and counts it in
+`L.stale`, and running the script again repairs it. Values logged outside
+any memoised call, or in a run a debugger forced, have no record and stay
+until the next run of the script.
+
+A script whose work is one `@pure` function, `main()`, has one line in its
+log after an unchanged re-run, and every logged value inside it is
+reachable from that one record. Nothing requires this shape; it costs
+nothing and keeps the log small.
 
 A log is readable while its run is going: `L.refresh()` picks up new
-logged values. Arrays come back as memory maps. Logs go in `logs/` in the cache
-directory with everything else, so there is nothing to configure and
-nothing recorded without a cache.
+logged values. Arrays come back as memory maps. Logs go in `logs/` in the
+store directory with everything else, so there is nothing to configure and
+nothing recorded without a store directory.
 
 ### Reading what a batch produced
 
@@ -678,18 +697,17 @@ block shows each host's state (syncing, ready, or dropped with the
 reason), its capacity under the mode, and what is running and finished
 there.
 
-The event log goes in `events/` inside the cache directory, one file per process, and
-nothing is recorded until `set_cache_dir` has been called — the same rule as
+The event log goes in `events/` inside the store directory, one file per process, and
+nothing is recorded until `set_store_dir` has been called — the same rule as
 everything else here. That does mean a `run_all` batch with no cache
-directory is not observable. The monitor takes the cache directory as an
-argument, falling back to `$VALUEKIT_CACHE`.
+directory is not observable. The monitor takes the store directory as an
+argument, falling back to `$VALUEKIT_STORE`.
 
 There is nothing to switch on and no way to get it wrong: writing the log never
 fails a run, an unwritable directory just disables it, old run files are
 pruned, and a run that produces a huge number of records stops recording
-detail rather than filling a disk. It costs about 3 µs per `@pure` call —
-under a tenth of a cache hit, which is dominated by reading the function's
-call-record file.
+detail rather than filling a disk. It costs about 3 µs per `@pure` call,
+a small fraction of a cache hit.
 
 ## Install
 

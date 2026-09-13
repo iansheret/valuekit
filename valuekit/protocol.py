@@ -52,9 +52,7 @@ GET_VALUE = b"\x0d"  # worker -> main process: send me this value's objects
 VALUE = b"\x0e"  # main   -> worker: empty once sent, or why not
 CALL = b"\x0f"  # worker -> main process: run this @pure_local call here
 CALLED = b"\x10"  # main   -> worker: its result root and record hash, or error
-LOGGED = b"\x17"  # worker -> main process: one runlog line (a log() call there)
-HIT = b"\x18"  # worker -> main process: it is taking this call record as a hit (fn hash, record hash);
-                #   the reply is the result's objects then VALUE, or VALUE with why not
+LOGGED = b"\x17"  # worker -> main process: one line of the run's log (an entry or a reference)
 
 # Between the main process and a host process (valuekit.hostprocess), which runs one
 # worker per task and carries each worker's stream as a numbered channel.

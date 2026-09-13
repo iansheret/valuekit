@@ -25,11 +25,11 @@ additions to a data or config map do not invalidate — whereas a plain dict
 argument is depended on whole, since nothing observed how it was used.
 
 A call record also records what happened inside the call: every memoised
-call it made (function name, key and record hash, in completion order) and
-every :func:`log` call (labels and value, by hash).  These are facts about
-the call, stored with its result, so a hit can stand in for the call
-completely: it emits to the run's log what the call record it found
-recorded, nested calls included.  :mod:`valuekit.runlog` reads it back.
+call it made (function name, function hash and record hash, in completion
+order) and every :func:`log` call (labels and value, by hash).  A hit
+writes one line to the run's log naming the record, and
+:mod:`valuekit.runlog` reads the logged values out of the record, nested
+calls included.
 
 ``@pure_local`` is memoised identically but promises less about the code
 and more about the world: the result may depend on this machine's
@@ -40,7 +40,7 @@ user configured, never on a remote worker.
 Note that the function body does not run on a hit: prints, plots, and any
 other side effect inside a @pure function are skipped.
 
-With no cache directory configured, @pure is a plain call.  For debugging
+With no store directory configured, @pure is a plain call.  For debugging
 see :mod:`valuekit.debughook`: a breakpoint anywhere in the function's
 reachable set forces execution, without writing.
 """
@@ -63,7 +63,7 @@ from .recording import Recorder, RecordingMap, unwrap_proxies
 from .store import CacheMiss, CacheStore, LocalStore
 from .values import content_hash, decode_key, digest, freeze
 
-__all__ = ["pure", "pure_local", "log", "set_cache_dir", "clear_cache"]
+__all__ = ["pure", "pure_local", "log", "set_store_dir", "clear_cache"]
 
 _MISSING = object()
 
@@ -86,14 +86,14 @@ def _current_store() -> "CacheStore | None":
     return _store
 
 
-def set_cache_dir(path: str | os.PathLike | None) -> None:
-    """Configure the cache directory (or None to disable caching).
+def set_store_dir(path: str | os.PathLike | None) -> None:
+    """Configure the store directory (or None to disable caching).
 
     Nothing is configured until this is called, so importing valuekit never
     enables disk caching by itself.  To drive it from the environment, read
     the variable explicitly::
 
-        set_cache_dir(os.environ.get("VALUEKIT_CACHE"))
+        set_store_dir(os.environ.get("VALUEKIT_STORE"))
     """
     global _store
     _store = None if path is None else LocalStore(path)
@@ -105,29 +105,23 @@ def set_store(store: CacheStore | None) -> None:
     _store = store
 
 
-def clear_cache(fn: Callable | None = None) -> None:
-    """Delete cached results. Always safe: the worst case is recomputation.
-
-    ``clear_cache()`` deletes everything in the configured cache.
-    ``clear_cache(fn)`` states that *fn* has changed: it deletes *fn*'s call
-    records.  Every function that computed through *fn*, whether it called
-    it directly or received it as an argument, names one of those records
-    in its own, so its next call finds nothing that can stand in for it and
-    recomputes; callers are reached transitively the same way, each at its
-    next call.  Stored values are content-addressed and shared, so they are
-    left in place; :mod:`valuekit.sweep` removes what nothing names.
+def clear_cache() -> None:
+    """Delete everything computed or logged: every stored value, call
+    record, batch and run log.  Always safe: the worst case is
+    recomputation.  To invalidate one function, edit it, or put a version
+    in its arguments; either gives it a new function hash.
     """
-    if not isinstance(_store, LocalStore):
-        return
-    if fn is None:
+    if isinstance(_store, LocalStore):
         _store.clear()
-        return
-    if not getattr(fn, "_valuekit_pure", False):
-        raise TypeError(
-            f"clear_cache() takes a @pure-decorated function; got "
-            f"{getattr(fn, '__qualname__', fn)!r}"
-        )
-    _store.drop_records(fn._valuekit_reachable().hash)
+
+
+def take_hit(store: CacheStore, function_hash: str, h: str, record: dict) -> Any:
+    """The result of call record *h* of *function_hash*, taken as a hit:
+    the value is loaded and the record is named in the run's log.  Raises
+    :class:`CacheMiss` if the value is gone, and then writes nothing."""
+    value = store.get_value(record["result"])
+    runlog.refer(store, function_hash, h)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +133,8 @@ class _Frame:
     """What the memoised call currently executing has recorded so far.
 
     ``calls`` and ``logs`` go into its call record.  A ``discard`` frame belongs
-    to a debugger-forced run: it accepts nothing and stores nothing.
+    to a debugger-forced run, which writes no call record: it notes nothing,
+    while its logged values still go to the run's log.
     """
 
     __slots__ = ("store", "calls", "logs", "discard")
@@ -171,12 +166,13 @@ def log(labels: Mapping, value: Any) -> None:
     The labels are frozen to an :class:`ImmutableMap` and both they and
     the value are stored like results (they must be storable).  The logged
     value goes into this run's log at once and, inside a memoised call,
-    into the call's record as well, so a later hit emits it again without
-    the body running.  Read it back through :func:`valuekit.logs`.
+    into the call's record as well, which is where a later hit's line in
+    the run's log points.  Read it back through :func:`valuekit.logs`.
 
-    valuekit gives no label key a meaning.  Outside a memoised call the
-    logged value goes to the run's log only.  With no cache configured
-    this does nothing, like everything else here.
+    valuekit gives no label key a meaning.  Outside a memoised call, and
+    in a call a debugger forced to run, the logged value goes to the run's
+    log only.  With no store configured this does nothing, like everything
+    else here.
     """
     if not isinstance(labels, Mapping):
         raise TypeError(
@@ -186,13 +182,11 @@ def log(labels: Mapping, value: Any) -> None:
     store = _store if frame is None else frame.store
     if store is None:
         return
-    if frame is not None and frame.discard:
-        return
     labels = freeze(labels)
     labels_hash = store.put_value(labels)
     value_hash = store.put_value(value)
     keys = runlog.label_hashes(labels)
-    if frame is not None:
+    if frame is not None and not frame.discard:
         frame.logs.append([labels_hash, value_hash, keys])
     runlog.emit(store, labels_hash, value_hash, keys)
 
@@ -320,9 +314,9 @@ def pure_local(fn: Callable):
     cannot be promised, put the version in the arguments (a date, a commit,
     an etag), where it is tracked like everything else.
 
-    Because the function reads an environment, it runs only on the machine
-    that has that environment: this one, where the pipeline is driven.  A
-    batch running elsewhere sends such calls back here.  Effects that do not
+    Because the function reads an environment, it runs only on this
+    machine, never on a remote host.  A batch running elsewhere sends such
+    calls back here and receives the value.  Effects that do not
     reach the result (a scratch file, a download cache) are permitted, since
     on a hit none of them happen.  The result must be a value, never a path:
     a path from this machine means nothing on another.
@@ -377,38 +371,23 @@ def _pure(fn: Callable, *, local: bool):
         return bound, arguments, arg_hashes
 
     def _hit(store, function_hash, arguments, arg_hashes, t_lookup):
-        """The first matching record whose value loads and whose logged
-        values can all be emitted, or None.
+        """The first matching record whose value loads, or None.
 
-        Reports the hit and records it in the enclosing call only
-        once the value is in hand: a CacheMiss on the value falls through to
-        the next candidate, and reporting a match before that would
-        overcount.  The same for what the call record logged: a hit stands in for
-        the call only if it can put into the run's log everything the call
-        would have, nested calls included.
+        Reports the hit and records it in the enclosing call only once the
+        value is in hand: a CacheMiss on the value falls through to the
+        next candidate, and reporting a match before that would overcount.
         """
         for h, record in _matches(store, function_hash, arguments, arg_hashes):
             try:
-                value = _take_hit(store, function_hash, h, record)
+                value = take_hit(store, function_hash, h, record)
             except CacheMiss:
-                continue  # the value, or a logged value, is gone: try others, else rerun
+                continue  # the value is gone: try others, else rerun
             events.record(
                 store, "hit", fn=qn, key=function_hash, dur=time.perf_counter() - t_lookup
             )
             _note_call(qn, function_hash, h)
             return (value,)
         return None
-
-    def _take_hit(store, function_hash, h, record):
-        """The record's result, with its logged values written to the run's
-        log.  A worker on a remote host asks the main process to do both;
-        here the value is loaded first, so a missing value emits nothing."""
-        remote = getattr(store, "hit", None)
-        if remote is not None:
-            return remote(function_hash, h, record["result"])
-        value = store.get_value(record["result"])
-        runlog.reemit(store, function_hash, h, record)
-        return value
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -433,8 +412,8 @@ def _pure(fn: Callable, *, local: bool):
 
         # A live breakpoint in this function's reachable set: execute without
         # reading or writing the cache, so nothing from a debug session can
-        # enter the store.  The discard frame keeps log() calls in the body
-        # from raising, and from writing.
+        # enter a call record.  Logged values still reach the run's log: a
+        # run being debugged is one whose values are wanted.
         if breakpoints_force(spans):
             global _force_epoch
             _force_epoch += 1
@@ -538,7 +517,7 @@ def _pure(fn: Callable, *, local: bool):
         """
         store = _store
         if store is None:
-            raise CacheMiss(f"{qn}: no cache directory is configured")
+            raise CacheMiss(f"{qn}: no store directory is configured")
         function_hash = _reachable().hash
         _, arguments, arg_hashes = _bind(args, kwargs)
         found = _hit(store, function_hash, arguments, arg_hashes, time.perf_counter())

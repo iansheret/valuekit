@@ -36,7 +36,7 @@ Every write is a temp file and ``os.replace``, and every file is named by
 the hash of its content, call records included.  Two processes writing the same
 entry write the same bytes under the same name, so there is nothing to
 coordinate: no appends, no locks, no read-before-write.  This is what lets
-any number of processes share a cache directory, on Windows as well as
+any number of processes share a store directory, on Windows as well as
 POSIX (Windows appends are not atomic, and Windows refuses to replace a file
 another process has mapped -- both cases reduce to "already there").
 """
@@ -176,7 +176,7 @@ class LocalStore:
                 raise RuntimeError(
                     f"Cache at {self.root} has format {found}, this valuekit "
                     f"writes format {FORMAT_VERSION}. Delete the directory or "
-                    "point set_cache_dir() elsewhere."
+                    "point set_store_dir() elsewhere."
                 )
         else:
             _atomic_write(fmt, f"{FORMAT_VERSION}\n".encode())
@@ -299,6 +299,7 @@ class LocalStore:
                 listing.docs[h] = doc
             entries.append((h, doc))
         listing.entries = entries
+        listing.docs = dict(entries)  # a record deleted since is not served
         listing.mtime_ns = mtime_ns
         listing.stale = False
         return entries
@@ -320,11 +321,13 @@ class LocalStore:
         return doc if isinstance(doc, dict) else None
 
     def get_record(self, function_hash: str, h: str) -> dict:
-        """One record by hash; CacheMiss if it is gone or corrupt."""
+        """One record by hash; CacheMiss if it is gone or corrupt.
+
+        Answered through the listing, so a record another process has
+        deleted is missed here from the next call on, like any other."""
+        self.get_records(function_hash)
         listing = self._listings.get(function_hash)
-        if listing is not None and h in listing.docs:
-            return listing.docs[h]
-        doc = self._read_record(self._record_dir(function_hash) / f"{h}.json", h)
+        doc = listing.docs.get(h) if listing is not None else None
         if doc is None:
             raise CacheMiss(f"record {h} of {function_hash}")
         return doc
@@ -340,19 +343,11 @@ class LocalStore:
             listing.stale = True
         return h
 
-    def drop_records(self, function_hash: str) -> None:
-        """Delete every call record of one function.  Stored values are left in
-        place.  A call record elsewhere that names one of these is left too: its
-        hit fails to load the subtree and recomputes, which is how
-        ``clear_cache(fn)`` reaches callers."""
-        shutil.rmtree(self._record_dir(function_hash), ignore_errors=True)
-        self._listings.pop(function_hash, None)
-
-    # -- maintenance -----------------------------------------------------------
-
     def clear(self) -> None:
-        """Delete all cached objects and call records (always safe)."""
-        for sub in (self.objects, self.records):
-            shutil.rmtree(sub, ignore_errors=True)
-            sub.mkdir(exist_ok=True)
+        """Delete everything computed or logged: the values, call records,
+        batches and run logs.  The event log and host source trees stay."""
+        for name in ("objects", "records", "batches", "logs"):
+            shutil.rmtree(self.root / name, ignore_errors=True)
+        self.objects.mkdir(exist_ok=True)
+        self.records.mkdir(exist_ok=True)
         self._listings.clear()

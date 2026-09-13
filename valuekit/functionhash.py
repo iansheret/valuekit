@@ -178,7 +178,7 @@ def _is_live_extension(filename: str, top: str) -> bool:
 def _binary_hash(filename: str) -> str:
     """The content hash of the file at *filename*, memoised on its size and
     modification time so a build is read once."""
-    from . import sync
+    from . import project
 
     try:
         st = os.stat(filename)
@@ -188,7 +188,7 @@ def _binary_hash(filename: str) -> str:
     cached = _binary_hashes.get(filename)
     if cached is not None and cached[0] == key:
         return cached[1]
-    h = sync._file_hash(filename) or "?"
+    h = project._file_hash(filename) or "?"
     _binary_hashes[filename] = (key, h)
     return h
 
@@ -232,7 +232,7 @@ def _is_installed(filename: str, top: str) -> bool:
     local directory claims nothing here: its files are the user's, edited in
     place under a version that never moves.
     """
-    from .sync import is_environment
+    from .project import is_environment
 
     if is_environment(filename):
         return True

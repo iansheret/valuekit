@@ -17,7 +17,7 @@ impossible: every input ran under one function hash, which the record
 carries.  Across code changes the question is only "has this batch been
 re-run since the edit", and the record's ``function_hash`` answers it.
 
-Layout, under the cache directory::
+Layout, under the store directory::
 
     batches/<name>/latest               # the id of the newest batch
     batches/<name>/<batch_id>/header.json
@@ -41,7 +41,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
-from .runlog import Logs, collect
+from .runlog import Selection, selection
 from .store import CacheMiss, LocalStore, SerializationError, _atomic_write, dirname_for
 from .values import content_hash
 
@@ -151,10 +151,10 @@ class CallRecord:
         return out
 
     @property
-    def logs(self) -> Logs:
+    def logs(self) -> Selection:
         """What this call logged, nested calls included.  A part
         that has been swept since is left out rather than failing."""
-        return Logs(self._store, items=collect(self._store, self._doc, strict=False))
+        return selection(self._store, self._doc)
 
 
 class Batch:
@@ -262,30 +262,30 @@ class Batch:
         raise KeyError(f"{x!r} is not an input of {self!r}")
 
     @property
-    def logs(self) -> Logs:
+    def logs(self) -> Selection:
         """What the batch's finished inputs logged, as :func:`valuekit.logs`
         would show it: every logged value their call records hold, nested calls
         included.  A part that has been swept since is left out."""
         items: list = []
         for r in self.rows:
-            items.extend(collect(self._store, r._doc, strict=False))
-        return Logs(self._store, items=items)
+            items.extend(selection(self._store, r._doc))
+        return Selection(items)
 
 
-def batch(name: str, cache_dir: str | os.PathLike | None = None) -> Batch:
+def batch(name: str, store_dir: str | os.PathLike | None = None) -> Batch:
     """Open the newest batch recorded under *name*.
 
-    *cache_dir* defaults to the configured one.  Raises ``LookupError`` if
+    *store_dir* defaults to the configured one.  Raises ``LookupError`` if
     no batch of that name has been recorded.
     """
-    if cache_dir is None:
+    if store_dir is None:
         from .pure import _current_store
 
         store = _current_store()
         if not isinstance(store, LocalStore):
-            raise LookupError("no cache directory is configured; pass cache_dir=")
+            raise LookupError("no store directory is configured; pass store_dir=")
     else:
-        store = LocalStore(cache_dir)
+        store = LocalStore(store_dir)
     d = batches_dir(store) / dirname_for(name)
     try:
         batch_id = (d / "latest").read_text().strip()

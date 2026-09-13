@@ -81,7 +81,7 @@ __all__ = [
 ]
 
 # The table.  A row is what one lock tool needs said about it: its
-# executable, how to sync a tree into an environment for a given Python
+# executable, the command that installs the locked environment for a given Python
 # (``{python}``: this interpreter's path when it has the minor version the
 # main process runs, else that minor for the tool to find or fetch), where the
 # interpreter then lives relative to the tree, and where the executable
@@ -89,7 +89,7 @@ __all__ = [
 _TOOLS = {
     "uv.lock": {
         "tool": "uv",
-        "sync": ("sync", "--frozen", "--python", "{python}"),
+        "install": ("sync", "--frozen", "--python", "{python}"),
         "interpreters": (".venv/bin/python", ".venv/Scripts/python.exe"),
         "search": ("~/.local/bin", "~/.cargo/bin"),
     },
@@ -433,7 +433,7 @@ def _python_request(py_minor: str) -> str:
     return py_minor
 
 
-def _sync(tree: str, py_minor: str) -> tuple[str, str]:
+def _build_environment(tree: str, py_minor: str) -> tuple[str, str]:
     """Run the tree's lock tool in it; the interpreter it made, or why not."""
     lock = lock_tool(os.listdir(tree))
     if lock is None:
@@ -450,7 +450,7 @@ def _sync(tree: str, py_minor: str) -> tuple[str, str]:
             f"session has a short one) and was not found in {looked}. Install "
             "it there, or put it on the PATH that non-interactive shells see."
         )
-    cmd = [exe] + [a.format(python=_python_request(py_minor)) for a in row["sync"]]
+    cmd = [exe] + [a.format(python=_python_request(py_minor)) for a in row["install"]]
     try:
         p = subprocess.run(
             cmd, cwd=tree, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
@@ -499,7 +499,7 @@ def _prepare(
         reason = _extract(data, tree)
         if reason:
             return "", reason
-        python, reason = _sync(tree, py_minor)
+        python, reason = _build_environment(tree, py_minor)
         if reason:
             return "", reason  # the tree stays; the next update starts from it
         _write_manifest(manifest, project_hash, python, files)

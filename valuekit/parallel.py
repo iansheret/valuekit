@@ -53,7 +53,7 @@ The split is what lets work run somewhere other than this machine without
 the scheduling being written twice.
 
 Workers are configured automatically (each process applies the parent's
-cache directory before running) and share the cache: every write is a
+store directory before running) and share the cache: every write is a
 content-named file, so concurrent writers cannot drop each other's
 results.  ``fn`` must be a module-level function (it is sent to workers by
 reference).  Worker processes are daemonic: they are cleaned up if the
@@ -70,7 +70,8 @@ import time
 from collections import deque
 from typing import Any, Callable, Iterable, Iterator
 
-from . import bootstrap, events, localfile, modes, runlog, sync
+from . import bootstrap, events, localfile, modes, runlog
+from .project import Project, ProjectError, project_root
 from .hosts import Finished, LocalHost, ProcessConnection, RemoteHost
 from .batches import BatchWriter
 from .functionhash import reachable_set
@@ -277,16 +278,12 @@ def _cached(fn, x) -> Outcome | None:
     found = fn._valuekit_lookup(x)
     if found is None:
         return None
-    from .pure import _current_store
+    from .pure import _current_store, take_hit
 
-    store = _current_store()
     try:
-        value = store.get_value(found[1]["result"])
-        # The stored result stands in for the call only with everything the
-        # call would have logged; otherwise a worker runs it afresh.
-        runlog.reemit(store, fn._valuekit_reachable().hash, found[0], found[1])
+        value = take_hit(_current_store(), fn._valuekit_reachable().hash, found[0], found[1])
     except CacheMiss:
-        return None
+        return None  # the result value is gone: a worker runs the input
     return Outcome(x, value=value)
 
 
@@ -303,38 +300,41 @@ class _Hosts:
     switch made while the batch runs applies to the next task started.
     """
 
-    def __init__(self, fn, cache_dir: str | None, completions: queue.Queue, store, batch: int):
-        self.local = LocalHost(fn, cache_dir, completions)
+    def __init__(
+        self, fn, store_dir: str | None, completions: queue.Queue, store, batch: int,
+        max_workers: int | None = None,
+    ):
+        self.local = LocalHost(fn, store_dir, completions)
         self.hosts: list[RemoteHost] = []
         self._states: dict[str, str] = {}  # name -> syncing | ready | failed
         self._store = store
         self._batch = batch
-        self._cache_dir = cache_dir
+        self._store_dir = store_dir
         self._closed = False
         # The local file lives in the function's project; a function with
         # no project (defined in __main__, or exec'd) has no file and so no
         # hosts.
         try:
-            self._root: str | None = sync.sync_root(fn)
-        except sync.SyncError:
+            self._root: str | None = project_root(fn)
+        except ProjectError:
             self._root = None
         config = localfile.load_local(self._root)
-        self.local_workers = config.local_workers
+        self.local_workers = config.local_workers if max_workers is None else max_workers
         if _host_commands is not None:
-            project = sync.Project(fn, config.project) if _host_commands else None
-            source_root = os.path.join(cache_dir, "source") if cache_dir else ""
+            project = Project(fn, config.project) if _host_commands else None
+            source_root = os.path.join(store_dir, "source") if store_dir else ""
             for name, spec in _host_commands.items():
                 command, workers = spec if isinstance(spec, tuple) else (spec, None)
                 self.hosts.append(
                     RemoteHost(
-                        project, cache_dir, completions, name,
+                        project, store_dir, completions, name,
                         _launcher([*command, "-c", bootstrap.STAGE0]),
                         source_root, workers,
                     )
                 )
         else:
             # One project for every host: the tree is walked once per batch.
-            project = sync.Project(fn, config.project) if config.hosts else None
+            project = Project(fn, config.project) if config.hosts else None
             for h in config.hosts:
                 command = [
                     "ssh", "-T", "-o", "BatchMode=yes", h.ssh,
@@ -342,7 +342,7 @@ class _Hosts:
                 ]
                 self.hosts.append(
                     RemoteHost(
-                        project, cache_dir, completions, h.name, _launcher(command),
+                        project, store_dir, completions, h.name, _launcher(command),
                         h.source_root, h.workers,
                     )
                 )
@@ -385,7 +385,7 @@ class _Hosts:
         start at once and a host joins when it is ready, whether the mode
         named it from the start or a switch mid-batch brought it in.
         """
-        mode = localfile.read_mode(self._root, self._cache_dir)
+        mode = localfile.read_mode(self._root, self._store_dir)
         if mode != "local" and self.hosts:
             self.sync(wait=False)
         remote = {}
@@ -423,12 +423,16 @@ def run_all(
     input order.
 
     ``fn`` must be ``@pure`` or ``@pure_local``.  Each input runs in its
-    own process; ``max_workers`` caps how many run at once (default: the
-    CPU count).  An input whose result is already cached is answered
-    without a worker.  ``timeout`` limits the seconds each input may spend
+    own process; ``max_workers`` is how many run at once on this machine
+    (default: the ``[local] workers`` line of the local file, else the CPU
+    count).  Remote hosts, if the local file names any, add their own
+    capacity.  An input whose result is already cached is answered without
+    a worker.  ``timeout`` limits the seconds each input may spend
     running; a breach kills that input's process and records a
     TimeoutError on its outcome, leaving the rest of the batch unaffected.
-    Worker deaths are likewise recorded per input.
+    Worker deaths are likewise recorded per input.  When no host may run
+    anything (``max_workers=0`` and no remote host is usable) the inputs
+    run one at a time in this process, without the timeout.
 
     Every input is processed and failures are collected on the
     BatchResult: ``.values`` raises an ExceptionGroup if any input failed,
@@ -452,7 +456,7 @@ def run_all(
     from .pure import _current_store
 
     store = _current_store()
-    cache_dir = str(store.root) if isinstance(store, LocalStore) else None
+    store_dir = str(store.root) if isinstance(store, LocalStore) else None
     qualname = getattr(fn, "__qualname__", repr(fn))
     name = name or qualname
     runlog.current_run(store)  # begun here, so that every worker joins this run
@@ -503,7 +507,7 @@ def run_all(
         return BatchResult(o for o in outcomes if o is not None)
 
     completions: queue.Queue = queue.Queue()
-    hosts = _Hosts(fn, cache_dir, completions, store, batch)
+    hosts = _Hosts(fn, store_dir, completions, store, batch, max_workers)
 
     running: list[_Task] = []
     busy: dict[str, int] = {}  # host name -> tasks running there
@@ -518,14 +522,21 @@ def run_all(
 
     def _start_pending() -> None:
         _, caps = hosts.capacities()
-        total = max_workers or sum(caps.values())
         for host in hosts.all():
-            while (
-                pending
-                and len(running) < total
-                and busy.get(host.name, 0) < caps.get(host.name, 0)
-            ):
+            while pending and busy.get(host.name, 0) < caps.get(host.name, 0):
                 _start(host, *pending.popleft())
+
+    def _run_here() -> None:
+        """Run the next pending input in this process: no host may run
+        anything, and a batch must always be able to run."""
+        idx, x = pending.popleft()
+        events.record(store, "start", id=batch, i=idx, host="main")
+        try:
+            o = Outcome(x, value=fn(x))
+        except Exception as e:  # noqa: BLE001 - collected on the outcome
+            o = Outcome(x, exc=e)
+        outcomes[idx] = o
+        recorder.outcome(idx, o, host="main")
 
     def _deliver(block: bool) -> None:
         """Feed handles whatever the hosts have delivered."""
@@ -547,11 +558,10 @@ def run_all(
             if not running:
                 if not pending:
                     break
-                if not hosts.syncing():
-                    raise RuntimeError(
-                        "no host can run this batch: every capacity is zero"
-                    )
-                _deliver(block=True)  # a host is still syncing; wait for it
+                if hosts.syncing():
+                    _deliver(block=True)  # a host is still syncing; wait for it
+                else:
+                    _run_here()
                 continue
             _deliver(block=True)
             now = time.monotonic()

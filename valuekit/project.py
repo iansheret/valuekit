@@ -1,10 +1,11 @@
-"""Getting the user's code to the machine that will run it.
+"""The user's project: where it is, which files it consists of, and how it
+is packed for a host.
 
-A worker must run the code the main process meant, and the main process must not have to
-remember to copy it there -- an edit loop that needs a manual sync step is an
-edit loop nobody uses.  So the main process describes its project as a *manifest*,
-the worker unpacks an immutable copy of it -- a *source tree* -- and imports
-from that rather than from whatever happens to be on its own disk.
+A worker must run the code the main process meant, and the main process
+must not have to copy it there by hand.  So the main process describes
+its project as a *manifest*, the worker unpacks a copy of it -- a *source
+tree* -- and imports from that rather than from whatever happens to be on
+its own disk.
 
 What gets sent is the user-code partition and nothing else, the same
 boundary :func:`valuekit.functionhash._classify` already draws: the project's own
@@ -17,8 +18,8 @@ trusting the project's ignore rules.
 A host keeps one source tree per project, updated in place from the
 manifest's difference, so a build directory there persists across edits;
 the manifest hash (the *project hash*) says whether the host's copy is current.
-On this machine the tree lives under the cache directory, beside
-``objects/`` and ``events/``: the cache directory is where valuekit writes,
+On this machine the tree lives under the store directory, beside
+``objects/`` and ``events/``: the store directory is where valuekit writes,
 and nothing is written until one is named.
 
 What happens to the tree on the host -- unpacking it, building the
@@ -50,13 +51,13 @@ from .localfile import LOCAL_FILE
 from .values import _frame, _new_hasher
 
 __all__ = [
-    "SyncError",
+    "ProjectError",
     "Project",
     "manifest",
     "manifest_hash",
     "project_hash",
     "find_root",
-    "sync_root",
+    "project_root",
     "pack_tree",
     "import_roots",
     "user_span_files",
@@ -87,7 +88,7 @@ MAX_BYTES = 256 << 20  # a project tree, not a data directory
 MAX_FILES = 20_000
 
 
-class SyncError(Exception):
+class ProjectError(Exception):
     """The project cannot be described or shipped as it stands."""
 
 
@@ -185,12 +186,12 @@ def find_root(path: str) -> str | None:
     return None
 
 
-def sync_root(fn: Any) -> str:
+def project_root(fn: Any) -> str:
     """The project directory enclosing *fn*: its nearest marker, else its directory."""
     mod = sys.modules.get(getattr(fn, "__module__", "") or "")
     fname = getattr(mod, "__file__", None)
     if not fname:
-        raise SyncError(
+        raise ProjectError(
             f"cannot locate the project for {getattr(fn, '__qualname__', fn)!r}: "
             "its module has no file. Define it in a module, not a notebook or "
             "an exec'd string."
@@ -198,7 +199,7 @@ def sync_root(fn: Any) -> str:
     return find_root(fname) or str(Path(os.path.realpath(fname)).parent)
 
 
-def _cache_dirs() -> list[str]:
+def _store_dirs() -> list[str]:
     """The current store's directory, if it has one: never part of a tree.
 
     A cache configured inside the project would otherwise be packed into the
@@ -220,7 +221,7 @@ def project_hash(root: str) -> str:
     caller that needs it repeatedly within one operation keeps it for that
     operation (the walk does).
     """
-    return manifest_hash(manifest(root, exclude=_cache_dirs()))
+    return manifest_hash(manifest(root, exclude=_store_dirs()))
 
 
 class Project:
@@ -235,9 +236,9 @@ class Project:
 
     def __init__(self, fn: Any, name: str | None = None):
         self.fn = fn
-        self.root = sync_root(fn)
+        self.root = project_root(fn)
         self.name = project_name(self.root, name)
-        self.entries = manifest(self.root, exclude=_cache_dirs())
+        self.entries = manifest(self.root, exclude=_store_dirs())
         self.project_hash = manifest_hash(self.entries)
         self.roots = import_roots(self.root)
         _warn_if_tracked(self.root)
@@ -441,7 +442,7 @@ def manifest(root: str, exclude: Iterable[str] = ()) -> list[tuple[str, str]]:
     if total > MAX_BYTES or len(entries) > MAX_FILES:
         biggest.sort(reverse=True)
         worst = "\n  ".join(f"{s // 1024} KiB  {p}" for s, p in biggest[:10])
-        raise SyncError(
+        raise ProjectError(
             f"the project at {root} is {total // (1 << 20)} MiB over "
             f"{len(entries)} files, past the limit for shipping to a worker. "
             f"The largest entries are:\n  {worst}\n"

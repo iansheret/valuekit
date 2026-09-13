@@ -11,11 +11,11 @@ The immutable map alone activates nothing else::
     ctx  = ImmutableMap({"raw": signal, "fs": 1000.0})
     ctx2 = ctx | {"scaled": ctx["raw"] * gain}       # derive; ctx unchanged
 
-Memoised pipelines: declare functions pure and set a cache directory::
+Memoised pipelines: declare functions pure and set a store directory::
 
-    from valuekit import ImmutableMap, pure, set_cache_dir
+    from valuekit import ImmutableMap, pure, set_store_dir
 
-    set_cache_dir("~/.cache/mypipeline")             # nothing caches until this
+    set_store_dir("~/.cache/mypipeline")             # nothing caches until this
 
     @pure
     def calculate_geometry(obs, config):
@@ -40,7 +40,7 @@ from ._version import __version__
 from .values import freeze, content_hash, register_type
 from .map import ImmutableMap
 from .store import SerializationError, CacheMiss
-from .pure import pure, pure_local, log, set_cache_dir, clear_cache
+from .pure import pure, pure_local, log, set_store_dir, clear_cache
 from .parallel import run_all, BatchResult
 from .batches import batch
 from .runlog import logs
@@ -55,7 +55,7 @@ __all__ = [
     "pure",
     "pure_local",
     "log",
-    "set_cache_dir",
+    "set_store_dir",
     "clear_cache",
     "run_all",
     "BatchResult",

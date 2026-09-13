@@ -6,15 +6,15 @@ looks exactly like one that is.  This module writes what happened -- hits,
 misses, forced runs, batch outcomes -- so that another process can watch a
 run in progress.  See :mod:`valuekit.monitor` for the reader.
 
-Records go in the configured cache directory, under ``events/``.  That is the
-whole configuration: the cache directory is where valuekit writes, and
+Records go in the configured store directory, under ``events/``.  That is the
+whole configuration: the store directory is where valuekit writes, and
 nothing is written until one is named, so importing valuekit still has no
-effect on its own.  A batch run with no cache directory is therefore
+effect on its own.  A batch run with no store directory is therefore
 unobservable, which is the price of not inventing a second location.
 
 One file per process, ``events/<start>-<pid>.jsonl``, never appended to by
 two processes: concurrent appends to a shared file are exactly what does
-not work on Windows.  A spawned worker derives its own path from the cache
+not work on Windows.  A spawned worker derives its own path from the store
 directory it is already given, so there is nothing extra to pass it.
 
 The event log is a diagnostic, never a dependency.  Every failure here is
@@ -172,7 +172,7 @@ class _Writer:
             pass
 
 
-# The writer for the store currently in use.  set_cache_dir may point
+# The writer for the store currently in use.  set_store_dir may point
 # somewhere else mid-process, so the root is checked on every record -- but it
 # is compared as given, never rebuilt: deriving the path here instead cost
 # more than everything else in this function put together.

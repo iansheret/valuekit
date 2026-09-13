@@ -60,7 +60,7 @@ import traceback
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from . import events, sync, protocol
+from . import events, project, protocol
 from .remotestore import RemoteStore
 
 __all__ = ["main", "serve", "serve_check"]
@@ -135,7 +135,7 @@ def _check_imports(source: Path) -> str:
             path = os.path.realpath(fname)
         except OSError:
             continue
-        if sync.is_environment(path) or sync._under(path, real):
+        if project.is_environment(path) or project._under(path, real):
             continue
         strays.append(f"{name} from {path}")
     if strays:
@@ -170,7 +170,7 @@ def _accept(python: str, module: str, qualname: str, function_hash: str) -> str:
     if theirs != function_hash:
         return (
             f"{module}:{qualname} differs here: main process has {function_hash[:12]}, "
-            f"this worker has {theirs[:12]}. The code is not in sync."
+            f"this worker has {theirs[:12]}: the code differs."
         )
     return ""
 

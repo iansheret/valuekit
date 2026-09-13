@@ -17,8 +17,8 @@ more: it looks exactly like one somebody does, so it stays.
 The modules named must be every module that defines a memoised function
 whose results are wanted.  A function that is not imported here reads as
 gone, and its call records go with it -- the worst case is recomputation, as with
-every deletion in this library.  The cache directory is the one configured
-in those modules if they configure one, else ``--cache`` or ``$VALUEKIT_CACHE``.
+every deletion in this library.  The store directory is the one configured
+in those modules if they configure one, else ``--store`` or ``$VALUEKIT_STORE``.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from .codec import children
 from .runlog import logs_dir
 from .store import LocalStore
 
-__all__ = ["sweep", "main"]
+__all__ = ["sweep", "sweep_store", "main"]
 
 
 def live_keys(modules: list[str]) -> set[str]:
@@ -50,11 +50,17 @@ def live_keys(modules: list[str]) -> set[str]:
     return keys
 
 
-def sweep(cache_dir: str | os.PathLike, modules: list[str], dry_run: bool = False) -> dict:
+def sweep(store_dir: str | os.PathLike, modules: list[str], dry_run: bool = False) -> dict:
     """Delete call records, batches and objects the functions in *modules* cannot
     reach.  Returns counts of what was (or would be) removed."""
-    store = LocalStore(cache_dir)
-    keys = live_keys(modules)
+    return sweep_store(LocalStore(store_dir), live_keys(modules), dry_run)
+
+
+def sweep_store(store: LocalStore, keys: set[str], dry_run: bool = False) -> dict:
+    """Keep the call records of the function hashes in *keys* and the
+    batches recorded under them; delete every other call record and batch,
+    then every object that none of what is kept, and no run log entry,
+    names.  Returns counts of what was (or would be) removed."""
     counts = {"functions": len(keys), "records": 0, "batches": 0, "objects": 0}
 
     def remove(path: Path) -> None:
@@ -112,8 +118,10 @@ def sweep(cache_dir: str | os.PathLike, modules: list[str], dry_run: bool = Fals
             if not dry_run and not kept:
                 remove(name_dir)
 
-    # -- what the run logs name: a value logged outside any memoised call has
-    # no call record, and a run's log is kept whatever the code did since
+    # -- what the run logs' entries name: a value logged outside any memoised
+    # call, or in a forced run, has no call record.  A reference line names
+    # a call record, not an object, and roots nothing: a record the sweep
+    # removes reads as stale.
     ldir = logs_dir(store)
     if ldir.exists():
         for p in ldir.rglob("*.jsonl"):
@@ -124,9 +132,10 @@ def sweep(cache_dir: str | os.PathLike, modules: list[str], dry_run: bool = Fals
             for raw in lines:
                 try:
                     d = json.loads(raw)
-                    reachable.update((d["labels"], d["v"]))
-                except (ValueError, KeyError, TypeError):
+                except ValueError:
                     continue
+                if "labels" in d and "v" in d:
+                    reachable.update((d["labels"], d["v"]))
 
     # -- objects nothing above names, transitively ----------------------------
     queue = list(reachable)
@@ -149,6 +158,8 @@ def sweep(cache_dir: str | os.PathLike, modules: list[str], dry_run: bool = Fals
         if p.stem not in reachable:
             counts["objects"] += 1
             remove(p)
+    if not dry_run:
+        store._listings.clear()
     return counts
 
 
@@ -158,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Delete call records, batches and objects the current code cannot reach.",
     )
     ap.add_argument("modules", nargs="+", help="modules defining the memoised functions")
-    ap.add_argument("--cache", help="cache directory (default: $VALUEKIT_CACHE)")
+    ap.add_argument("--store", help="store directory (default: $VALUEKIT_STORE)")
     ap.add_argument("--dry-run", action="store_true", help="report only")
     args = ap.parse_args(argv)
     sys.path.insert(0, os.getcwd())
@@ -170,9 +181,9 @@ def main(argv: list[str] | None = None) -> int:
     from .pure import _current_store
 
     store = _current_store()
-    cache = args.cache or getattr(store, "root", None) or os.environ.get("VALUEKIT_CACHE")
+    cache = args.store or getattr(store, "root", None) or os.environ.get("VALUEKIT_STORE")
     if not cache:
-        print("no cache directory: pass --cache or set VALUEKIT_CACHE", file=sys.stderr)
+        print("no store directory: pass --store or set VALUEKIT_STORE", file=sys.stderr)
         return 2
     del keys  # recomputed inside sweep(); importing twice is cheap
     counts = sweep(cache, args.modules, dry_run=args.dry_run)

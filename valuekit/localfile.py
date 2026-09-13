@@ -144,14 +144,14 @@ def _workers(path: Path, section: str, value) -> int:
 _MODE_LINE = re.compile(r"^\s*mode\s*=")
 
 
-def read_mode(root: str | os.PathLike | None, cache_dir: str | os.PathLike | None) -> str:
+def read_mode(root: str | os.PathLike | None, store_dir: str | os.PathLike | None) -> str:
     """The mode in force for the project at *root*; ``all`` when unset or
     the file is unreadable.
 
-    With no cache directory a host's results would have nowhere to land:
+    With no store directory a host's results would have nowhere to land:
     that case is ``local``.
     """
-    if cache_dir is None:
+    if store_dir is None:
         return "local"
     try:
         return load_local(root).mode

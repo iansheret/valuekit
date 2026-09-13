@@ -38,14 +38,14 @@ with `uv sync` from a lock file. The suite therefore needs `uv` on the PATH.
 `valuekit.local.toml`. The sequence for a host:
 
 1. The main process refuses before connecting if the project cannot go: no lock file valuekit
-   knows, or user code outside the project tree (`sync.Project.refusal`).
+   knows, or user code outside the project tree (`project.Project.refusal`).
 2. The main process opens one connection: `ssh -T -o BatchMode=yes <target> "<python> -c
    <stage 0>"`, where stage 0 is a one-line Python program that reads a script off stdin
    up to a NUL byte and runs it. The main process sends `valuekit/bootstrap.py` as that script.
 3. The bootstrap speaks a short JSON-line protocol on the same streams: it says whether
    `source_root/<project>` already holds this project hash, else reports the files it has;
    the main process sends the names to delete and a tar of the files whose hash differs; the
-   bootstrap applies both in place, runs the lock tool's sync (`uv sync --frozen --python
+   bootstrap applies both in place, runs the lock tool's install command (`uv sync --frozen --python
    <main process's minor>`), writes the manifest beside the directory (project hash, interpreter,
    every file's hash), and starts `python -m valuekit.hostprocess` from that interpreter with
    `VALUEKIT_TREE` and `VALUEKIT_PROJECT_HASH` set, on the same streams, in the environment
@@ -85,13 +85,13 @@ store         the main process's store over the channel   remotestore.py
 | `valuekit/localfile.py` | The local file: hosts, worker cap, mode, project name; reading and setting the mode line. |
 | `valuekit/modes.py` | What each mode means: the capacity each host has under it. |
 | `valuekit/hosts.py` | `Connection`/`ProcessConnection`, `LocalHost` (a process per input), `RemoteHost` (one connection, a channel per task), and the handle that answers a worker's store requests and runs its `@pure_local` calls. |
-| `valuekit/bootstrap.py` | How a tree becomes an environment on a host: the lock-tool table, the layout under `source_root`, extraction, the sync, starting the host process. Both halves of its protocol. Stdlib only. |
+| `valuekit/bootstrap.py` | How a tree becomes an environment on a host: the lock-tool table, the layout under `source_root`, extraction, the environment build, starting the host process. Both halves of its protocol. Stdlib only. |
 | `valuekit/hostprocess.py` | The host process: starts a worker per channel, multiplexes their streams, exits on EOF. |
 | `valuekit/worker.py` | The worker process: a check mode and a single-task mode; install, admit, audit. |
 | `valuekit/remotestore.py` | `RemoteStore`: the worker's side of the store, over its channel. |
 | `valuekit/protocol.py` | Message framing, channel framing, and value transfer as content-addressed object graphs. |
 | `valuekit/codec.py` | The structural value format, and the child-hash walk the sweep uses. |
-| `valuekit/sync.py` | `Project` (the project as shipped, once per batch), manifest, project hash, packing, import roots, and the path predicate that separates project from environment. |
+| `valuekit/project.py` | `Project` (the project as sent, once per batch), manifest, project hash, packing, import roots, and the path predicate that separates project from environment. |
 | `valuekit/functionhash.py` | Function hashes (the hash of a function's reachable set), including a native extension's marker as the project hash of the tree it was built from. |
 | `valuekit/batches.py` | Batch records: written by `run_all`, read by `valuekit.batch()`. |
 | `valuekit/runlog.py` | The run's log: the values a run logged, under `logs/<script>/`, written as steps log or hit, read by `valuekit.logs()`. |
@@ -191,7 +191,7 @@ process multiplexes worker streams by channel and exits when its stdin closes.
 local worker cap, the mode and the project's host directory name. It replaced
 `VALUEKIT_HOSTS` and `<cache>/placement`: it is about this checkout on this machine, so it
 is ignored by git (valuekit warns if it is tracked), never shipped, and never hashed. It
-does not configure the cache; `set_cache_dir` stays in code, so a checkout that never uses
+does not configure the cache; `set_store_dir` stays in code, so a checkout that never uses
 other machines needs no file. A checkout that wants its own host directory, a git
 worktree say, sets `project`.
 
@@ -388,7 +388,7 @@ import sys
 import valuekit as vk
 from valuekit import parallel, localfile
 
-vk.set_cache_dir(cache)
+vk.set_store_dir(cache)
 parallel._host_commands = {"here": [sys.executable]}
 vk.run_all(mymodule.work, [1, 2, 3])          # mode defaults to "all"
 vk.batch("work")[1]

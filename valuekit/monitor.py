@@ -19,8 +19,8 @@ shows the mode and, while a batch runs, what it means for the next task
 given which hosts are ready.  ``--mode <mode>`` sets the line and exits,
 for scripts.
 
-The cache directory is taken as an argument, falling back to
-``$VALUEKIT_CACHE``.  The project is the one enclosing the current
+The store directory is taken as an argument, falling back to
+``$VALUEKIT_STORE``.  The project is the one enclosing the current
 directory; run the monitor from inside the project, or the mode is shown
 as unknown and the keys do nothing.
 """
@@ -459,7 +459,7 @@ def _apply_key(project: str | None, key: str | None) -> bool:
 
 def _project_here() -> str | None:
     """The project enclosing the current directory, if any."""
-    from .sync import find_root
+    from .project import find_root
 
     return find_root(os.path.join(os.getcwd(), "pyproject.toml"))
 
@@ -472,8 +472,8 @@ def _project_here() -> str | None:
 def _usage() -> None:
     print(
         "usage: python -m valuekit.monitor [--mode local|remote|all] <cache-dir>\n"
-        "       (or set VALUEKIT_CACHE)\n\n"
-        "The cache directory is the one passed to set_cache_dir(); the event\n"
+        "       (or set VALUEKIT_STORE)\n\n"
+        "The store directory is the one passed to set_store_dir(); the event\n"
         "log is written under its events/ subdirectory. Nothing is recorded for\n"
         "a program that never configures a cache. The mode is a line in the\n"
         "valuekit.local.toml of the project enclosing the current directory:\n"
@@ -494,7 +494,7 @@ def main(argv: list[str] | None = None) -> int:
             _usage()
             return 2
         del args[at : at + 2]
-    root = args[0] if args else os.environ.get("VALUEKIT_CACHE")
+    root = args[0] if args else os.environ.get("VALUEKIT_STORE")
     if not root or mode is not None and mode not in modes.MODES:
         _usage()
         return 2
