@@ -170,8 +170,8 @@ call-record layout changed (each call record is its own file, under
 ### Remote execution groundwork
 
 - Scheduling is separated from where work runs. `run_all` keeps the admission
-  limit, deadlines, input ordering and failure attribution; a backend starts
-  and kills a unit of work and reports on it.
+  limit, deadlines, input ordering and failure attribution; a host starts
+  and kills a task and reports on it.
 - The value codec is free functions parameterised by how a child value is
   reached, so the same pickle-free format serves a directory on disk and a
   connection to a peer. A peer's object messages carry the same bytes the
@@ -201,9 +201,9 @@ call-record layout changed (each call record is its own file, under
   depends on it. `mypkg.sub.f()` spells `sub` and `f` as attribute names, which
   resolve to nothing at module scope, and a package's source file is only its
   `__init__.py` — so the walk stopped there and nothing sub.py said reached the
-  fingerprint. Editing sub.py left the fingerprint unchanged and `@pure` served
+  function hash. Editing sub.py left the function hash unchanged and `@pure` served
   the old result without executing. The same shape defeated `clear_cache(fn)`,
-  since callers never recorded the submodule's unit. Submodules named by the
+  since callers never recorded the submodule. Submodules named by the
   referencing function are now followed, at any depth, each classified in its
   own right so that a compiled extension inside a package is still identified
   by its binary rather than read as source. Reaching a submodule as a name
@@ -213,7 +213,7 @@ call-record layout changed (each call record is its own file, under
   `@pure` functions using that import style will recompute once. Results they
   cached before this release may have been computed from code that has since
   changed — if you have relied on this style, clearing the cache directory is
-  the cautious move, though results are not silently reused: the fingerprint
+  the cautious move, though results are not silently reused: the function hash
   now differs, so the affected entries are simply never consulted again.
 
 ## 0.3.0 — 2026-08-06
