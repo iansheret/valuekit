@@ -235,7 +235,7 @@ and during a batch it schedules the inputs and answers the workers. "Worker": a 
 one input and exits, started by the main process here or by a host process on a remote host.
 "Check": the worker-module process that imports the function on a host and checks it,
 running no input. "Mode": which hosts are used. "Connection": the
-link to a remote host.
+two byte streams to a process on a remote host.
 
 ## Outstanding work
 
@@ -341,7 +341,7 @@ user's shell's job, as the README says.
    risk into an explicit refusal, at the cost of a format-version bump. Less pressing now that
    the bootstrap asks the lock tool for the main process's minor.
 
-5. **Verify a reported instability in `_unit_digest`** (a frozenset constant's `repr`
+5. **Verify a reported instability in the function hash** (a frozenset constant's `repr`
    varying with `PYTHONHASHSEED`). The evidence offered did not support the claim.
 
 ### Later
@@ -351,7 +351,7 @@ user's shell's job, as the README says.
    real limit is bandwidth to the main process's store; a bucket holding objects by hash would
    be a second tier, after the streaming version works.
 
-7. **Collapse `LocalBackend` into a host process launched as a subprocess.** One code path;
+7. **Collapse `LocalHost` into a host process launched as a subprocess.** One code path;
    inputs narrowed to storable types locally as they are remotely.
 
 8. **Moving a running task.** A mode switch applies to the next task started; a task

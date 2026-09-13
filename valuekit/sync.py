@@ -46,6 +46,7 @@ from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 from typing import Any, Iterable
 
+from .localfile import LOCAL_FILE
 from .values import _frame, _new_hasher
 
 __all__ = [
@@ -80,7 +81,7 @@ _SKIP_DIRS = frozenset(
 
 # Never shipped and never hashed: the local file says where a computation
 # runs, which must not be able to affect a result.
-_SKIP_FILES = frozenset({"valuekit.local.toml"})
+_SKIP_FILES = frozenset({LOCAL_FILE})
 
 MAX_BYTES = 256 << 20  # a project tree, not a data directory
 MAX_FILES = 20_000

@@ -58,7 +58,7 @@ REEMITTED = b"\x19"  # main   -> worker: empty once emitted, or why not
 
 # Between the main process and a host process (valuekit.hostprocess), which runs one
 # worker per task and carries each worker's stream as a numbered channel.
-HOST = b"\x11"  # host -> main process: on start, its salt, CPU count and pid
+HOST = b"\x11"  # host -> main process: on start, its Python version, CPU count and pid
 OPEN = b"\x12"  # main   -> host: channel id, then "check" or "task"
 DATA = b"\x13"  # both: channel id, then bytes of that worker's stdin or stdout
 CLOSE = b"\x14"  # main   -> host: channel id; close the worker's stdin

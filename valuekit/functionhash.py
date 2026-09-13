@@ -11,7 +11,7 @@ its names resolve to.  The walk stops at boundaries:
   from a local directory, editable or not, and so rebuilt in place --
   contribute the hash of their binary on the main process;
 * the standard library contributes ``std:<module>`` (the Python version is
-  already part of the global salt);
+  a marker in the hash);
 * user modules referenced *as modules* (``mymod.helper()``) contribute a hash
   of the module's source file, and a package's submodules are followed
   through attribute access (``mypkg.sub.f()`` depends on sub.py, not only on
@@ -28,8 +28,8 @@ matter and mutual recursion works.  The decorated function's own code
 object is captured at decoration time, before a debugger patches its
 bytecode.
 
-The walk's product is the function's *reachable set*: its hash is the code
-hash that names the function's call records, and its spans (filename,
+The walk's product is the function's *reachable set*: its hash is the
+function hash that names the function's call records, and its spans (filename,
 first line, last line, one per user code object reached) are what the
 debugger hook intersects live breakpoints against to decide when a cache
 hit must be bypassed.  The Python major and minor version is a marker in
@@ -536,8 +536,8 @@ def reachable_set(fn: Callable, *, code: types.CodeType | None = None) -> Reacha
 # Registry wiring: functions as *values*
 # ---------------------------------------------------------------------------
 #
-# A function passed as an argument to a @pure function is hashed by its code
-# function_hash (including defaults and captured closure values), so lambdas
+# A function passed as an argument to a @pure function is hashed by its
+# function hash (including defaults and captured closure values), so lambdas
 # work as parameters. Functions are treated as immutable for freezing
 # purposes. They have no serialiser: a function may be an input, but cannot
 # appear inside a cached return value.

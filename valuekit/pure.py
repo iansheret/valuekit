@@ -392,7 +392,7 @@ def _pure(fn: Callable, *, local: bool):
                 value = store.get_value(record["result"])
                 runlog.reemit(store, function_hash, h, record)
             except CacheMiss:
-                continue  # value or a logged value evicted: try others, else rerun
+                continue  # the value, or a logged value, is gone: try others, else rerun
             events.record(
                 store, "hit", fn=qn, key=function_hash, dur=time.perf_counter() - t_lookup
             )

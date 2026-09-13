@@ -555,7 +555,7 @@ def run_all(
                     raise RuntimeError(
                         "no host can run this batch: every capacity is zero"
                     )
-                _drain(block=True)  # a host is on its way; wait for it
+                _drain(block=True)  # a host is still syncing; wait for it
                 continue
             _drain(block=True)
             now = time.monotonic()
@@ -575,7 +575,7 @@ def run_all(
                 busy[t.where] -= 1
                 t.handle.reap()
                 if msg is None and not t.timed_out and t.handle.lost():
-                    # The host went away; the input is not done, not
+                    # The connection closed; the input is not done, not
                     # failed.  Run it again elsewhere, once: an input that
                     # takes a host down each time is a failure after all.
                     if t.idx not in moved:

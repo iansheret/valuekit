@@ -82,7 +82,7 @@ class _State:
         self.batches: dict[tuple, dict] = {}
         self.failures: list[tuple] = []
         self.hosts: dict[tuple, dict] = {}  # (source, host) -> the sync's outcome
-        self.per_machine: dict[str, dict[str, dict]] = {}  # source -> host -> counts
+        self.per_host: dict[str, dict[str, dict]] = {}  # source -> host -> counts
 
     def apply(self, source: str, e: dict) -> None:
         ev = e.get("ev")
@@ -124,18 +124,18 @@ class _State:
             return
 
         if ev == "start":
-            self._machine_counts(source, e.get("host", "local"))["running"] += 1
+            self._host_counts(source, e.get("host", "local"))["running"] += 1
             return
 
         if ev == "requeue":
             # The host went away under this input; it will start again
             # elsewhere and be counted there.
-            counts = self._machine_counts(source, e.get("host", "local"))
+            counts = self._host_counts(source, e.get("host", "local"))
             counts["running"] = max(0, counts["running"] - 1)
             return
 
         if ev == "outcome":
-            counts = self._machine_counts(source, e.get("host", "local"))
+            counts = self._host_counts(source, e.get("host", "local"))
             counts["running"] = max(0, counts["running"] - 1)
             counts["done"] += 1
             if not e.get("ok", True):
@@ -163,8 +163,8 @@ class _State:
                 "capacity": e.get("capacity"),
             }
 
-    def _machine_counts(self, source: str, host: str) -> dict:
-        return self.per_machine.setdefault(source, {}).setdefault(
+    def _host_counts(self, source: str, host: str) -> dict:
+        return self.per_host.setdefault(source, {}).setdefault(
             host, {"running": 0, "done": 0, "failed": 0}
         )
 
@@ -258,7 +258,7 @@ def _render(
     for name in (
         *configured,
         *(h for s, h in state.hosts if s in scope),
-        *(h for s in scope for h in state.per_machine.get(s, ())),
+        *(h for s in scope for h in state.per_host.get(s, ())),
     ):
         if name not in names and name != "local":
             names.append(name)
@@ -297,7 +297,7 @@ def _render(
             cap = caps.get(name) if caps else None
             counts = {"running": 0, "done": 0, "failed": 0}
             for s in scope:
-                c = state.per_machine.get(s, {}).get(name)
+                c = state.per_host.get(s, {}).get(name)
                 if c:
                     for k in counts:
                         counts[k] += c[k]

@@ -161,33 +161,11 @@ call-record layout changed (each call record is its own file, under
   ninja for an extension that rebuilds on import, say) are on the workers'
   PATH. A tree with no known lock is refused before anything is sent.
 - One connection per host carries every task: a host process
-  (`python -m valuekit.host`) starts a worker per task and multiplexes their
+  (`python -m valuekit.hostprocess`) starts a worker per task and multiplexes their
   streams, so a thousand inputs cost one ssh handshake. The host process
   exits, killing its workers, when the connection closes.
-- A native extension's identity in the fingerprint is the tree it was built
-  from, not its binary: each host builds its own from the same sources, so
-  keys match across machines with nothing sent between them to make it so.
-  Any edit in the project re-keys functions that reach an extension.
-- Where work goes is a mode, the `mode` line of `valuekit.local.toml`: `all`
-  (the default: every configured host, plus this machine), `local`, or
-  `remote` (as little here as possible). The main process re-reads it each time it
-  starts a task, so a switch mid-batch moves the next task. The monitor
-  shows the mode and what it means for the next task, and sets it on a
-  keystroke; `--mode` sets it from a script. That line is the only
-  thing the monitor writes.
-- Preparing a host never holds the batch back: this machine starts at once
-  and a host joins when ready. Under `remote` this machine stays idle while
-  a host is on its way.
-- A host that fails readiness is dropped with the reason recorded once and the
-  batch continues. A host whose connection drops loses nothing: the inputs
-  running there are run again elsewhere, once, and the host takes no more.
-  `remote` mode with no reachable host runs locally and records why.
-- The monitor gains a `hosts` block: capacity, running, finished and failed
-  per place, and whether each host was reached.
-- Scheduling waits on one inbox fed by threads, for local processes and host
-  connections alike; there is no `select`, and no platform-specific waiting.
-  The connection itself is one small object (a process's pipes today), so a
-  different transport later touches nothing above it.
+- A native extension's marker in the function hash is the hash of the main
+  process's build of it, sent to workers (see the entry under Changed).
 
 ### Remote execution groundwork
 
@@ -196,22 +174,22 @@ call-record layout changed (each call record is its own file, under
   and kills a unit of work and reports on it.
 - The value codec is free functions parameterised by how a child value is
   reached, so the same pickle-free format serves a directory on disk and a
-  connection to a peer. A peer's object frames carry the same bytes the
+  connection to a peer. A peer's object messages carry the same bytes the
   store writes, so they are stored without being decoded.
-- A worker that speaks a framed protocol over a pipe, with a handshake that
-  recomputes the function's fingerprint and refuses if the code it would run
+- A worker that speaks a message protocol over a pipe, with a handshake that
+  recomputes the function's function hash and refuses if the code it would run
   is not the code the main process meant. It runs on this machine, which is the
   point: everything is exercised in CI with no network involved.
 - Code sync. The main process describes its project as a manifest -- tracked files
   plus untracked ones that are not ignored -- and the host unpacks an
   immutable source tree named by the manifest hash, which workers import
   from.  Build artefacts are never shipped, whatever platform names them.
-- A readiness phase, once per host rather than once per input, and an audit
+- A sync, once per host rather than once per input, and an checks
   after importing that every user module actually came from the source tree.
 - A worker holds no cache. Its store is the main process's store, reached over the
-  connection: every value, trace and run-log record it produces goes to the
+  connection: every value, call record and event it produces goes to the
   main process, every lookup asks the main process, and a `@pure_local` call runs on the
-  main process. A batch's results exist in one place however many machines ran it.
+  main process. A batch's results exist in one host however many machines ran it.
 - A worker's environment is an allowlist of what a process needs to start,
   plus `VALUEKIT_*`. Nothing else of the main process's crosses.
 

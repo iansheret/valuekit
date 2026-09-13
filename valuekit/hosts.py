@@ -17,7 +17,7 @@ the one primitive every platform gives a pipe, which is why there is no
 ``select`` here.
 
 The handle carries a three-variant message back, the same union the local
-worker has always sent: ``("ok", value)``, ``("err", exc, tb)``, or
+worker sends: ``("ok", value)``, ``("err", exc, tb)``, or
 ``("err_str", type_name, text, tb)`` when the exception itself could not be
 sent.  A handle that yields no message at all died, which the scheduler
 already knows how to attribute.
@@ -56,7 +56,7 @@ from typing import Any, BinaryIO, Callable, Protocol
 
 from .codec import SerializationError
 
-__all__ = ["Backend", "Handle", "Connection", "ProcessConnection", "LocalHost", "RemoteHost"]
+__all__ = ["Handle", "Connection", "ProcessConnection", "LocalHost", "RemoteHost"]
 
 
 class Handle(Protocol):
@@ -87,15 +87,6 @@ class Handle(Protocol):
         connection that closes under a worker has said nothing about the
         input at all, and the scheduler may run it elsewhere.
         """
-
-
-class Backend(Protocol):
-    """Somewhere work can run."""
-
-    name: str
-
-    def start(self, x: Any) -> Handle: ...
-    def close(self) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +177,7 @@ class _LocalHandle:
         )
 
     def lost(self) -> bool:
-        return False  # this machine does not go away
+        return False  # a local process's exit is always reported
 
 
 class LocalHost:
@@ -266,7 +257,7 @@ class _Handle:
     """
 
     __slots__ = (
-        "ch", "objects", "seen", "completions", "out", "_machine", "_failure",
+        "ch", "objects", "seen", "completions", "out", "_host", "_failure",
         "_buf", "_result", "_eof", "_exit", "_stderr", "_lock", "_messages", "_raw",
     )
 
@@ -276,7 +267,7 @@ class _Handle:
         self.seen: set[str] = set()
         self.completions = completions
         self.out = _ChannelWriter(host._send, ch)
-        self._machine = host
+        self._host = host
         self._failure: str | None = None
         self._buf = b""
         self._result: tuple | None = None
@@ -380,7 +371,7 @@ class _Handle:
             protocol.write_message(self.out, tag, body)
 
     def _store(self):
-        return self._machine._store
+        return self._host._store
 
     def _fallback(self):
         store = self._store()
@@ -411,7 +402,7 @@ class _Handle:
                     protocol.write_message(self.out, protocol.VALUE, b"")
         elif tag == protocol.EVENT:
             record = json.loads(body)
-            record.setdefault("host", self._machine.name)
+            record.setdefault("host", self._host.name)
             events.record(store, record.pop("ev", "?"), **record)
         elif tag == protocol.LOGGED:
             from . import runlog
@@ -433,7 +424,7 @@ class _Handle:
         elif tag == protocol.CALL:
             module, qualname, root = protocol.unstrings(body)
             args, kwargs = protocol.unpack(root, self.objects, self._fallback())
-            self._machine._submit(self._run_call, protocol, module, qualname, args, kwargs)
+            self._host._submit(self._run_call, protocol, module, qualname, args, kwargs)
         else:
             raise protocol.ProtocolError(f"unexpected message {tag!r}")
 
@@ -470,13 +461,13 @@ class _Handle:
     def kill(self) -> None:
         from . import protocol
 
-        self._machine._send(protocol.KILL, protocol.channelled(self.ch))
+        self._host._send(protocol.KILL, protocol.channelled(self.ch))
 
     def reap(self) -> None:
         from . import protocol
 
-        self._machine._send(protocol.CLOSE, protocol.channelled(self.ch))
-        self._machine._forget(self.ch)
+        self._host._send(protocol.CLOSE, protocol.channelled(self.ch))
+        self._host._forget(self.ch)
 
     def lost(self) -> bool:
         return (
@@ -489,14 +480,14 @@ class _Handle:
     def death(self) -> str:
         tail = self._stderr.decode("utf-8", "replace").strip()
         if self._exit is None:
-            why = f"the connection to host {self._machine.name!r} closed"
+            why = f"the connection to host {self._host.name!r} closed"
         else:
-            why = f"exit code {self._exit} on host {self._machine.name!r}"
+            why = f"exit code {self._exit} on host {self._host.name!r}"
         return f"{why}:\n{tail}" if tail else f"{why}; a segfault or a broken pipe?"
 
 
 # ---------------------------------------------------------------------------
-# a link: bytes to and from a process somewhere
+# a connection: bytes to and from a process somewhere
 # ---------------------------------------------------------------------------
 
 
@@ -522,7 +513,7 @@ class Connection(Protocol):
 
 class ProcessConnection:
     """A process on this machine, or on another through ssh: its stdin and
-    stdout are the link, its stderr is kept for the failure message."""
+    stdout are the connection, its stderr is kept for the failure message."""
 
     def __init__(self, command: list[str]):
         self.command = command

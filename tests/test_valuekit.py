@@ -204,7 +204,7 @@ def _fp(fn, **kw):
         return reachable_set(fn, **kw).hash
 
 
-class TestCodeHash:
+class TestFunctionHash:
     def test_body_change_changes_hash(self):
         def f(x):
             return x + 1
@@ -771,14 +771,14 @@ class TestStore:
         with pytest.raises(RuntimeError):
             LocalStore(tmp_path)
 
-    def test_trace_dedup(self, tmp_path):
+    def test_record_dedup(self, tmp_path):
         s = LocalStore(tmp_path)
         t = {"fn": "f", "deps": {}, "result": "0" * 40}
         s.put_record("k", t)
         s.put_record("k", dict(t))
         assert len(s.get_records("k")) == 1
 
-    def test_concurrent_trace_writes_survive_across_processes(self, tmp_path):
+    def test_concurrent_record_writes_survive_across_processes(self, tmp_path):
         # Parallel writers used to drop each other's call records on Windows,
         # where an O_APPEND write is a seek followed by a write. Every record
         # is now its own content-named file, so there is nothing shared to
@@ -802,7 +802,7 @@ class TestStore:
         assert len(got) == 400
         assert all(h == record_hash(t) for h, t in got)
 
-    def test_put_trace_returns_hash_and_get_traces_pairs(self, tmp_path):
+    def test_put_record_returns_hash_and_get_records_pairs(self, tmp_path):
         s = LocalStore(tmp_path)
         t = {"fn": "f", "deps": {}, "result": "0" * 40}
         h = s.put_record("k", t)
@@ -810,7 +810,7 @@ class TestStore:
         assert (tmp_path / "records" / "k" / f"{h}.json").exists()
         assert s.get_records("k") == [(h, t)]
 
-    def test_corrupt_trace_file_skipped(self, tmp_path):
+    def test_corrupt_record_file_skipped(self, tmp_path):
         # A file that does not parse, and one whose bytes do not hash to its
         # name (a torn write, or an edit), are both ignored: a miss at worst.
         s = LocalStore(tmp_path)
@@ -821,7 +821,7 @@ class TestStore:
         (d / f"{'2' * 40}.json").write_bytes(b'{"fn": "g", "deps": {}}')
         assert s.get_records("k") == [(h, t)]
 
-    def test_get_traces_newest_first(self, tmp_path):
+    def test_get_records_newest_first(self, tmp_path):
         s = LocalStore(tmp_path)
         old = {"fn": "f", "deps": {}, "result": "0" * 40}
         new = {"fn": "f", "deps": {}, "result": "1" * 40}
@@ -863,7 +863,7 @@ class TestStore:
         assert target.read_bytes() == b"same"
         assert not list(tmp_path.glob(".tmp-*"))
 
-    def test_drop_records_removes_one_functions_traces(self, tmp_path):
+    def test_drop_records_removes_one_functions_records(self, tmp_path):
         s = LocalStore(tmp_path)
         s.put_record("k", {"fn": "f", "deps": {}, "result": "0" * 40})
         s.put_record("j", {"fn": "g", "deps": {}, "result": "0" * 40})
@@ -1517,7 +1517,7 @@ class TestPure:
         assert f(ImmutableMap({"a": 1, "b": 2, "c": 3})) == 6  # any change invalidates
         assert len(calls) == 2
 
-    def test_conditional_reads_get_separate_traces(self, cache):
+    def test_conditional_reads_get_separate_records(self, cache):
         calls = []
 
         @pure
@@ -1967,7 +1967,7 @@ class TestTransparency:
         )
         assert len(calls) == 2
 
-    def test_trace_records_arguments_as_passed(self, cache):
+    def test_a_record_holds_arguments_as_passed(self, cache):
         # Mutating an argument breaks the purity contract, but the record is
         # still keyed on what was handed in, so the call is reusable.
         calls = []
@@ -2013,7 +2013,7 @@ class TestTransparency:
 
 
 class TestNestedPure:
-    def test_map_passed_inward_records_in_both_traces(self, cache):
+    def test_map_passed_inward_records_in_both_records(self, cache):
         calls = []
 
         @pure
@@ -2341,7 +2341,7 @@ class TestCallRecords:
         assert {t["calls"][0][2], t["calls"][2][2]} == a_hashes
         assert t["logs"] == []
 
-    def test_a_hit_records_the_trace_it_matched(self, cache):
+    def test_a_hit_records_the_record_it_matched(self, cache):
         n = []
 
         @pure
@@ -2361,7 +2361,7 @@ class TestCallRecords:
         assert t["calls"] == [[inner.__qualname__, inner._valuekit_reachable().hash, h_inner]]
         assert len(LocalStore(cache).get_records(inner._valuekit_reachable().hash)) == 1
 
-    def test_log_records_context_and_value_in_the_trace(self, cache):
+    def test_log_records_labels_and_value_in_the_record(self, cache):
         from valuekit import runlog
 
         @pure
@@ -2600,7 +2600,7 @@ class TestRunLog:
         with pytest.raises(TypeError):
             vk.logs().where(cfg=[1])
 
-    def test_a_hit_emits_what_its_trace_recorded(self, cache):
+    def test_a_hit_emits_what_its_record_holds(self, cache):
         n = []
 
         @pure
@@ -2623,7 +2623,7 @@ class TestRunLog:
         assert len(L.where(q="outer")) == 2 and len(L.where(q="inner")) == 4
         assert {it.value for it in L.where(q="inner")} == {10}
 
-    def test_a_new_execution_replaces_the_last(self, cache, monkeypatch):
+    def test_a_new_run_replaces_the_last(self, cache, monkeypatch):
         @pure
         def f(x):
             vk.log({"q": "v"}, x)
@@ -2657,7 +2657,7 @@ class TestRunLog:
         with pytest.raises(LookupError):
             vk.logs("other")
 
-    def test_a_hit_whose_logged_item_is_gone_recomputes(self, cache):
+    def test_a_hit_whose_logged_value_is_gone_recomputes(self, cache):
         n = []
 
         @pure
@@ -2668,7 +2668,7 @@ class TestRunLog:
 
         f(1)
         [npy] = list((cache / "objects").rglob("*.npy*"))
-        npy.unlink()  # evicted: the record can no longer stand in for the call
+        npy.unlink()  # deleted: the record can no longer be served for the call
         f(1)
         assert n == [1, 1]
         items = vk.logs().where(q="big")
@@ -2676,7 +2676,7 @@ class TestRunLog:
         for it in items:  # the same content, so the second run restored the first's value too
             np.testing.assert_array_equal(it.value, np.arange(100.0))
 
-    def test_a_hit_whose_nested_trace_is_gone_recomputes(self, cache):
+    def test_a_hit_whose_nested_record_is_gone_recomputes(self, cache):
         import shutil
 
         n = []
@@ -3338,7 +3338,7 @@ class TestLocalFile:
         assert env["VALUEKIT_CACHE"] == "y" and "PATH" in env
 
 
-class TestPlacementScheduling:
+class TestScheduling:
     """Where tasks go: capacities per host, remote hosts first, the mode
     file re-read at every start, and a host that fails or dies dropped."""
 
@@ -3349,7 +3349,7 @@ class TestPlacementScheduling:
     def _local_workers(self, tmp_path, monkeypatch, n):
         _local_file(tmp_path, f"[local]\nworkers = {n}\n")
 
-    def test_mode_all_fills_remote_places_first(self, cache, tmp_path, monkeypatch):
+    def test_mode_all_fills_remote_hosts_first(self, cache, tmp_path, monkeypatch):
         from valuekit import localfile
 
         monkeypatch.setattr(
@@ -3491,8 +3491,8 @@ class TestMonitor:
             ]
         )
         assert st.hosts[("run.jsonl", "mac")]["capacity"] == 8
-        assert st.per_machine["run.jsonl"]["mac"] == {"running": 1, "done": 1, "failed": 0}
-        assert st.per_machine["run.jsonl"]["local"] == {"running": 0, "done": 1, "failed": 1}
+        assert st.per_host["run.jsonl"]["mac"] == {"running": 1, "done": 1, "failed": 0}
+        assert st.per_host["run.jsonl"]["local"] == {"running": 0, "done": 1, "failed": 1}
         assert st.hosts[("run.jsonl", "pc")]["ok"] is False
 
     def test_render_shows_the_mode_and_the_hosts(self):
@@ -3663,7 +3663,7 @@ class TestEventLog:
         (_, hit), = _records(cache, "hit")
         assert "exec" not in hit
 
-    def test_evicted_value_is_not_reported_as_a_hit(self, cache):
+    def test_a_deleted_value_is_not_reported_as_a_hit(self, cache):
         # A record can match and the value still be gone; the lookup falls
         # through to the next candidate, so reporting the match would
         # overcount hits.
@@ -3800,7 +3800,7 @@ class TestEventLog:
 # exercised in CI without ssh being configured anywhere.
 
 
-class TestWire:
+class TestProtocol:
     def test_every_storable_type_round_trips(self):
         ro = np.arange(4.0)
         ro.flags.writeable = False
@@ -3839,14 +3839,14 @@ class TestWire:
         _, again = protocol.pack(v, seen=set(first))
         assert again == {}
 
-    def test_a_frame_round_trips(self):
+    def test_a_message_round_trips(self):
         buf = io.BytesIO()
         protocol.write_message(buf, protocol.TASK, b"payload")
         buf.seek(0)
         assert protocol.read_message(buf) == (protocol.TASK, b"payload")
         assert protocol.read_message(buf) is None  # clean end of stream
 
-    def test_a_truncated_frame_is_a_transport_error(self):
+    def test_a_truncated_message_is_a_transport_error(self):
         buf = io.BytesIO()
         protocol.write_message(buf, protocol.TASK, b"payload")
         cut = io.BytesIO(buf.getvalue()[:-3])
@@ -3968,7 +3968,7 @@ def _settle(handle, completions, timeout=30):
         h.feed(payload)
 
 
-class TestRemoteMachine:
+class TestRemoteHost:
     """Batches through a host process on this host, in remote mode."""
 
     @pytest.fixture(autouse=True)
@@ -4079,7 +4079,7 @@ class TestRemoteMachine:
         assert failed == [(9, "TimeoutError")]
         assert r[0].result() == 70 and r[2].result() == 80
 
-    def test_a_breakpoint_still_short_circuits_before_any_backend(
+    def test_a_breakpoint_still_short_circuits_before_any_host(
         self, cache, tmp_path, monkeypatch
     ):
         import bdb

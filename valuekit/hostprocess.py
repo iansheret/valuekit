@@ -8,7 +8,7 @@ channel, so a batch of a thousand inputs costs one ssh handshake rather than
 a thousand.  (The Windows ssh client has no connection sharing, which is
 what rules out a connection per task.)
 
-    host   -> HOST    salt, CPU count, pid
+    host   -> HOST    Python version, CPU count, pid
     main   -> OPEN    channel, "check" | "task"     start a worker
     main   -> DATA    channel, bytes                 to that worker's stdin
     host   -> DATA    channel, bytes                 from that worker's stdout
