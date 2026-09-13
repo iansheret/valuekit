@@ -409,18 +409,22 @@ class _Handle:
 
             if store is not None:
                 runlog.write_line(store, body.decode())
-        elif tag == protocol.REEMIT:
+        elif tag == protocol.HIT:
             from . import runlog
 
             function_hash, h = protocol.unstrings(body)
-            reason = b""
             try:
                 if store is None:
                     raise CacheMiss("the main process has no cache directory")
-                runlog.reemit(store, function_hash, h, store.get_record(function_hash, h))
+                record = store.get_record(function_hash, h)
+                v = store.get_value(record["result"])
+                runlog.reemit(store, function_hash, h, record)
             except CacheMiss as e:
-                reason = str(e).encode() or b"unreadable"
-            self._write_message(protocol.REEMITTED, reason)
+                self._write_message(protocol.VALUE, str(e).encode() or b"unreadable")
+            else:
+                with self._lock:
+                    protocol.send_value(self.out, v, self.seen)
+                    protocol.write_message(self.out, protocol.VALUE, b"")
         elif tag == protocol.CALL:
             module, qualname, root = protocol.unstrings(body)
             args, kwargs = protocol.unpack(root, self.objects, self._fallback())

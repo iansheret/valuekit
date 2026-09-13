@@ -53,8 +53,8 @@ VALUE = b"\x0e"  # main   -> worker: empty once sent, or why not
 CALL = b"\x0f"  # worker -> main process: run this @pure_local call here
 CALLED = b"\x10"  # main   -> worker: its result root and record hash, or error
 LOGGED = b"\x17"  # worker -> main process: one runlog line (a log() call there)
-REEMIT = b"\x18"  # worker -> main process: emit what this call record recorded (fn key, hash)
-REEMITTED = b"\x19"  # main   -> worker: empty once emitted, or why not
+HIT = b"\x18"  # worker -> main process: it is taking this call record as a hit (fn hash, record hash);
+                #   the reply is the result's objects then VALUE, or VALUE with why not
 
 # Between the main process and a host process (valuekit.hostprocess), which runs one
 # worker per task and carries each worker's stream as a numbered channel.

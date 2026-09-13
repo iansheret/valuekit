@@ -389,8 +389,7 @@ def _pure(fn: Callable, *, local: bool):
         """
         for h, record in _matches(store, function_hash, arguments, arg_hashes):
             try:
-                value = store.get_value(record["result"])
-                runlog.reemit(store, function_hash, h, record)
+                value = _take_hit(store, function_hash, h, record)
             except CacheMiss:
                 continue  # the value, or a logged value, is gone: try others, else rerun
             events.record(
@@ -399,6 +398,17 @@ def _pure(fn: Callable, *, local: bool):
             _note_call(qn, function_hash, h)
             return (value,)
         return None
+
+    def _take_hit(store, function_hash, h, record):
+        """The record's result, with its logged values written to the run's
+        log.  A worker on a remote host asks the main process to do both;
+        here the value is loaded first, so a missing value emits nothing."""
+        remote = getattr(store, "hit", None)
+        if remote is not None:
+            return remote(function_hash, h, record["result"])
+        value = store.get_value(record["result"])
+        runlog.reemit(store, function_hash, h, record)
+        return value
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):

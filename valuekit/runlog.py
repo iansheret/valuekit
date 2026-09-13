@@ -249,13 +249,8 @@ def reemit(store: Any, function_hash: str, h: str, record: dict) -> None:
     """Emit again what a hit's call record holds, nested calls included.
 
     Raises :class:`CacheMiss` if the subtree cannot be read whole, and then
-    emits nothing: the caller treats the hit as a miss.  In a remote
-    worker the main process walks its own store and answers.
+    emits nothing: the caller treats the hit as a miss.
     """
-    remote = getattr(store, "reemit", None)
-    if remote is not None:
-        remote(function_hash, h)
-        return
     entries = collect(store, record)
     if not entries:
         return
