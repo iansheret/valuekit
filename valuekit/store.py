@@ -70,6 +70,7 @@ __all__ = [
 ]
 
 FORMAT_VERSION = 8
+_MTIME_STEP = 1_000_000_000  # ns: a directory mtime moved by hand moves by this much
 
 
 class CacheMiss(Exception):
@@ -353,10 +354,11 @@ class LocalStore:
             _atomic_write(path, data)
             # The write moves the directory's mtime, which is how another
             # store notices; on a filesystem with coarse mtime it may not
-            # have, so move it by hand.
+            # have, so move it by hand, by more than any filesystem's
+            # resolution (NTFS keeps 100 ns, HFS+ one second).
             try:
                 if d.stat().st_mtime_ns <= before:
-                    t = max(time.time_ns(), before + 1)
+                    t = max(time.time_ns(), before + _MTIME_STEP)
                     os.utime(d, ns=(t, t))
             except OSError:
                 pass

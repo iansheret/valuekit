@@ -851,13 +851,16 @@ class TestStore:
         # directory's mtime where it was; put_record then moves it by hand.
         # Setting the mtime ahead of the clock makes the next write's
         # natural mtime read as not moved.
+        from valuekit import store as store_mod
+
         s = LocalStore(tmp_path)
         s.put_record("k", {"fn": "f", "deps": {}, "result": "0" * 40})
         d = tmp_path / "records" / "k"
         ahead = time.time_ns() + 3_600 * 10**9
         os.utime(d, ns=(ahead, ahead))
+        ahead = d.stat().st_mtime_ns  # as the filesystem keeps it
         s.put_record("k", {"fn": "f", "deps": {}, "result": "1" * 40})
-        assert d.stat().st_mtime_ns == ahead + 1
+        assert d.stat().st_mtime_ns == ahead + store_mod._MTIME_STEP
 
     def test_atomic_write_onto_existing_target_is_success(self, tmp_path, monkeypatch):
         # Windows refuses to replace a file another process has mapped. The
