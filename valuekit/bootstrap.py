@@ -63,6 +63,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -81,21 +82,73 @@ __all__ = [
 ]
 
 # The table.  A row is what one lock tool needs said about it: its
-# executable, the command that installs the locked environment for a given Python
-# (``{python}``: this interpreter's path when it has the minor version the
-# main process runs, else that minor for the tool to find or fetch), where the
-# interpreter then is, relative to the tree, and where the executable
-# is when a non-interactive shell's PATH is short.
+# executable; the command that installs the locked environment for a given
+# Python (``{python}``: this interpreter's path when it has the minor version
+# the main process runs, else that minor for the tool to find or fetch); the
+# command that installs it and rebuilds the project itself (``{dist}``: the
+# project's distribution name), which is the project's build step; where the
+# interpreter then is, relative to the tree; and where the executable is when
+# a non-interactive shell's PATH is short.
 _TOOLS = {
     "uv.lock": {
         "tool": "uv",
         "install": ("sync", "--frozen", "--python", "{python}"),
+        "rebuild": ("sync", "--frozen", "--reinstall-package", "{dist}", "--python", "{python}"),
         "interpreters": (".venv/bin/python", ".venv/Scripts/python.exe"),
         "search": ("~/.local/bin", "~/.cargo/bin"),
     },
 }
 
 KNOWN_LOCKS = tuple(_TOOLS)
+
+# The files whose change means the project must be rebuilt.  The project may
+# list them in pyproject.toml, as globs relative to its root::
+#
+#     [tool.valuekit]
+#     build-inputs = ["CMakeLists.txt", "src/**/*.c"]
+#
+# Without the list, every file that is not a Python source counts, since
+# valuekit does not know what the build reads.  pyproject.toml and the lock
+# file always count: the first defines the build, the second the environment.
+# Python sources never need a build: the project is installed editable and
+# they are imported from the tree.
+ALWAYS_BUILD_INPUTS = ("pyproject.toml",) + KNOWN_LOCKS
+_PYTHON_SUFFIXES = (".py", ".pyi")
+
+
+def is_build_input(rel: str, patterns=None) -> bool:
+    """Whether a change to the file at *rel* (a path relative to the project
+    root, with ``/`` separators) means the project must be rebuilt."""
+    if rel in ALWAYS_BUILD_INPUTS:
+        return True
+    if patterns is None:
+        return not rel.endswith(_PYTHON_SUFFIXES)
+    return any(_glob_regex(p).match(rel) for p in patterns)
+
+
+def _glob_regex(pattern: str):
+    """*pattern* as a regular expression: ``*`` and ``?`` stay within one
+    path component, ``**`` crosses components."""
+    out = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif c == "*":
+            out.append("[^/]*")
+            i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
 
 # Reads this module's source off stdin up to a NUL and runs it; exits if the
 # stream ends first (a main process that exited before sending it), rather than
@@ -145,21 +198,26 @@ def _script() -> bytes:
     return _source
 
 
-def offer(rx, tx, source_root: str, project: str, project_hash: str, py_minor: str, entries, pack, run: str = "") -> str:
+def offer(
+    rx, tx, source_root: str, project: str, project_hash: str, py_minor: str, entries, pack,
+    run: str = "", dist: str = "", build_inputs=None,
+) -> str:
     """Bring the host at the far end of *rx*/*tx* to a running host process.
 
     *entries* is the manifest, ``(relpath, hash)`` pairs; *pack* is called
     with the subset of them the host lacks, only if it lacks any.  *run*
     names the main process, for the refusal a busy host gives another run.
-    Returns "" once the host process is about to send its first message,
-    else why not.
+    *dist* is the project's distribution name and *build_inputs* its list
+    of build inputs, or None, for the host's rebuild decision.  Returns ""
+    once the host process is about to send its first message, else why
+    not.
     """
     tx.write(_script() + b"\0")
     tx.write(
         json.dumps(
             {
                 "root": source_root, "project": project, "project_hash": project_hash,
-                "python": py_minor, "run": run,
+                "python": py_minor, "run": run, "dist": dist, "build_inputs": build_inputs,
             }
         ).encode()
         + b"\n"
@@ -379,7 +437,7 @@ def _extract(data: bytes, dest: str) -> str:
             tar.extractall(dest)  # every member was just checked
         # The tar carries no times.  A file written over an older tree must
         # read as newer than any build made from the old one, or a build
-        # backend that rebuilds on import sees nothing to do and the worker
+        # backend that rebuilds on import finds nothing to do and the worker
         # runs the old binary on the new source.
         now = time.time()
         for m in tar.getmembers():
@@ -436,8 +494,10 @@ def _python_request(py_minor: str) -> str:
     return py_minor
 
 
-def _build_environment(tree: str, py_minor: str) -> tuple[str, str]:
-    """Run the tree's lock tool in it; the interpreter it made, or why not."""
+def _build_environment(tree: str, py_minor: str, rebuild: str = "") -> tuple[str, str]:
+    """Run the tree's lock tool in it; the interpreter it made, or why not.
+    With *rebuild*, the project's distribution name, the tool also rebuilds
+    the project itself."""
     lock = lock_tool(os.listdir(tree))
     if lock is None:
         return "", (
@@ -453,7 +513,8 @@ def _build_environment(tree: str, py_minor: str) -> tuple[str, str]:
             f"session has a short one) and was not found in {looked}. Install "
             "it there, or put it on the PATH that non-interactive shells see."
         )
-    cmd = [exe] + [a.format(python=_python_request(py_minor)) for a in row["install"]]
+    args = row["rebuild"] if rebuild else row["install"]
+    cmd = [exe] + [a.format(python=_python_request(py_minor), dist=rebuild) for a in args]
     try:
         p = subprocess.run(
             cmd, cwd=tree, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
@@ -474,16 +535,20 @@ def _build_environment(tree: str, py_minor: str) -> tuple[str, str]:
 
 
 def _prepare(
-    root: str, project: str, project_hash: str, py_minor: str, delete, files: dict, data: bytes
+    root: str, project: str, project_hash: str, py_minor: str, delete, files: dict, data: bytes,
+    dist: str = "", build_inputs=None,
 ) -> tuple[str, str]:
     """Update the project's directory to *project_hash* and build its
     environment; the interpreter, or why not.
 
     *delete* names the files to remove, *files* is the full new manifest,
-    *data* a tar of the files whose content differs.  Holds the project's
-    lock throughout.  A main process that finds the lock held by another
-    waits; if the other main process's update produced this project hash there is
-    nothing left to do.
+    *data* a tar of the files whose content differs.  The project itself
+    (*dist*, its distribution name) is rebuilt when a build input changed
+    (see :func:`is_build_input`; *build_inputs* is the project's list, or
+    None), or when what the directory held is unknown.  Holds the
+    project's lock throughout.  A main process that finds the lock held by
+    another waits; if the other main process's update produced this
+    project hash there is nothing left to do.
     """
     tree, manifest, lock = _paths(root, project)
     os.makedirs(root, exist_ok=True)
@@ -498,11 +563,19 @@ def _prepare(
             os.remove(manifest)
         except OSError:
             pass
+        if not os.path.isdir(tree):
+            rebuild = ""  # the first install builds everything
+        elif current is None:
+            rebuild = dist  # the directory's content is unknown: a failed update
+        else:
+            had = current.get("files") or {}
+            changed = [rel for rel, h in files.items() if had.get(rel) != h] + list(delete)
+            rebuild = dist if any(is_build_input(rel, build_inputs) for rel in changed) else ""
         _delete(tree, delete)
         reason = _extract(data, tree)
         if reason:
             return "", reason
-        python, reason = _build_environment(tree, py_minor)
+        python, reason = _build_environment(tree, py_minor, rebuild)
         if reason:
             return "", reason  # the tree stays; the next update starts from it
         _write_manifest(manifest, project_hash, python, files)
@@ -544,7 +617,8 @@ def main() -> int:
         change = json.loads(line)
         try:
             python, reason = _prepare(
-                root, project, project_hash, req["python"], change["delete"], change["files"], data
+                root, project, project_hash, req["python"], change["delete"], change["files"], data,
+                req.get("dist") or "", req.get("build_inputs"),
             )
         except Exception as e:  # anything else is still a reason, not a crash
             python, reason = "", f"{type(e).__name__}: {e}"

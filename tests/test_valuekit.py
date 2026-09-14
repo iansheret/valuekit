@@ -605,7 +605,9 @@ class TestNativeExtensions:
         _fp(ns["f"])
         _fp(ns["f"])
         assert len(calls) == 1
-        path.write_bytes(b"compiled bytes, version two")
+        path.write_bytes(b"compiled bytes, version two")  # the same size
+        t = path.stat().st_mtime_ns + 1_000_000_000
+        os.utime(path, ns=(t, t))  # a rebuild's mtime moves; a coarse clock may not have
         _fp(ns["f"])
         assert len(calls) == 2
 
@@ -843,6 +845,19 @@ class TestStore:
         assert len(a.get_records("k")) == 1
         b.put_record("k", t2)
         assert len(a.get_records("k")) == 2
+
+    def test_a_write_moves_the_directory_mtime_on_a_coarse_clock(self, tmp_path):
+        # A write within one tick of a coarse filesystem clock leaves the
+        # directory's mtime where it was; put_record then moves it by hand.
+        # Setting the mtime ahead of the clock makes the next write's
+        # natural mtime read as not moved.
+        s = LocalStore(tmp_path)
+        s.put_record("k", {"fn": "f", "deps": {}, "result": "0" * 40})
+        d = tmp_path / "records" / "k"
+        ahead = time.time_ns() + 3_600 * 10**9
+        os.utime(d, ns=(ahead, ahead))
+        s.put_record("k", {"fn": "f", "deps": {}, "result": "1" * 40})
+        assert d.stat().st_mtime_ns == ahead + 1
 
     def test_atomic_write_onto_existing_target_is_success(self, tmp_path, monkeypatch):
         # Windows refuses to replace a file another process has mapped. The
@@ -2750,6 +2765,85 @@ class TestDebugHook:
 
 
 # ===========================================================================
+# the build step on this machine
+# ===========================================================================
+
+
+class TestBuild:
+    @pytest.fixture
+    def built_project(self, tmp_path, monkeypatch):
+        """A project with a fake lock tool that records the commands it ran,
+        and a record location under a temporary prefix."""
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / "pyproject.toml").write_text(
+            "[project]\nname = 'p'\nversion = '0'\n[tool.valuekit]\nbuild-inputs = ['*.c']\n"
+        )
+        (root / "fake.lock").write_text("")
+        (root / "native.c").write_text("int x;")
+        (root / "mod.py").write_text("x = 1")
+        made = tmp_path / "made.py"
+        made.write_text(
+            "import sys\n"
+            f"open({str(tmp_path / 'commands')!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+            "sys.exit(int('fail' in sys.argv[1]))\n"
+        )
+        row = {
+            "tool": sys.executable,
+            "install": (str(made), "install"),
+            "rebuild": (str(made), "rebuild", "{dist}"),
+            "interpreters": (),
+            "search": (),
+        }
+        monkeypatch.setitem(bootstrap._TOOLS, "fake.lock", row)
+        monkeypatch.setattr(bootstrap, "KNOWN_LOCKS", ("fake.lock",))
+        monkeypatch.setattr(sys, "prefix", str(tmp_path / "prefix"))
+        (tmp_path / "prefix").mkdir()
+        return root, tmp_path / "commands"
+
+    def test_build_runs_once_per_change_to_a_build_input(self, built_project, capsys):
+        root, commands = built_project
+        assert vk.build(root) is True
+        assert commands.read_text().splitlines() == ["rebuild p"]
+        assert "build inputs of p changed" in capsys.readouterr().err
+        assert vk.build(root) is False  # nothing changed
+        (root / "mod.py").write_text("x = 2")
+        assert vk.build(root) is False  # a Python source is not a build input
+        (root / "native.c").write_text("int y;")
+        assert vk.build(root) is True
+        (root / "pyproject.toml").write_text(
+            "[project]\nname = 'p'\nversion = '1'\n[tool.valuekit]\nbuild-inputs = ['*.c']\n"
+        )
+        assert vk.build(root) is True  # pyproject.toml always counts
+        assert len(commands.read_text().splitlines()) == 3
+
+    def test_build_finds_the_project_from_the_calling_script(self, built_project, monkeypatch):
+        root, commands = built_project
+        monkeypatch.chdir(root)
+        ns = {}  # a caller with no __file__, an interactive session say: the cwd is used
+        exec("import valuekit\nran = valuekit.build()", ns)
+        assert ns["ran"] is True
+
+    def test_a_failed_build_raises_with_the_tools_output(self, built_project, monkeypatch):
+        root, commands = built_project
+        row = dict(bootstrap._TOOLS["fake.lock"])
+        row["rebuild"] = (row["rebuild"][0], "fail-rebuild", "{dist}")
+        monkeypatch.setitem(bootstrap._TOOLS, "fake.lock", row)
+        with pytest.raises(RuntimeError, match="fail-rebuild p failed"):
+            vk.build(root)
+        assert vk.build.__module__ == "valuekit.build"
+
+    def test_build_refuses_what_it_cannot_build(self, tmp_path):
+        with pytest.raises(project.ProjectError, match="no project"):
+            vk.build(tmp_path)
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / "pyproject.toml").write_text("[project]\nname = 'p'\nversion = '0'\n")
+        with pytest.raises(project.ProjectError, match="no lock file"):
+            vk.build(root)
+
+
+# ===========================================================================
 # concurrency-ish / atomicity smoke test
 # ===========================================================================
 
@@ -4162,6 +4256,22 @@ def _load(root, name="vk_sync_mod"):
 
 
 class TestProject:
+    def test_build_inputs_come_from_pyproject(self, tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / "pyproject.toml").write_text("[project]\nname = 'p'\nversion = '0'\n")
+        assert project.build_inputs(str(root)) is None
+        assert project.distribution_name(str(root)) == "p"
+        (root / "pyproject.toml").write_text(
+            "[project]\nname = 'p'\nversion = '0'\n[tool.valuekit]\nbuild-inputs = ['src/**/*.c']\n"
+        )
+        assert project.build_inputs(str(root)) == ["src/**/*.c"]
+        (root / "pyproject.toml").write_text(
+            "[project]\nname = 'p'\nversion = '0'\n[tool.valuekit]\nbuild-inputs = 'src'\n"
+        )
+        with pytest.raises(project.ProjectError, match="build-inputs"):
+            project.build_inputs(str(root))
+
     @pytest.fixture(autouse=True)
     def _cleanup(self):
         yield
@@ -4291,10 +4401,12 @@ class TestBootstrap:
             "import os, sys\n"
             "os.makedirs('env', exist_ok=True)\n"
             "open('env/python', 'w').write(sys.argv[1])\n"
+            "open('env/commands', 'a').write(' '.join(sys.argv[2:]) + '\\n')\n"
         )
         row = {
             "tool": sys.executable,
-            "install": (str(made), "{python}"),
+            "install": (str(made), "{python}", "install"),
+            "rebuild": (str(made), "{python}", "rebuild", "{dist}"),
             "interpreters": ("env/python",),
             "search": (),
         }
@@ -4313,11 +4425,54 @@ class TestBootstrap:
         entries = project.manifest(str(root))
         return project.manifest_hash(entries), dict(entries), project.pack_tree(str(root), entries)
 
-    def _prepare(self, root, tree, delete=(), data=None, entries=None):
+    def _prepare(self, root, tree, delete=(), data=None, entries=None, build_inputs=None):
         th, files, tar = tree
         return bootstrap._prepare(
-            str(root), "p", th, "3.99", list(delete), files, tar if data is None else data
+            str(root), "p", th, "3.99", list(delete), files, tar if data is None else data,
+            "pdist", build_inputs,
         )
+
+    def _commands(self, root):
+        return (root / "p" / "env" / "commands").read_text().splitlines()
+
+    def test_the_project_is_rebuilt_when_a_build_input_changed(self, tmp_path, fake_tool):
+        root = tmp_path / "source"
+        first = self._tree(tmp_path, **{"a.py": "1", "native.c": "int x;", "fake.lock": ""})
+        assert self._prepare(root, first)[1] == ""
+        assert self._commands(root) == ["install"]  # the first install builds everything
+        edited_py = self._tree(tmp_path, **{"a.py": "2", "native.c": "int x;", "fake.lock": ""})
+        assert self._prepare(root, edited_py)[1] == ""
+        assert self._commands(root)[-1] == "install"  # a Python source needs no build
+        edited_c = self._tree(tmp_path, **{"a.py": "2", "native.c": "int y;", "fake.lock": ""})
+        assert self._prepare(root, edited_c)[1] == ""
+        assert self._commands(root)[-1] == "rebuild pdist"
+        # With a build-inputs list, only what it names counts.
+        edited_txt = self._tree(tmp_path, **{"a.py": "2", "native.c": "int y;", "fake.lock": "", "n.txt": "x"})
+        assert self._prepare(root, edited_txt, build_inputs=["*.c"])[1] == ""
+        assert self._commands(root)[-1] == "install"
+        edited_c2 = self._tree(tmp_path, **{"a.py": "2", "native.c": "int z;", "fake.lock": "", "n.txt": "x"})
+        assert self._prepare(root, edited_c2, build_inputs=["*.c"])[1] == ""
+        assert self._commands(root)[-1] == "rebuild pdist"
+
+    def test_a_directory_without_a_manifest_is_rebuilt(self, tmp_path, fake_tool):
+        root = tmp_path / "source"
+        first = self._tree(tmp_path, **{"a.py": "1", "fake.lock": ""})
+        assert self._prepare(root, first)[1] == ""
+        (root / "p.manifest").unlink()  # a failed update leaves no manifest
+        second = self._tree(tmp_path, **{"a.py": "2", "fake.lock": ""})
+        assert self._prepare(root, second)[1] == ""
+        assert self._commands(root)[-1] == "rebuild pdist"
+
+    def test_build_inputs(self):
+        is_input = bootstrap.is_build_input
+        assert is_input("native.c") and is_input("CMakeLists.txt") and is_input("data/x.bin")
+        assert not is_input("pkg/a.py") and not is_input("pkg/a.pyi")
+        assert is_input("pyproject.toml") and is_input("uv.lock")
+        assert is_input("pyproject.toml", ["*.c"]) and is_input("uv.lock", ["*.c"])
+        assert is_input("src/a/b.c", ["src/**/*.c"]) and is_input("src/b.c", ["src/**/*.c"])
+        assert not is_input("other/b.c", ["src/**/*.c"]) and not is_input("src/a/b.h", ["src/**/*.c"])
+        assert is_input("a/b/c.txt", ["**/*.txt"]) and not is_input("a/b/c.txt", ["*.txt"])
+        assert is_input("x.c", ["?.c"]) and not is_input("xy.c", ["?.c"])
 
     def test_a_project_becomes_an_environment(self, tmp_path, fake_tool):
         tree = self._tree(tmp_path, **{"fake.lock": "", "a.py": "A = 1\n"})

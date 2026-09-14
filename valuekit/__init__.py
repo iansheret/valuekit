@@ -44,10 +44,12 @@ from .pure import pure, pure_local, log, set_store_dir, clear_cache
 from .parallel import run_all, BatchResult
 from .batches import batch
 from .runlog import logs
+from .build import build
 
 __all__ = [
     "batch",
     "logs",
+    "build",
     "ImmutableMap",
     "freeze",
     "content_hash",

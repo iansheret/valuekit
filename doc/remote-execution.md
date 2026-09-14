@@ -151,6 +151,27 @@ binary was built from the same sources. An extension the main process never reac
 no marker on the worker, and the worker is refused. A released wheel keeps its version
 marker, as before.
 
+**The build is the lock tool's; nothing rebuilds on import.** A backend that rebuilds on
+import runs its build tool at every import and lets the tool decide whether anything is out
+of date, so several workers importing at once run the tool at once in one build directory.
+MSBuild failed under that on the PC (one input of three, after a C edit), and
+scikit-build-core's own lock around the rebuild is POSIX-only. A file lock around the
+import was tried and rejected: a build in every worker is the wrong design even when it is
+serialised. Instead the tool table's row has a rebuild command (`uv sync --frozen
+--reinstall-package <name>`), the bootstrap runs it when the files a sync changed include a
+build input, and `valuekit.build()` runs it on the main machine under the same rule. The rule
+is `bootstrap.is_build_input`: the project's `[tool.valuekit] build-inputs` globs, else every
+file that is not a Python source, with `pyproject.toml` and the lock file always included. A
+local worker receives the function by name and imports it itself, as a host's worker does.
+The sync's check worker is one decision per host, reported once; it no longer serves as the
+place the build happens.
+
+**The import audit judges only what the function's import loaded.** Ubuntu's system Python
+loads a `sitecustomize` from `/etc/python3.X`, outside every prefix `sysconfig` and `site`
+report, and the audit refused every host on the 3.12 CI job for it. The worker now snapshots
+`sys.modules` before putting the tree on the path, and modules loaded before then are the
+interpreter's own.
+
 **Modes stay; the default is `all`; syncing never blocks.** On review, modes are a
 preset over per-host capacities, which is the shape the extra-cores model needs
 underneath; the objection to them was aesthetic. What the model concretely requires was

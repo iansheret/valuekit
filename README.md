@@ -124,6 +124,36 @@ runs, so editing a source file without rebuilding correctly changes nothing.
 The cost is one read of the file per build, on the order of a millisecond
 for a few megabytes.
 
+The build is the project's own: its lock tool installs the project and
+rebuilds it (for uv, `uv sync --reinstall-package <name>`), through the
+build backend `pyproject.toml` names. Nothing rebuilds on import, and a
+backend's rebuild-on-import option is not supported with parallel workers
+on any backend: many processes importing at once would run the build tool
+at once in one build directory. To rebuild without a step of your own, call
+`valuekit.build()` at the top of the script, before the project is
+imported:
+
+```python
+import valuekit
+valuekit.build()          # rebuilds the project if a build input changed
+import mypipeline         # imports the current binary
+```
+
+It runs the rebuild command when the project's *build inputs* changed since
+the last build, and does nothing otherwise. The build inputs are what the
+project says they are, as globs in `pyproject.toml`:
+
+```toml
+[tool.valuekit]
+build-inputs = ["CMakeLists.txt", "src/**/*.c", "src/**/*.h"]
+```
+
+Without the list, every file that is not a Python source counts.
+`pyproject.toml` and the lock file always count. A host applies the same
+rule when a sync sends changed files (below). Set the backend's build
+directory (`build-dir` for scikit-build-core and meson-python) so a
+rebuild is incremental.
+
 Decoration emits no warnings. Side effects in a `@pure` function (printing,
 progress bars, metrics) are permitted by the contract precisely because
 they will not happen on a hit; whether that is acceptable is the user's
@@ -601,15 +631,16 @@ and that is expected: an extension's marker in the function hash is the
 hash of *your* build of it, and a worker is given that marker rather than
 hashing its own binary, so results computed anywhere are keyed by what you
 ran. The host's binary must then be a build of the same sources, which the
-sync guarantees, up to date through a build backend that rebuilds on import
-(scikit-build-core with `editable.rebuild`, or meson-python). Such a backend runs
-`cmake` by name at import time, so put the build tools in the project
-(`cmake` and `ninja` are on PyPI) and build without isolation (for uv,
-`no-build-isolation-package` under `[tool.uv]`, with `scikit-build-core`
-among the dependencies): an isolated build's tools vanish with it, and the
-build directory would still name them. Workers run in the environment
-activated, so whatever the lock installed beside the interpreter is on
-their PATH.
+sync guarantees: the first sync installs the project through its lock
+tool, and a later sync whose changed files include a build input (see
+"Native extensions") runs the tool's rebuild command, `uv sync --frozen
+--reinstall-package <name>`. A worker imports, and only imports. Put the
+build tools in the project (`cmake` and `ninja` are on PyPI) and build
+without isolation (for uv, `no-build-isolation-package` under
+`[tool.uv]`, with `scikit-build-core` among the dependencies), so the
+build directory's tools exist between builds. Workers run in the
+environment activated, so whatever the lock installed beside the
+interpreter is on their PATH.
 
 Each host keeps one directory per project, named by the project (the
 `project` key, else the name in `pyproject.toml`), and updates it in

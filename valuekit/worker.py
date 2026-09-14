@@ -7,13 +7,12 @@ got, and exits; every later process then runs exactly one input against
 that same tree and exits, which is what keeps the isolation `run_all`
 already promises -- a segfault or a timeout costs one input and nothing else.
 
-The check is a separate process for three reasons.  It is the host's
-first import of the function, and with a build backend that rebuilds on
-import it is the build: done once here, rather than by every task worker
-at once in one build directory.  It is the moment a host becomes usable,
-which the modes need: under ``remote`` this machine waits for it.  And a
-missing dependency, a build error or a function that will not import is a
-fact about the *host*, reported once, rather than against whichever input
+The check is a separate process for three reasons.  It is the moment a
+host becomes usable, which the modes need: under ``remote`` this machine
+waits for it, and until then the host has no capacity, so no input waits
+on it.  A missing dependency, a build error or a function that will not
+import is a fact about the *host*, reported once, rather than against
+whichever input
 happened to go there first.
 
     main   -> HELLO   json: python, module, qualname, function_hash, project_hash,
@@ -114,18 +113,26 @@ def _install(source: Path, roots: list[str]) -> None:
         sys.path.insert(0, entry)
 
 
-def _check_imports(source: Path) -> str:
-    """Confirm every user module actually came from the source tree.
+def _check_imports(source: Path, loaded_before: set[str]) -> str:
+    """Confirm every module the function's import loaded came from the
+    source tree or the environment.
 
     A source tree on ``sys.path`` is not proof that imports resolved through it:
     a PEP 660 editable install puts a finder on ``sys.meta_path``, which runs
     before any path entry, and namespace packages merge portions across
     entries.  This is the check that is independent of the sync having
     worked -- without it a worker could run the wrong source with no sign of it.
+
+    *loaded_before* names the modules the interpreter had loaded before the
+    tree was put on the path.  They are the interpreter's own (a
+    ``sitecustomize`` a distribution keeps under ``/etc``, say) and cannot
+    have come from the tree, so they are not judged.
     """
     real = str(source.resolve())
     strays: list[str] = []
     for name, mod in list(sys.modules.items()):
+        if name in loaded_before:
+            continue
         if name.startswith("valuekit") or name in ("__main__", "__mp_main__"):
             continue  # the harness itself, not the code under test
         fname = getattr(mod, "__file__", None)
@@ -198,6 +205,7 @@ def _handshake(rx: BinaryIO, tx: BinaryIO, check_imports: bool) -> tuple[bool, s
         return False, ""
 
     source, reason = _tree(project_hash)
+    loaded_before = set(sys.modules)
     if not reason:
         # The tree goes on the path before _accept, which imports.
         if source is not None:
@@ -207,7 +215,7 @@ def _handshake(rx: BinaryIO, tx: BinaryIO, check_imports: bool) -> tuple[bool, s
     if not reason and check_imports and source is not None:
         # After the import, and before the function hash is compared: a
         # function_hash that matches the wrong file is still the wrong file.
-        reason = _check_imports(source)
+        reason = _check_imports(source, loaded_before)
     protocol.write_message(tx, protocol.ACCEPTED, reason.encode("utf-8"))
     return not reason, f"{module}:{qualname}"
 

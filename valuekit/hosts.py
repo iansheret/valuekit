@@ -116,12 +116,13 @@ class Handle(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def _local_worker_main(conn, store_dir: str | None, fn, x) -> None:
-    """Runs in the worker process: configure the cache, run one input, send
-    one message back: ("ok", value) or ("err", exc, tb) or, when the
-    exception or value cannot be pickled, ("err_str", type_name, text, tb).
-    What this worker logs goes into the main process's run, named in the
-    environment it inherited (see :mod:`valuekit.runlog`).
+def _local_worker_main(conn, store_dir: str | None, module: str, qualname: str, x) -> None:
+    """Runs in the worker process: configure the cache, import the function
+    by name, run one input, send one message back: ("ok", value) or
+    ("err", exc, tb) or, when the exception or value cannot be pickled,
+    ("err_str", type_name, text, tb).  What this worker logs goes into the
+    main process's run, named in the environment it inherited (see
+    :mod:`valuekit.runlog`).
     """
     try:
         if store_dir is not None:
@@ -129,6 +130,9 @@ def _local_worker_main(conn, store_dir: str | None, fn, x) -> None:
 
             set_store_dir(store_dir)
         try:
+            from .worker import _resolve
+
+            fn = _resolve(module, qualname)
             value = fn(x)
         except BaseException as e:
             tb = traceback.format_exc()
@@ -205,7 +209,9 @@ class LocalHost:
     name = "local"
 
     def __init__(self, fn, store_dir: str | None, completions: queue.Queue):
-        self._fn = fn
+        # The function goes to the worker by name, as it does to a host.
+        self._module = getattr(fn, "__module__", "") or ""
+        self._qualname = getattr(fn, "__qualname__", "") or ""
         self._store_dir = store_dir
         self._completions = completions
         self._ctx = multiprocessing.get_context("spawn")
@@ -214,7 +220,7 @@ class LocalHost:
         recv_end, send_end = self._ctx.Pipe(duplex=False)
         proc = self._ctx.Process(
             target=_local_worker_main,
-            args=(send_end, self._store_dir, self._fn, x),
+            args=(send_end, self._store_dir, self._module, self._qualname, x),
             daemon=True,
         )
         proc.start()
@@ -628,6 +634,8 @@ class RemoteHost:
                 self._project.pack,
                 f"a run of {os.path.basename(sys.argv[0]) or 'python'} on "
                 f"{socket.gethostname()} (pid {os.getpid()}, started {self._started})",
+                self._project.dist,
+                self._project.build_inputs,
             )
         except (OSError, ValueError) as e:
             reason = f"the connection to host {self.name!r} broke: {e}"
@@ -712,14 +720,15 @@ class RemoteHost:
     # -- the sync -------------------------------------------------------------------
 
     def sync(self) -> str:
-        """Make this host match the main process, once, before it takes any
-        input: update its copy of the project, build the environment, import
-        the function (which builds an extension that rebuilds on import) and
-        check that what it imported is the main process's function.
+        """Decide once, before this host takes any input, whether it can run
+        the function: update its copy of the project, build the environment,
+        import the function and check that what was imported is the main
+        process's function.
 
         Returns "" when the host can take work, else why not.  A failure
         is a fact about the host, recorded once rather than against every
-        input that would have gone there.
+        input that would have gone there, and the host has no capacity
+        until the decision is made, so no input waits on it.
         """
         from . import protocol
 

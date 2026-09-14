@@ -70,6 +70,19 @@ call-record layout changed (each call record is its own file, under
   code produced: values, call records, batches and run logs.
   `python -m valuekit.sweep` takes `--store` and reads `$VALUEKIT_STORE`.
 
+- The project's build is the project's lock tool's. A host installs the
+  project with `uv sync --frozen` and, when a sync sends changed files that
+  include a build input, rebuilds it with `uv sync --frozen
+  --reinstall-package <name>`. `valuekit.build()`, called at the top of a
+  script before the project is imported, does the same on this machine.
+  Build inputs are the project's `[tool.valuekit] build-inputs` globs,
+  else every file that is not a Python source; `pyproject.toml` and the
+  lock file always count. Rebuild-on-import is no longer the mechanism
+  and is not supported with parallel workers: many processes importing at
+  once run the build tool at once in one build directory, which failed
+  under MSBuild. A local worker receives the function by name and imports
+  it itself, as a host's worker does.
+
 - A run a debugger forces (a live breakpoint, or `VALUEKIT_ALWAYS_RUN`)
   still writes its logged values to the run's log; it writes no call
   record, as before.

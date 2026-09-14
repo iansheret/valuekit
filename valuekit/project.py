@@ -53,6 +53,8 @@ from .values import _frame, _new_hasher
 __all__ = [
     "ProjectError",
     "Project",
+    "build_inputs",
+    "distribution_name",
     "manifest",
     "manifest_hash",
     "project_hash",
@@ -238,6 +240,8 @@ class Project:
         self.fn = fn
         self.root = project_root(fn)
         self.name = project_name(self.root, name)
+        self.dist = distribution_name(self.root)
+        self.build_inputs = build_inputs(self.root)
         self.entries = manifest(self.root, exclude=_store_dirs())
         self.project_hash = manifest_hash(self.entries)
         self.roots = import_roots(self.root)
@@ -284,20 +288,47 @@ class Project:
         return ""
 
 
+def _pyproject(root: str) -> dict:
+    """``pyproject.toml`` in *root* as a mapping; empty when absent or
+    unreadable."""
+    try:
+        with open(os.path.join(root, "pyproject.toml"), "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def distribution_name(root: str) -> str:
+    """``[project].name`` from the project's ``pyproject.toml``, or ""."""
+    name = _pyproject(root).get("project", {}).get("name")
+    return name if isinstance(name, str) else ""
+
+
+def build_inputs(root: str) -> list[str] | None:
+    """The project's ``[tool.valuekit] build-inputs`` list, or None when it
+    has none (every file that is not a Python source then counts; see
+    :func:`valuekit.bootstrap.is_build_input`)."""
+    tool = _pyproject(root).get("tool", {}).get("valuekit", {})
+    patterns = tool.get("build-inputs") if isinstance(tool, dict) else None
+    if patterns is None:
+        return None
+    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+        raise ProjectError(
+            f"{os.path.join(root, 'pyproject.toml')}: [tool.valuekit] build-inputs "
+            "must be a list of strings"
+        )
+    return patterns
+
+
 def project_name(root: str, override: str | None = None) -> str:
     """The name of the project's directory on a host: *override* (the local
     file's ``project``), else ``[project].name`` from ``pyproject.toml``,
     else the root directory's name.  Made safe for a directory name."""
     from .store import dirname_for
 
-    name = override
+    name = override or distribution_name(root)
     if not name:
-        try:
-            with open(os.path.join(root, "pyproject.toml"), "rb") as f:
-                name = tomllib.load(f).get("project", {}).get("name")
-        except (OSError, tomllib.TOMLDecodeError, AttributeError):
-            name = None
-    if not isinstance(name, str) or not name:
         name = os.path.basename(os.path.realpath(root))
     return dirname_for(name)
 

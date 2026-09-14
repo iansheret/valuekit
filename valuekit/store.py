@@ -343,9 +343,23 @@ class LocalStore:
     def put_record(self, function_hash: str, record: dict) -> str:
         data = record_bytes(record)
         h = _hash_bytes(data)
-        path = self._record_dir(function_hash) / f"{h}.json"
+        d = self._record_dir(function_hash)
+        path = d / f"{h}.json"
         if not path.exists():
+            try:
+                before = d.stat().st_mtime_ns
+            except OSError:
+                before = -1
             _atomic_write(path, data)
+            # The write moves the directory's mtime, which is how another
+            # store notices; on a filesystem with coarse mtime it may not
+            # have, so move it by hand.
+            try:
+                if d.stat().st_mtime_ns <= before:
+                    t = max(time.time_ns(), before + 1)
+                    os.utime(d, ns=(t, t))
+            except OSError:
+                pass
         listing = self._listings.get(function_hash)
         if listing is not None:
             listing.stale = True
