@@ -680,7 +680,9 @@ class TestNativeExtensions:
         # A module global resolves by name, so the reference is to the module
         # itself rather than to anything it defines.
         before = _fp(fn)
-        path.write_bytes(b"compiled bytes, version two")
+        path.write_bytes(b"compiled bytes, version two")  # the same size
+        t = path.stat().st_mtime_ns + 1_000_000_000
+        os.utime(path, ns=(t, t))  # a rebuild's mtime moves; a coarse clock may not have
         assert _fp(fn) != before
 
     def test_an_extension_with_no_project_is_its_binary(self, tmp_path):
