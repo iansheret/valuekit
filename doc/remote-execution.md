@@ -21,14 +21,14 @@ exercised in the suite through the real bootstrap: a host process on this machin
 started the way an ssh session would start it, building the test project's environment
 with `uv sync` from a lock file. The suite therefore needs `uv` on the PATH.
 
-## The three ideas this design answers
+## The three ideas this design follows
 
 1. **A project runs remotely iff it could be checked out and run there.** The host
    provides the toolchain (a Python 3 to start with, the lock tool, a compiler, the
    network); the project provides everything else through its lock file, valuekit
    included. The host builds the environment; the project builds its own extension.
 2. **The user's model is "my machine has extra cores".** Hosts in the local file are used
-   by default. Preparing one never holds work back. A host that dies loses nothing.
+   by default. Preparing one never delays work. When a host drops, no input is lost.
 3. **The design extends to serverless.** The connection is one interface; the bootstrap is a
    container entrypoint; requeue on connection loss is what a recycled instance needs.
 
@@ -38,11 +38,11 @@ with `uv sync` from a lock file. The suite therefore needs `uv` on the PATH.
 `valuekit.local.toml`. The sequence for a host:
 
 1. The main process refuses before connecting if the project cannot go: no lock file valuekit
-   knows, or user code outside the project tree (`project.Project.refusal`).
+   recognises, or user code outside the project tree (`project.Project.refusal`).
 2. The main process opens one connection: `ssh -T -o BatchMode=yes <target> "<python> -c
    <stage 0>"`, where stage 0 is a one-line Python program that reads a script off stdin
    up to a NUL byte and runs it. The main process sends `valuekit/bootstrap.py` as that script.
-3. The bootstrap speaks a short JSON-line protocol on the same streams: it says whether
+3. The bootstrap uses a short JSON-line protocol on the same streams: it says whether
    `source_root/<project>` already holds this project hash, else reports the files it has;
    the main process sends the names to delete and a tar of the files whose hash differs; the
    bootstrap applies both in place, runs the lock tool's install command (`uv sync --frozen --python
@@ -51,7 +51,7 @@ with `uv sync` from a lock file. The suite therefore needs `uv` on the PATH.
    `VALUEKIT_TREE` and `VALUEKIT_PROJECT_HASH` set, on the same streams, in the environment
    activated (its interpreter's directory first on `PATH`, `VIRTUAL_ENV` set).
 4. The host process's first message carries its Python version, CPU count and pid. On a
-   check channel the main process sends HELLO (Python version, function, function hash, project hash,
+   check channel the main process sends HELLO (a JSON object: Python version, function, function hash, project hash,
    import roots); the host
    starts `valuekit.worker --check`, which puts the tree's roots on `sys.path`, imports the
    function, checks that every user module came from the tree, and compares function hashes.
@@ -84,7 +84,7 @@ store         the main process's store over the channel   remotestore.py
 | `valuekit/parallel.py` | Scheduling: capacities per host from the local file's mode, deadlines, input ordering, failure attribution, requeue on host loss, cached-input short-circuit, batch recording. |
 | `valuekit/localfile.py` | The local file: hosts, worker cap, mode, project name; reading and setting the mode line. |
 | `valuekit/modes.py` | What each mode means: the capacity each host has under it. |
-| `valuekit/hosts.py` | `Connection`/`ProcessConnection`, `LocalHost` (a process per input), `RemoteHost` (one connection, a channel per task), and the handle that answers a worker's store requests and runs its `@pure_local` calls. |
+| `valuekit/hosts.py` | `Connection`/`ProcessConnection`, `LocalHost` (a process per input), `RemoteHost` (one connection, a channel per task), and the handle that serves a worker's store requests and runs its `@pure_local` calls. |
 | `valuekit/bootstrap.py` | How a tree becomes an environment on a host: the lock-tool table, the layout under `source_root`, extraction, the environment build, starting the host process. Both halves of its protocol. Stdlib only. |
 | `valuekit/hostprocess.py` | The host process: starts a worker per channel, multiplexes their streams, exits on EOF. |
 | `valuekit/worker.py` | The worker process: a check mode and a single-task mode; install, admit, audit. |
@@ -107,9 +107,9 @@ nothing else, produce an interpreter on the host that imports the project with t
 versions the main process has. Lock tools provide it; the requirement is the capability, not
 uv. Detection is by lock filename through a table (`bootstrap._TOOLS`) with one row per
 tool; uv is the first row because it is what can be validated between the two machines
-to hand. Nothing above the bootstrap knows which row was used. The README says
+to hand. Nothing above the bootstrap depends on which row was used. The README says
 "requires a locked project", never "requires uv". Rejected on the way: pip with
-`--no-deps --no-build-isolation` (kept the old boundary rather than the clone-and-run
+`--no-deps --no-build-isolation` (retained the old boundary rather than the clone-and-run
 reading), pip with defaults on any pyproject (no lock, so versions drift), a
 project-configured prepare command (a hook by another name).
 
@@ -119,7 +119,7 @@ the function hash still exists, populated by the sync rather than by a human.
 
 **The bootstrap is stdlib-only and sent over the connection.** Nothing of valuekit's is
 on the host before the project's environment exists, and valuekit is one of the project's
-dependencies, so it arrives with the rest. Stage 0 reads the script one byte at a time up
+dependencies, so it is installed with the rest. Stage 0 reads the script one byte at a time up
 to a NUL so nothing meant for the protocol is consumed ahead. The bootstrap stays as the
 host process's parent (spawn-and-wait on every platform, since `exec` is unreliable on
 Windows) and never touches the streams after the spawn. It is also a container entrypoint.
@@ -137,8 +137,8 @@ from what is there. A host holds one version at a time: while a host process run
 bootstrap keeps a busy marker (refreshed every few seconds; ignored once stale) naming
 the run, and a run wanting a different version is refused with that name rather than
 updating the directory under a running batch. Starting a second run before stopping the
-first is the user's error, and the refusal says what to stop. The project hash still says whether a host is current and still
-stands for a native extension in the function hash.
+first is the user's error, and the refusal says what to stop. The project hash still says whether a host is current and is still
+the marker for a native extension in the function hash.
 
 **A native extension's marker is the hash of the main process's binary, sent to workers.**
 The marker was the project hash for a while, on the reasoning that each host builds its own
@@ -152,7 +152,7 @@ no marker on the worker, and the worker is refused. A released wheel keeps its v
 marker, as before.
 
 **Modes stay; the default is `all`; syncing never blocks.** On review, modes are a
-preset over per-host capacities, which is the shape the extra-cores model wants
+preset over per-host capacities, which is the shape the extra-cores model needs
 underneath; the objection to them was aesthetic. What the model concretely requires was
 changed instead: configured hosts are used without a keystroke, local work starts at once
 and hosts join when ready, and (under `remote` only) this machine stays idle while a host
@@ -192,7 +192,7 @@ local worker cap, the mode and the project's host directory name. It replaced
 `VALUEKIT_HOSTS` and `<cache>/placement`: it is about this checkout on this machine, so it
 is ignored by git (valuekit warns if it is tracked), never shipped, and never hashed. It
 does not configure the cache; `set_store_dir` stays in code, so a checkout that never uses
-other machines needs no file. A checkout that wants its own host directory, a git
+other machines needs no file. A checkout that needs its own host directory, a git
 worktree say, sets `project`.
 
 **The monitor's only write is the `mode` line of that file.** Watching has no effect on a
@@ -207,7 +207,7 @@ directory first on the `PATH` the host process (and so every worker) sees, and s
 `VIRTUAL_ENV`. Found with scikit-build-core's `editable.rebuild`, which runs `cmake` by
 name at import time: with `cmake` and `ninja` from PyPI in the lock, they are in the
 environment's `bin`, and nothing else would put that on the PATH. The bootstrap is the
-one place that knows where the environment keeps its tools.
+one place that has the environment's layout.
 
 **A project that rebuilds on import must build without isolation.** Not valuekit's
 decision but a fact for the README: uv builds a wheel in a temporary environment, and
@@ -231,7 +231,7 @@ logged values. "Batch record": what `run_all` writes under a name. "Run": one ma
 process running a script. "Run log": the values a run logged, under `logs/`. "Host": a machine that can run
 workers, this one included; a remote host is one reached over ssh. "Host process": the process on a
 remote host that starts its workers. "Main process": the process the user started, in which the script runs; it owns the cache,
-and during a batch it schedules the inputs and answers the workers. "Worker": a process that runs
+and during a batch it schedules the inputs and serves the workers' requests. "Worker": a process that runs
 one input and exits, started by the main process here or by a host process on a remote host.
 "Check": the worker-module process that imports the function on a host and checks it,
 running no input. "Mode": which hosts are used. "Connection": the
@@ -254,7 +254,7 @@ defects found and fixed on the way, both in `bootstrap.py`:
   elevated process the junctions uv makes for its minor-version links. The bootstrap now
   hands the lock tool its own interpreter's path when that interpreter has the main process's
   minor, and the bare minor otherwise; uv then does no discovery.
-- *Stage 0 never ended at EOF*: a main process that died before sending the script left it
+- *Stage 0 never ended at EOF*: a main process that exited before sending the script left it
   joining empty reads forever, at full CPU and growing without bound (seen on both
   machines). It now exits.
 
@@ -331,7 +331,7 @@ user's shell's job, as the README says.
    running the stage-0 command line verbatim through `cmd /c` (works) and `powershell -c`
    (strips the quotes, a documented Windows OpenSSH limitation); `sh` works too.
 2. ~~**A real native extension across machines.**~~ Done both ways (above). The
-   incremental rebuild question is answered: not across trees, with CMake.
+   incremental rebuild question is settled: not across trees, with CMake.
 3. **Release.** `_version.py` to `0.5.0`, CHANGELOG dated, CI green on Linux, macOS and
    Windows, `python -m build`, `twine check --strict`, tag `v0.5.0`, publish.
 

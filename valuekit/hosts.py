@@ -16,10 +16,10 @@ waiting on two kinds of thing, and a blocking read on a thread is the one
 primitive every platform gives a pipe, which is why there is no ``select``
 here.
 
-A handle answers one question, ``finished()``: nothing yet, or a
+A handle has one method, ``finished()``: nothing yet, or a
 :class:`Finished` saying what happened -- a result, an exception, a worker
-that exited without answering, or a connection that closed with the input
-neither done nor failed.  A worker sends its answer as one of ``("ok",
+that exited without a result, or a connection that closed with the input
+neither done nor failed.  A worker sends its result as one of ``("ok",
 value)``, ``("err", exc, tb)`` or ``("err_str", type_name, text, tb)`` when
 the exception itself could not be sent; the handle turns that into the
 ``Finished``.
@@ -29,8 +29,8 @@ host.  :class:`RemoteHost` holds one connection to a *host process*
 (:mod:`valuekit.hostprocess`), on this machine or over ssh, which starts a worker
 per task and carries each worker's stream as a numbered channel.  A worker
 on a host holds no cache: its store is this process's store, so the messages
-that arrive on a channel are not only its answer but a call record to keep, a
-lookup to answer, a event to write, or a ``@pure_local`` call to
+that arrive on a channel are not only its result but a call record to store, a
+lookup to serve, an event to write, or a ``@pure_local`` call to
 make here.
 
 The connection is a :class:`Connection`: two byte streams and how they ended,
@@ -57,6 +57,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, BinaryIO, Callable, Protocol
 
 from .codec import SerializationError
+from .hostprocess import StderrTail
 
 __all__ = ["Finished", "Handle", "Connection", "ProcessConnection", "LocalHost", "RemoteHost"]
 
@@ -69,7 +70,7 @@ class Finished:
       traceback text;
     * ``"error_text"``: the exception could not be sent; ``text`` names it,
       ``tb`` is its traceback text;
-    * ``"exited"``: the worker exited without answering; ``text`` says how;
+    * ``"exited"``: the worker exited without a result; ``text`` says how;
     * ``"connection_closed"``: the connection to the host closed with the
       input neither done nor failed, so the scheduler may run it elsewhere.
     """
@@ -86,7 +87,7 @@ class Finished:
 
     @classmethod
     def from_message(cls, msg: tuple) -> "Finished":
-        """A worker's answer tuple as a Finished."""
+        """A worker's result tuple as a Finished."""
         if msg[0] == "ok":
             return cls("ok", value=msg[1])
         if msg[0] == "err":
@@ -167,7 +168,7 @@ class _LocalHandle:
         try:
             msg = self.conn.recv()
         except (EOFError, OSError):
-            msg = None  # died without sending; Windows says BrokenPipeError
+            msg = None  # exited without sending; Windows says BrokenPipeError
         completions.put((self, msg))
 
     def feed(self, payload: Any) -> None:
@@ -255,13 +256,13 @@ class _ChannelWriter:
 class _Handle:
     """One worker on a channel, and the framed conversation with it.
 
-    Frames are parsed out of a buffer as bytes arrive.  A worker speaks
+    Frames are parsed out of a buffer as bytes arrive.  A worker sends
     several times before it finishes -- a HELLO message, store traffic, then the
-    result's objects -- so "bytes arrived" does not mean "the answer is
+    result's objects -- so "bytes arrived" does not mean "the result is
     here", and reading until it is would sit inside a task that has already
     blown its deadline.
 
-    Lookups are answered on the scheduler's thread; a ``@pure_local`` call
+    Lookups are served on the scheduler's thread; a ``@pure_local`` call
     runs on a pool thread, since it may be a download, and replies when it
     is done.  ``seen`` names every object either side has sent, so nothing
     crosses twice.
@@ -373,7 +374,7 @@ class _Handle:
                 return None
             handle.feed(payload)
 
-    # -- answering the worker -------------------------------------------------
+    # -- serving the worker's requests ----------------------------------------
 
     def _write_message(self, tag: bytes, body: bytes = b"") -> None:
         from . import protocol
@@ -394,9 +395,9 @@ class _Handle:
 
         store = self._store()
         if tag == protocol.RECORD:
-            function_hash, doc = protocol.unstrings(body)
+            message = json.loads(body)
             if store is not None:
-                store.put_record(function_hash, json.loads(doc))
+                store.put_record(message["function_hash"], message["record"])
         elif tag == protocol.GET_RECORDS:
             pairs = [] if store is None else store.get_records(body.decode())
             self._write_message(protocol.RECORDS, json.dumps(pairs).encode())
@@ -501,7 +502,7 @@ class Connection(Protocol):
 
 class ProcessConnection:
     """A process on this machine, or on another through ssh: its stdin and
-    stdout are the connection, its stderr is kept for the failure message."""
+    stdout are the connection, its stderr is read for the failure message."""
 
     def __init__(self, command: list[str]):
         self.command = command
@@ -513,24 +514,11 @@ class ProcessConnection:
         )
         self.rx: BinaryIO = self.proc.stdout  # type: ignore[assignment]
         self.tx: BinaryIO = self.proc.stdin  # type: ignore[assignment]
-        self._stderr = bytearray()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
-
-    def _read_stderr(self) -> None:
-        fd = self.proc.stderr.fileno()  # type: ignore[union-attr]
-        while True:
-            try:
-                chunk = os.read(fd, 1 << 16)
-            except OSError:
-                chunk = b""
-            if not chunk:
-                return
-            self._stderr += chunk
-            del self._stderr[: -(64 << 10)]
+        self._stderr = StderrTail(self.proc)
 
     def failure(self) -> str:
         code = self.proc.poll()
-        tail = bytes(self._stderr).decode("utf-8", "replace").strip()
+        tail = self._stderr.bytes().decode("utf-8", "replace").strip()
         if code is None:
             return tail
         what = f"exit code {code}"
@@ -580,14 +568,13 @@ class RemoteHost:
         source_root: str,
         workers: int | None = None,
     ):
-        from . import protocol
         from .functionhash import PYTHON, reachable_set
         from .pure import _current_store
 
         fn = project.fn
         self.name = name
         self.capacity = workers
-        self.dead = False
+        self.dropped = False
         self.failure: str | None = None
         self._project = project
         self._store_dir = store_dir or ""
@@ -605,15 +592,18 @@ class RemoteHost:
         self._started = time.strftime("%H:%M:%S")
 
         reach = reachable_set(fn)
-        self._hello = protocol.strings(
-            PYTHON,
-            getattr(fn, "__module__", "") or "",
-            getattr(fn, "__qualname__", "") or "",
-            reach.hash,
-            project.project_hash,
-            json.dumps(reach.extensions, sort_keys=True),
-            *project.roots,
-        )
+        self._hello = json.dumps(
+            {
+                "python": PYTHON,
+                "module": getattr(fn, "__module__", "") or "",
+                "qualname": getattr(fn, "__qualname__", "") or "",
+                "function_hash": reach.hash,
+                "project_hash": project.project_hash,
+                "extensions": reach.extensions,
+                "roots": list(project.roots),
+            },
+            sort_keys=True,
+        ).encode()
 
     # -- the connection ---------------------------------------------------------
 
@@ -692,7 +682,7 @@ class RemoteHost:
                 code = int.from_bytes(rest[:4], "little", signed=True)
                 handle.completions.put((handle, (code, rest[4:])))
                 handle.completions.put((handle, None))
-        self.dead = True
+        self.dropped = True
         for handle in list(self._channels.values()):
             handle.completions.put((handle, None))
 

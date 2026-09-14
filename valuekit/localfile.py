@@ -51,7 +51,6 @@ __all__ = [
     "HostEntry",
     "LocalConfig",
     "load_local",
-    "read_mode",
     "write_mode",
 ]
 
@@ -142,21 +141,6 @@ def _workers(path: Path, section: str, value) -> int:
 # ---------------------------------------------------------------------------
 
 _MODE_LINE = re.compile(r"^\s*mode\s*=")
-
-
-def read_mode(root: str | os.PathLike | None, store_dir: str | os.PathLike | None) -> str:
-    """The mode in force for the project at *root*; ``all`` when unset or
-    the file is unreadable.
-
-    With no store directory a host's results would have nowhere to land:
-    that case is ``local``.
-    """
-    if store_dir is None:
-        return "local"
-    try:
-        return load_local(root).mode
-    except RuntimeError:
-        return DEFAULT_MODE
 
 
 def write_mode(root: str | os.PathLike, mode: str) -> None:

@@ -40,13 +40,13 @@ def calculate_geometry(obs, config):
 obs = obs | calculate_geometry(obs, config)
 ```
 
-`obs` and `config` are `ImmutableMap`s here, and that is what buys the
+`obs` and `config` are `ImmutableMap`s here, and that is what gives the
 per-key tracing: reads of a map argument are recorded individually, so a
 change to a key the function never read does not invalidate it. Any other
 argument — including a plain `dict` — is hashed whole. `ImmutableMap` has
 its own section below.
 
-Nothing else about the call changes. Arguments arrive as the objects you
+Nothing else about the call changes. Arguments are passed as the objects you
 passed, and the result is the object the function built, so a cache hit
 differs from a miss only in that the body did not run.
 
@@ -102,7 +102,7 @@ all of them recompute at their next call. `clear_cache()` deletes
 everything computed or logged.
 
 Tunables belong in config maps rather than in module globals. A traced
-config read is exact per call (change an unread key and hits are kept),
+config read is exact per call (change an unread key and hits continue),
 while a module constant is definition-wide (edit it and every function
 naming it recomputes).
 
@@ -110,12 +110,12 @@ naming it recomputes).
 
 A compiled extension (nanobind, pybind11, Cython, plain C) has no source to
 walk, so its binary is its marker. That matters where the version marker
-cannot stand in for it: a package installed from a released wheel changes
+would be wrong: a package installed from a released wheel changes
 only through a reinstall, which moves its version, while a package installed
 from a local directory — `pip install -e .` or `pip install .` — is rebuilt
 in place under the same version. Extensions in the second group are hashed
 by content, so rebuilding your own C++ recomputes what depends on it, and
-released wheels keep their cheap version markers.
+released wheels keep their version markers, which cost nothing to compute.
 
 The binary is a stricter dependency than the sources it was built from: it
 carries the compiler, its flags, and any library linked statically into the
@@ -131,7 +131,7 @@ decision.
 
 `step.cached(obs, cfg)` returns the stored result for those arguments
 without executing, or raises `CacheMiss`. It is the lookup half of a call,
-for code that wants to know what has been computed without computing.
+for code that needs to know what has been computed without computing.
 
 ## `@pure_local`
 
@@ -289,7 +289,7 @@ values are a fixed set: `None`, `bool`, `int`, `float`, `complex`, `str`,
 dicts, `ImmutableMap`s and plain-data dataclasses of the same.
 
 A stored value reloads as an equal value of the same type, which is what
-lets a hit stand in for the call. That is also why the content hash
+lets a hit be returned in place of running the call. That is also why the content hash
 distinguishes a list from a tuple, two dicts that differ only in order, and
 a writeable array from a read-only one: a hash has to identify a value
 exactly for a content-addressed store to be able to hand it back.
@@ -316,8 +316,8 @@ and the cache would serve a stale result. So adding a method to a dataclass
 you already cache turns it into a `register_type` job, where you take on
 hashing it yourself. That cliff is deliberate.
 
-A stored entry names its class, but nothing is imported on the strength of
-one: the class is resolved only among modules the process has already
+A stored entry names its class, but nothing is imported because an entry
+names it: the class is resolved only among modules the process has already
 loaded, and a class that has changed since the entry was written reads as a
 miss rather than being rebuilt into something it no longer means.
 
@@ -346,7 +346,7 @@ imports the named modules, takes the function hash of every `@pure` and
 records of every other function hash, then every object that no remaining
 call record, batch or run-log entry names. A run's log that names a
 removed call record reads as stale from then on, and `logs()` says so.
-Name every module whose results you want kept; a function that is not
+Name every module whose results you want retained; a function that is not
 imported reads as gone.
 `--dry-run` reports without deleting, and `--store` names the directory
 when the modules do not configure one.
@@ -356,7 +356,7 @@ when the modules do not configure one.
 ``run_all(fn, inputs)`` runs a module-level ``@pure`` (or ``@pure_local``)
 function over a batch of inputs in parallel and returns a ``BatchResult``
 of per-input outcomes, in input order. An input whose result is already
-cached is answered without a worker. Each other input runs in its own
+cached is served without a worker. Each other input runs in its own
 process, spawned per task, with ``max_workers`` running at once on this
 machine (default: the ``[local] workers`` line of ``valuekit.local.toml``,
 else the CPU count). Isolation
@@ -378,7 +378,7 @@ Every input is processed, and every failure is recorded against the input
 that caused it. An exception raised by ``fn`` carries the string-form
 traceback captured in the worker. ``timeout=`` limits the seconds each
 input may spend running; a breach kills that input's process promptly and
-records a ``TimeoutError``. A process that dies without raising (a
+records a ``TimeoutError``. A process that exits without raising (a
 segfault or an out-of-memory kill) records a ``RuntimeError`` naming the
 input and the exit code.
 
@@ -444,7 +444,7 @@ effect on its own.
 Processing code and the code that looks at what it produced belong in
 different places. A pipeline step should not know what will be plotted,
 and a plotting script should neither import the pipeline nor run any of
-it. What joins them is `log`:
+it. What connects them is `log`:
 
 ```python
 from valuekit import log
@@ -536,7 +536,7 @@ and the only question across a code change is whether the batch has been
 re-run since. One file is written per finished input, so a batch is
 readable the moment its first input finishes; `b.refresh()` picks up the
 rest. `b.logs` is read from the call records, so it is the batch's logged values whether
-its inputs ran or were answered from cache.
+its inputs ran or were served from cache.
 
 ## Running on other machines
 
@@ -557,7 +557,7 @@ point of view a batch that ran on three machines is indistinguishable from
 one that ran on this one.
 
 Your project has to be a *locked* project: its tree must carry a lock file
-from a tool valuekit knows how to invoke. Today that is `uv.lock`; a tree
+from a tool valuekit recognises. Today that is `uv.lock`; a tree
 without one is refused before anything is sent, and the refusal names the
 lock files valuekit understands. The lock pins the Python version and every
 dependency, so what the host builds is what you have.
@@ -584,7 +584,7 @@ source_root = "~/.cache/valuekit/source"      # optional; this is the default
 Login must work without a prompt (`ssh mac.local true`), which means a key
 and, on macOS, Remote Login switched on; on Windows the OpenSSH Server
 feature. A key with a passphrase needs an agent holding it wherever the
-main process runs, so a main process that is itself reached over ssh wants `ssh -A`. The lock tool must be on the PATH a *non-interactive* ssh session
+main process runs, so a main process that is itself reached over ssh needs `ssh -A`. The lock tool must be on the PATH a *non-interactive* ssh session
 sees, which is shorter than your login shell's; valuekit also looks in
 `~/.local/bin` and `~/.cargo/bin`. A Windows host is reached through sshd's
 default shell: leave that as `cmd.exe`, because PowerShell in that role
@@ -601,7 +601,7 @@ and that is expected: an extension's marker in the function hash is the
 hash of *your* build of it, and a worker is given that marker rather than
 hashing its own binary, so results computed anywhere are keyed by what you
 ran. The host's binary must then be a build of the same sources, which the
-sync guarantees, kept current by a build backend that rebuilds on import
+sync guarantees, up to date through a build backend that rebuilds on import
 (scikit-build-core with `editable.rebuild`, or meson-python). Such a backend runs
 `cmake` by name at import time, so put the build tools in the project
 (`cmake` and `ninja` are on PyPI) and build without isolation (for uv,
@@ -618,11 +618,11 @@ those removed, and touches nothing else there, so the build directory and
 the environment persist and a native extension rebuilds incrementally. An
 unchanged project costs one comparison. Two checkouts of one project that
 should not share a host directory give one of them a different `project`
-name. A host holds one version at a time: a run that wants a different
+name. A host holds one version at a time: a run that needs a different
 version while an earlier run is still using that host is refused, with the
 earlier run named, and continues on its other hosts and this machine.
-Stop the earlier run, or wait for it. A run that wants the same version
-joins.
+Stop the earlier run, or wait for it. A run that needs the same version
+proceeds.
 
 Where work goes is a *mode*, the `mode` line of `valuekit.local.toml`:
 
@@ -632,16 +632,16 @@ Where work goes is a *mode*, the `mode` line of `valuekit.local.toml`:
 | `local` | everything | nothing |
 | `remote` | nothing, unless no host is reachable | everything |
 
-The default is `all`: a host in the file is there to be used, the way a
-core is. Edit the line, switch it from the monitor (below), or run
+The default is `all`: a host named in the file is used unless the mode
+excludes it. Edit the line, switch it from the monitor (below), or run
 `python -m valuekit.monitor --mode remote <cache-dir>` from inside the
 project. The main process re-reads the file each time it starts a task, so a switch during a batch applies to the next
 task; tasks already running finish where they are. Syncing a host never
-holds the batch back: this machine starts at once and a host joins when it
-is ready (under `remote`, this machine waits for it instead). A host that
+delays the batch: this machine starts at once and a host starts taking
+tasks when it is ready (under `remote`, this machine waits for it instead). A host that
 cannot be reached or synced is dropped with the reason recorded once,
-and the batch continues elsewhere. A host whose connection drops mid-batch
-loses nothing: the inputs that were running there run again elsewhere,
+and the batch continues elsewhere. When a host's connection drops mid-batch
+no input is lost: the inputs that were running there run again elsewhere,
 once, and the host takes no more.
 
 `run_all` takes no argument about any of this. Where a call ran must
@@ -651,7 +651,7 @@ function hash could reach it.
 ## Watching a run
 
 A cache that works is silent, which makes it hard to tell from one that
-doesn't: a step that ought to be hitting and quietly isn't looks exactly
+doesn't: a step that ought to be hitting and isn't looks exactly
 like a step that is slow. `python -m valuekit.monitor` shows what is
 actually happening, from a separate process:
 

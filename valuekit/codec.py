@@ -1,4 +1,4 @@
-"""The structural value format, independent of where values are kept.
+"""The structural value format, independent of where values are stored.
 
 A composite value is encoded as a tag and the content hashes of its
 children; each child is its own object, reached through a callback.  That
@@ -57,7 +57,7 @@ def encode(v: Any, put: Callable[[Any], str]) -> bytes:
 
     *put* takes a child value and returns its content hash, having made the
     child retrievable by that hash -- written to a store, or queued for a
-    peer.  ndarrays never arrive here; the caller handles them.
+    peer.  ndarrays are never passed here; the caller handles them.
     """
     t = type(v)
     if t is tuple:
@@ -127,7 +127,7 @@ def children(data: bytes) -> list[str]:
     """The hashes an encoded value refers to, without rebuilding it.
 
     What a reachability walk over the store needs: which objects this one
-    keeps alive.  Nothing is decoded, so no class has to be importable.
+    references.  Nothing is decoded, so no class has to be importable.
     """
     tag, body, _ = _read_blob(data, 0)
     if tag == b"I":

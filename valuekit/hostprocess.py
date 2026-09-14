@@ -20,7 +20,7 @@ Workers are started with the allowlisted environment, as they are locally;
 ``VALUEKIT_TREE``, set by the bootstrap that started this process, passes
 through it and tells each worker which source tree it is in.
 This process exits when its stdin closes, after killing every worker it
-started: a dropped connection or a main process that died leaves nothing running.
+started: a dropped connection or a main process that exited leaves nothing running.
 Bytes on a channel are passed through untouched; what they mean is between
 the main process and the worker.
 """
@@ -41,13 +41,42 @@ __all__ = ["main", "serve"]
 _STDERR_TAIL = 64 << 10
 
 
+class StderrTail:
+    """The last ``_STDERR_TAIL`` bytes a process has written to stderr,
+    read by a thread as they arrive.  ``bytes()`` may be called from any
+    thread, at any time."""
+
+    __slots__ = ("_buf", "_lock")
+
+    def __init__(self, proc: subprocess.Popen):
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        fd = proc.stderr.fileno()  # type: ignore[union-attr]
+        threading.Thread(target=self._read, args=(fd,), daemon=True).start()
+
+    def _read(self, fd: int) -> None:
+        while True:
+            try:
+                chunk = os.read(fd, 1 << 16)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                return
+            with self._lock:
+                self._buf += chunk
+                del self._buf[:-_STDERR_TAIL]
+
+    def bytes(self) -> bytes:
+        with self._lock:
+            return bytes(self._buf)
+
+
 class _Worker:
-    __slots__ = ("proc", "stderr", "lock")
+    __slots__ = ("proc", "stderr")
 
     def __init__(self, proc: subprocess.Popen):
         self.proc = proc
-        self.stderr = bytearray()
-        self.lock = threading.Lock()
+        self.stderr = StderrTail(proc)
 
 
 # What a process needs from the environment to start and to find its
@@ -98,25 +127,11 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
                 break
             send(protocol.DATA, protocol.channelled(ch, chunk))
         code = w.proc.wait()
-        with w.lock:
-            tail = bytes(w.stderr[-_STDERR_TAIL:])
+        tail = w.stderr.bytes()
         send(
             protocol.EXIT,
             protocol.channelled(ch, code.to_bytes(4, "little", signed=True) + tail),
         )
-
-    def read_stderr(w: _Worker) -> None:
-        fd = w.proc.stderr.fileno()
-        while True:
-            try:
-                chunk = os.read(fd, 1 << 16)
-            except OSError:
-                chunk = b""
-            if not chunk:
-                return
-            with w.lock:
-                w.stderr += chunk
-                del w.stderr[:-_STDERR_TAIL]
 
     send(protocol.HOST, protocol.strings(PYTHON, str(os.cpu_count() or 1), str(os.getpid())))
     env = worker_env()
@@ -137,7 +152,6 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
                     env=env,
                 )
                 w = workers[ch] = _Worker(proc)
-                threading.Thread(target=read_stderr, args=(w,), daemon=True).start()
                 threading.Thread(target=forward_stdout, args=(ch, w), daemon=True).start()
             elif tag == protocol.DATA:
                 w = workers.get(ch)
@@ -146,7 +160,7 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
                         w.proc.stdin.write(rest)
                         w.proc.stdin.flush()
                     except (OSError, ValueError):
-                        pass  # the worker died; its EXIT says so
+                        pass  # the worker has exited; its EXIT says so
             elif tag == protocol.CLOSE:
                 w = workers.get(ch)
                 if w is not None:

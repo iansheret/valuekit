@@ -7,7 +7,7 @@ can be memoised, so valuekit memoises them.
 Arguments are hashed, not converted: a dict stays a dict, a list stays a
 list, an array keeps its writeability.  A cache hit returns a value equal to
 what the call would have produced, of the same type — including on the miss
-that recorded it, where the function's own object is handed straight back.
+that recorded it, where the function's own object is returned.
 
 Fine-grained invalidation is opt-in, and the opt-in is passing an
 :class:`~valuekit.ImmutableMap`.  Such an argument is wrapped on a miss in a
@@ -374,7 +374,7 @@ def _pure(fn: Callable, *, local: bool):
         """The first matching record whose value loads, or None.
 
         Reports the hit and records it in the enclosing call only once the
-        value is in hand: a CacheMiss on the value falls through to the
+        value has loaded: a CacheMiss on the value falls through to the
         next candidate, and reporting a match before that would overcount.
         """
         for h, record in _matches(store, function_hash, arguments, arg_hashes):
@@ -383,7 +383,7 @@ def _pure(fn: Callable, *, local: bool):
             except CacheMiss:
                 continue  # the value is gone: try others, else rerun
             events.record(
-                store, "hit", fn=qn, key=function_hash, dur=time.perf_counter() - t_lookup
+                store, "hit", fn=qn, function_hash=function_hash, dur=time.perf_counter() - t_lookup
             )
             _note_call(qn, function_hash, h)
             return (value,)
@@ -417,7 +417,7 @@ def _pure(fn: Callable, *, local: bool):
         if breakpoints_force(spans):
             global _force_epoch
             _force_epoch += 1
-            events.record(store, "forced", fn=qn, key=function_hash)
+            events.record(store, "forced", fn=qn, function_hash=function_hash)
             token = _ctx.set(_Frame(store, discard=True))
             try:
                 return fn(*args, **kwargs)
@@ -450,7 +450,7 @@ def _pure(fn: Callable, *, local: bool):
         except BaseException as e:
             # Report and re-raise unchanged: the cache is still untouched,
             # and a body that raises is otherwise invisible from outside.
-            events.record(store, "error", fn=qn, key=function_hash, exc=type(e).__name__)
+            events.record(store, "error", fn=qn, function_hash=function_hash, exc=type(e).__name__)
             raise
         finally:
             _ctx.reset(token)
@@ -469,7 +469,7 @@ def _pure(fn: Callable, *, local: bool):
                 store,
                 "miss",
                 fn=qn,
-                key=function_hash,
+                function_hash=function_hash,
                 dur=time.perf_counter() - t_lookup,
                 exec=exec_dur,
                 stored=False,
@@ -500,7 +500,7 @@ def _pure(fn: Callable, *, local: bool):
             store,
             "miss",
             fn=qn,
-            key=function_hash,
+            function_hash=function_hash,
             dur=time.perf_counter() - t_lookup,
             exec=exec_dur,
             stored=True,

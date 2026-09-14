@@ -5,7 +5,7 @@ a :class:`BatchResult` of per-input outcomes, in input order.
 
 ``fn`` must be memoised (``@pure`` or ``@pure_local``).  Three things rest
 on that.  An input whose result the cache already holds needs no worker,
-and is answered here.  Each input's root call record can be named in a *batch
+and is served here.  Each input's root call record can be named in a *batch
 record* (see :mod:`valuekit.batches`), which is how analysis code reaches
 what the batch produced without reconstructing arguments.  And running
 somewhere other than this machine is safe only for a function whose
@@ -28,7 +28,7 @@ that caused it.  There are three kinds, treated alike:
 * a timeout.  ``timeout=`` limits the seconds each input may spend
   running; a breach kills that input's process promptly and records a
   TimeoutError;
-* a process that dies without raising (a segfault or an out-of-memory
+* a process that exits without raising (a segfault or an out-of-memory
   kill), recorded as a RuntimeError naming the input and the exit code.
 
 ``.values`` returns the plain list of results, raising an ExceptionGroup if
@@ -37,8 +37,8 @@ lists ``(input, exception)`` pairs for callers that handle them explicitly.
 
 Nothing is re-run automatically.  To debug one input, call ``fn(x)`` on
 it: the cached prefix is served without executing and the failing step runs
-inline, in this process, with a live stack — and you choose which input you
-land in, rather than whichever one happened to fail first.
+inline, in this process, with a live stack — and you choose which input to
+debug, rather than whichever one happened to fail first.
 
 One debugger accommodation remains, because breakpoints do not reach
 spawned workers: if a live breakpoint intersects anything reachable by name
@@ -88,8 +88,8 @@ _batch_seq = 0
 
 # Where work happens is configuration (the local file), never a call-site
 # argument: a host list in code could reach a function hash, and where a call
-# ran must not be able to affect its result.  This private hook stands in
-# for the local file's hosts in tests: a name to the command
+# ran must not be able to affect its result.  This private hook replaces
+# the local file's hosts in tests: a name to the command
 # that runs a Python 3 to bootstrap with, or to ``(command, workers)``; a host
 # with no capacity given reports its own.
 _host_commands: dict[str, Any] | None = None
@@ -203,7 +203,7 @@ class _Task:
 
 
 def _outcome_of(t: _Task, done: Finished, name: str, timeout) -> Outcome:
-    """A finished task's answer as an Outcome against its input."""
+    """A finished task's result as an Outcome against its input."""
     if done.kind == "ok":
         return Outcome(t.x, value=done.value)
     if done.kind == "error":
@@ -223,7 +223,7 @@ def _outcome_of(t: _Task, done: Finished, name: str, timeout) -> Outcome:
         ))
     # "exited", or "connection_closed" for the second time
     return Outcome(t.x, exc=RuntimeError(
-        f"a worker died without raising while processing "
+        f"a worker exited without raising while processing "
         f"{name}({t.x!r}) ({done.text}). Completed steps are "
         f"cached; call {name}({t.x!r}) yourself to debug it."
     ))
@@ -295,15 +295,19 @@ class _Hosts:
     """The hosts a batch may run on, and how many tasks each may hold.
 
     Remote hosts come from the local file (or the test hook); each syncs
-    on its own thread and counts only once it is ready.  The
-    mode is re-read from the file every time capacities are asked for, so a
-    switch made while the batch runs applies to the next task started.
+    on its own thread and counts only once it is ready.  The mode is
+    re-read from the file every time capacities are asked for, so a switch
+    made while the batch runs applies to the next task started; a file
+    that cannot be read leaves the mode last read in force.
     """
 
     def __init__(
-        self, fn, store_dir: str | None, completions: queue.Queue, store, batch: int,
-        max_workers: int | None = None,
+        self, fn, store_dir: str | None, store, batch: int, max_workers: int | None = None
     ):
+        # Every host puts (handle, payload) here as a worker returns, sends
+        # a request, or exits; deliver() passes each to its handle.
+        completions: queue.Queue = queue.Queue()
+        self._completions = completions
         self.local = LocalHost(fn, store_dir, completions)
         self.hosts: list[RemoteHost] = []
         self._states: dict[str, str] = {}  # name -> syncing | ready | failed
@@ -311,7 +315,7 @@ class _Hosts:
         self._batch = batch
         self._store_dir = store_dir
         self._closed = False
-        # The local file lives in the function's project; a function with
+        # The local file is in the function's project; a function with
         # no project (defined in __main__, or exec'd) has no file and so no
         # hosts.
         try:
@@ -320,7 +324,12 @@ class _Hosts:
             self._root = None
         config = localfile.load_local(self._root)
         self.local_workers = config.local_workers if max_workers is None else max_workers
-        if _host_commands is not None:
+        self._mode = config.mode
+        if store_dir is None:
+            # A remote host sends every result to this process's store;
+            # with none configured there is nowhere to put them.
+            pass
+        elif _host_commands is not None:
             project = Project(fn, config.project) if _host_commands else None
             source_root = os.path.join(store_dir, "source") if store_dir else ""
             for name, spec in _host_commands.items():
@@ -382,25 +391,44 @@ class _Hosts:
         """The mode in force and each host's capacity under it.
 
         Syncing is started here, never waited for: this machine's workers
-        start at once and a host joins when it is ready, whether the mode
-        named it from the start or a switch mid-batch brought it in.
+        start at once and a host starts taking tasks when it is ready,
+        whether the mode named it from the start or a switch mid-batch added it.
         """
-        mode = localfile.read_mode(self._root, self._store_dir)
+        try:
+            self._mode = localfile.load_local(self._root).mode
+        except RuntimeError:
+            pass  # the file cannot be read since the last time: that mode stays in force
+        mode = self._mode
         if mode != "local" and self.hosts:
             self.sync(wait=False)
         remote = {}
         for b in self.hosts:
             if b.name not in self._states:
                 continue  # never asked, under a local mode
-            usable = self._states[b.name] == "ready" and not b.dead
+            usable = self._states[b.name] == "ready" and not b.dropped
             remote[b.name] = (b.capacity or 0) if usable else 0
-            if b.dead and self._states[b.name] == "ready":
+            if b.dropped and self._states[b.name] == "ready":
                 self._states[b.name] = "failed"
                 events.record(
                     self._store, "host", id=self._batch, name=b.name, ok=False,
                     reason=b.failure or "the connection closed", capacity=b.capacity,
                 )
         return mode, modes.capacities(mode, self.local_workers, remote, self.syncing())
+
+    def deliver(self, block: bool) -> None:
+        """Pass what the hosts have delivered to the handles it is for;
+        with *block*, wait up to ``_POLL`` seconds for the first."""
+        try:
+            handle, payload = self._completions.get(timeout=_POLL if block else 0)
+        except queue.Empty:
+            return
+        handle.feed(payload)
+        while True:
+            try:
+                handle, payload = self._completions.get_nowait()
+            except queue.Empty:
+                return
+            handle.feed(payload)
 
     def close(self) -> None:
         self._closed = True
@@ -426,7 +454,7 @@ def run_all(
     own process; ``max_workers`` is how many run at once on this machine
     (default: the ``[local] workers`` line of the local file, else the CPU
     count).  Remote hosts, if the local file names any, add their own
-    capacity.  An input whose result is already cached is answered without
+    capacity.  An input whose result is already cached is served without
     a worker.  ``timeout`` limits the seconds each input may spend
     running; a breach kills that input's process and records a
     TimeoutError on its outcome, leaving the rest of the batch unaffected.
@@ -459,7 +487,7 @@ def run_all(
     store_dir = str(store.root) if isinstance(store, LocalStore) else None
     qualname = getattr(fn, "__qualname__", repr(fn))
     name = name or qualname
-    runlog.current_run(store)  # begun here, so that every worker joins this run
+    runlog.current_run(store)  # begun here, so that every worker writes into this run
 
     global _batch_seq
     _batch_seq += 1
@@ -506,25 +534,22 @@ def run_all(
         events.record(store, "end", id=batch)
         return BatchResult(o for o in outcomes if o is not None)
 
-    completions: queue.Queue = queue.Queue()
-    hosts = _Hosts(fn, store_dir, completions, store, batch, max_workers)
+    hosts = _Hosts(fn, store_dir, store, batch, max_workers)
 
     running: list[_Task] = []
     busy: dict[str, int] = {}  # host name -> tasks running there
     requeued: set[int] = set()  # inputs already run again once after losing their host
 
-    def _start(host, idx: int, x: Any) -> None:
-        handle = host.start(x)
-        deadline = time.monotonic() + timeout if timeout is not None else None
-        running.append(_Task(x, idx, handle, deadline, host.name))
-        busy[host.name] = busy.get(host.name, 0) + 1
-        events.record(store, "start", id=batch, i=idx, host=host.name)
-
     def _start_pending() -> None:
         _, caps = hosts.capacities()
         for host in hosts.all():
             while pending and busy.get(host.name, 0) < caps.get(host.name, 0):
-                _start(host, *pending.popleft())
+                idx, x = pending.popleft()
+                handle = host.start(x)
+                deadline = time.monotonic() + timeout if timeout is not None else None
+                running.append(_Task(x, idx, handle, deadline, host.name))
+                busy[host.name] = busy.get(host.name, 0) + 1
+                events.record(store, "start", id=batch, i=idx, host=host.name)
 
     def _run_here() -> None:
         """Run the next pending input in this process: no host may run
@@ -538,20 +563,6 @@ def run_all(
         outcomes[idx] = o
         recorder.outcome(idx, o, host="main")
 
-    def _deliver(block: bool) -> None:
-        """Feed handles whatever the hosts have delivered."""
-        try:
-            handle, payload = completions.get(timeout=_POLL if block else 0)
-        except queue.Empty:
-            return
-        handle.feed(payload)
-        while True:
-            try:
-                handle, payload = completions.get_nowait()
-            except queue.Empty:
-                return
-            handle.feed(payload)
-
     try:
         while pending or running:
             _start_pending()
@@ -559,20 +570,20 @@ def run_all(
                 if not pending:
                     break
                 if hosts.syncing():
-                    _deliver(block=True)  # a host is still syncing; wait for it
+                    hosts.deliver(block=True)  # a host is still syncing; wait for it
                 else:
                     _run_here()
                 continue
-            _deliver(block=True)
+            hosts.deliver(block=True)
             now = time.monotonic()
             for t in list(running):
                 done = t.handle.finished()
                 if done is None and t.deadline is not None and now >= t.deadline:
                     t.handle.kill()
-                    _deliver(block=False)
+                    hosts.deliver(block=False)
                     done = t.handle.finished()
                     if done is None or done.kind in ("exited", "connection_closed"):
-                        done = Finished("timed_out")  # only an answer means it finished first
+                        done = Finished("timed_out")  # only a result means it finished first
                 if done is None:
                     continue
                 running.remove(t)
@@ -590,7 +601,7 @@ def run_all(
                 outcomes[t.idx] = o
                 recorder.outcome(t.idx, o, host=t.where)
     finally:
-        # Covers KeyboardInterrupt: no orphans.
+        # Covers KeyboardInterrupt: no worker process outlives the batch.
         for t in running:
             try:
                 t.handle.kill()

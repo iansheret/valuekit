@@ -10,8 +10,8 @@ every call record and batch record whose function_hash is not among them, then
 every object that no remaining record or batch names.
 
 Retention is by code version, never by age.  A result from a year ago whose
-function has not changed is as current as one from this morning, and is
-kept.  What cannot be told apart is a result for an input nobody wants any
+function has not changed is as current as one from this morning, and
+stays.  What cannot be told apart is a result for an input nobody uses any
 more: it looks exactly like one somebody does, so it stays.
 
 The modules named must be every module that defines a memoised function
@@ -59,7 +59,7 @@ def sweep(store_dir: str | os.PathLike, modules: list[str], dry_run: bool = Fals
 def sweep_store(store: LocalStore, keys: set[str], dry_run: bool = False) -> dict:
     """Keep the call records of the function hashes in *keys* and the
     batches recorded under them; delete every other call record and batch,
-    then every object that none of what is kept, and no run log entry,
+    then every object that none of what remains, and no run log entry,
     names.  Returns counts of what was (or would be) removed."""
     counts = {"functions": len(keys), "records": 0, "batches": 0, "objects": 0}
 
@@ -95,7 +95,7 @@ def sweep_store(store: LocalStore, keys: set[str], dry_run: bool = False) -> dic
         for name_dir in list(bdir.iterdir()):
             if not name_dir.is_dir():
                 continue
-            kept = []
+            live_ids = []
             for run in list(name_dir.iterdir()):
                 if not run.is_dir():
                     continue
@@ -103,8 +103,9 @@ def sweep_store(store: LocalStore, keys: set[str], dry_run: bool = False) -> dic
                     header = json.loads((run / "header.json").read_bytes())
                 except (OSError, ValueError):
                     header = {}
-                if header.get("function_hash") in keys:
-                    kept.append(run.name)
+                is_live = header.get("function_hash") in keys
+                if is_live:
+                    live_ids.append(run.name)
                     reachable.update(h for h in header.get("inputs", []) if h)
                 else:
                     counts["batches"] += 1
@@ -113,9 +114,9 @@ def sweep_store(store: LocalStore, keys: set[str], dry_run: bool = False) -> dic
                 latest = (name_dir / "latest").read_text().strip()
             except OSError:
                 latest = ""
-            if not dry_run and latest and latest not in kept:
+            if not dry_run and latest and latest not in live_ids:
                 remove(name_dir / "latest")
-            if not dry_run and not kept:
+            if not dry_run and not live_ids:
                 remove(name_dir)
 
     # -- what the run logs' entries name: a value logged outside any memoised

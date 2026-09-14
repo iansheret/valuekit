@@ -5,7 +5,7 @@ capacity; ``local`` runs everything on this machine; ``remote`` runs as
 little here as possible, which means nothing here while any remote host
 is ready or still syncing, and everything here when none is.  The mode is
 the ``mode`` line of the local file (:mod:`valuekit.localfile`); absent, it
-is ``all``: a host in the file is there to be used, the way a core is.
+is ``all``: a host named in the file is used unless the mode excludes it.
 
 The scheduler reads the file each time it is about to start a task, so an
 edit takes effect for the next task started; tasks already running finish
@@ -32,7 +32,7 @@ def capacities(
 
     Under ``remote`` this machine stays idle while a remote host is still
     syncing: the person who chose that mode wants their machine free, and
-    a short batch would otherwise be over before the host arrived.
+    a short batch would otherwise be over before the host was ready.
     """
     if mode == "local":
         return {**{name: 0 for name in remote}, "local": local}

@@ -118,7 +118,7 @@ def _dist_version(top: str) -> str | None:
 # ---------------------------------------------------------------------------
 #
 # A compiled extension has no source to walk and no code object to hash.
-# Where its version can stand for it -- a distribution installed from a
+# Where its version is a sufficient marker -- a distribution installed from a
 # released artefact changes only through a reinstall, which moves the
 # version -- the version is its marker.  One built from a local directory,
 # editable or not, is rebuilt in place under the same version, so its
@@ -133,7 +133,7 @@ def _dist_version(top: str) -> str | None:
 # keyed by the main process's build; the sync guarantees the worker's binary
 # was built from the same sources.  An extension the main process never
 # reached has no marker on the worker, so the hashes differ and the worker
-# is refused rather than trusted.
+# is refused rather than accepted.
 
 _markers_here: dict[str, str] | None = None  # set on a worker; None on the main process
 _walk = threading.local()  # .extensions: the markers the walk in progress has met
@@ -167,7 +167,7 @@ def _dist_dir(dist: Any) -> str | None:
 
 
 def _is_live_extension(filename: str, top: str) -> bool:
-    """Report whether a file is an extension whose version cannot stand for
+    """Report whether a file is an extension whose version does not identify
     its contents."""
     if not _is_extension_file(filename):
         return False
@@ -194,7 +194,7 @@ def _binary_hash(filename: str) -> str:
 
 
 def _extension_hash(module_name: str | None, filename: str) -> str:
-    """What stands for the live extension *module_name* at *filename*: on the
+    """The marker for the live extension *module_name* at *filename*: on the
     main process its binary's hash; on a worker the marker the main process
     sent for it, or a value no marker can equal."""
     name = module_name or ""
@@ -211,7 +211,7 @@ def _extension_marker(module_name: str | None) -> str | None:
     """Return the marker for *module_name* if it names a native extension.
 
     Objects a compiled module defines -- a nanobind function, a Cython class
-    -- carry no Python code, so the module they came from stands for them.
+    -- carry no Python code, so the module they came from is their marker.
     """
     mod = sys.modules.get(module_name or "")
     filename = getattr(mod, "__file__", None)
@@ -224,7 +224,7 @@ def _is_installed(filename: str, top: str) -> bool:
     """Whether a module file belongs to an installed package rather than to
     the user's project.
 
-    By where it lives (the interpreter's own directories, as sysconfig and
+    By its path (the interpreter's own directories, as sysconfig and
     site report them) or by what claims it (a released distribution, wherever
     it was put).  Not by a ``site-packages`` substring: that misses ``pip
     --target`` and vendored installs, and matches any project that happens to
@@ -260,7 +260,7 @@ def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
         filename = getattr(mod, "__file__", None)
     if filename and _is_live_extension(filename, top):
         # An extension rebuilt in place under a fixed version: its binary,
-        # or on a worker the main process's, stands for it.
+        # or on a worker the main process's, is its marker.
         return _PKG, f"ext:{module_name}={_extension_hash(module_name, filename)}"
     if filename and _is_installed(filename, top):
         ver = _dist_version(top)
@@ -369,8 +369,8 @@ class _Walker:
         if id(code) in self.seen:
             self._mark("cycle")
             return
-        # Runtime state that parameterises the function but lives outside
-        # its bytecode.  A module arriving this way is attribute-accessed in
+        # Runtime state that parameterises the function but is outside
+        # its bytecode.  A module reached this way is attribute-accessed in
         # the body, so the body's names are what resolve its submodules.
         names = code.co_names
         for i, d in enumerate(fn.__defaults__ or ()):

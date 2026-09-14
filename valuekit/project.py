@@ -13,23 +13,23 @@ files, never libraries.  A dependency is the environment's job on both
 machines, exactly as numpy is -- and shipping a locally built extension would
 be worse than useless anyway, since it is the wrong architecture as often as
 not.  Compiled artefacts are therefore excluded outright rather than by
-trusting the project's ignore rules.
+relying on the project's ignore rules.
 
 A host keeps one source tree per project, updated in place from the
 manifest's difference, so a build directory there persists across edits;
 the manifest hash (the *project hash*) says whether the host's copy is current.
-On this machine the tree lives under the store directory, beside
+On this machine the tree is under the store directory, beside
 ``objects/`` and ``events/``: the store directory is where valuekit writes,
 and nothing is written until one is named.
 
 What happens to the tree on the host -- unpacking it, building the
 environment the project's lock file describes, starting the host process
-inside it -- is :mod:`valuekit.bootstrap`'s.  Nothing here trusts that any
+inside it -- is :mod:`valuekit.bootstrap`'s.  Nothing here assumes that any
 of it worked: :mod:`valuekit.worker` checks that what it actually imported came from the tree
 afterwards, and the function-hash handshake checks the result again --
 because a source tree on ``sys.path`` can still lose to an editable
-install's meta-path finder, and a silent wrong answer is the one outcome
-worth any amount of machinery to avoid.
+install's meta-path finder, and a wrong result with no sign of it is the
+outcome every check here exists to prevent.
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ MAX_FILES = 20_000
 
 
 class ProjectError(Exception):
-    """The project cannot be described or shipped as it stands."""
+    """The project cannot be described or shipped in its current state."""
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +157,8 @@ def user_span_files(spans: Iterable[tuple[str, int, int]]) -> list[str]:
     Spans record ``co_filename`` unmodified, so they carry synthetic names
     (``<string>`` for a dataclass's generated methods, or anything exec'd),
     the main script itself, and genuine stdlib or site-packages paths -- a
-    user class whose methods came from elsewhere drags those in.  Only what
-    survives all three filters is a file worth syncing.
+    user class whose methods came from elsewhere includes those.  Only what
+    passes all three filters is a file to send.
     """
     out: list[str] = []
     for entry in spans:
@@ -203,7 +203,7 @@ def _store_dirs() -> list[str]:
     """The current store's directory, if it has one: never part of a tree.
 
     A cache configured inside the project would otherwise be packed into the
-    source tree that lives beside it, and would move the tree's hash every
+    source tree beside it, and would move the tree's hash every
     time a value was written.
     """
     from .pure import _current_store
@@ -217,7 +217,7 @@ def project_hash(root: str) -> str:
     """The hash of the project at *root*: its manifest hash, right now.
 
     Not memoised across calls: the manifest is what says whether the tree
-    changed, so a remembered answer is the one thing it must not be.  A
+    changed, so a stored result is the one thing it must not be.  A
     caller that needs it repeatedly within one operation keeps it for that
     operation (the walk does).
     """
@@ -228,10 +228,10 @@ class Project:
     """The project a function belongs to, as it would be shipped.
 
     Built once per batch and shared by every host: the manifest walk reads
-    every file in the tree, and the answer is the same for all of them.
+    every file in the tree, and the result is the same for all of them.
     ``project_hash`` names exactly this set of files at exactly these contents;
-    it is the name of the source tree on every host, and the hash that
-    stands for a native extension built from it (see :mod:`valuekit.functionhash`).
+    it is the name of the source tree on every host, and the marker for
+    a native extension built from it (see :mod:`valuekit.functionhash`).
     """
 
     def __init__(self, fn: Any, name: str | None = None):
@@ -251,10 +251,10 @@ class Project:
         """Why no host could take this project, or "".
 
         Refused here, before anything is sent: a tree without a lock file
-        valuekit knows, since no host could build its environment; and a
+        valuekit recognises, since no host could build its environment; and a
         dependency in a sibling checkout the tree never contained, which
         would surface on the host as "cannot import X", with nothing to say
-        that X lives somewhere the main process never offered to send.
+        that X is somewhere the main process never offered to send.
         """
         from . import bootstrap
         from .functionhash import reachable_set
@@ -262,8 +262,8 @@ class Project:
         if bootstrap.lock_tool(rel for rel, _ in self.entries) is None:
             known = ", ".join(bootstrap.KNOWN_LOCKS)
             return (
-                f"the project at {self.root} has no lock file valuekit knows how "
-                f"to use ({known}), so a host could not build its environment. "
+                f"the project at {self.root} has no lock file valuekit recognises "
+                f"({known}), so a host could not build its environment. "
                 "Lock the project's dependencies with one of those tools."
             )
         try:
@@ -336,8 +336,8 @@ def _file_hash(path: str) -> str | None:
     its mtime or its size -- a same-size edit within one tick on a
     coarse-mtime filesystem such as HFS+, ext3 or exFAT -- would keep its old
     digest, leave the manifest hash unmoved, and let a worker reuse a
-    source tree built from the previous content.  A remote quietly running stale code is
-    the worst outcome this library has.
+    source tree built from the previous content.  A host running stale code with no
+    sign of it is the worst outcome this library has.
 
     The cost of not memoising is small for the same reason whole-tree
     transfer is affordable: the boundary rule keeps a project tree to its own
@@ -402,7 +402,7 @@ def manifest(root: str, exclude: Iterable[str] = ()) -> list[tuple[str, str]]:
 
     *exclude* names directories to leave out whatever the ignore rules say --
     valuekit's own cache above all, since a cache configured inside the
-    project would otherwise be packed into the source tree that lives beside it.
+    project would otherwise be packed into the source tree beside it.
 
     Missing files are dropped rather than raising: ``git ls-files --cached``
     reads the index, so a path staged and then deleted from the worktree is

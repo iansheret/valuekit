@@ -5,7 +5,7 @@ exactly*: two values hash the same only if no Python program could tell
 them apart.  So a list and a tuple of the same items hash differently, two
 dicts hash differently if their iteration order differs, and a writeable
 array differs from a read-only one.  This is what lets a content-addressed
-store hand back, on a hit, exactly what the miss produced.
+store return, on a hit, exactly what the miss produced.
 
 Freezing is separate, and narrower: it is what :class:`ImmutableMap` applies
 to values on entry.  ``@pure`` does not freeze anything, so a type needs a

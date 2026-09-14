@@ -2972,7 +2972,7 @@ class TestRunAll:
         assert r[1].result() == 4 and r[2].result() == 6  # isolation
         [(x, exc)] = r.failures
         assert x == 1
-        assert "died without raising" in str(exc) and "exit code" in str(exc)
+        assert "exited without raising" in str(exc) and "exit code" in str(exc)
 
     # ---- failure collection --------------------------------------------------
 
@@ -3252,14 +3252,11 @@ class TestLocalFile:
     def test_the_mode_line(self, tmp_path):
         from valuekit import localfile
 
-        cache = tmp_path / "cache"
-        # Absent means every configured host is used, as a core would be;
-        # no store directory means nowhere for a host's results to land.
-        assert localfile.read_mode(tmp_path, cache) == "all"
-        assert localfile.read_mode(tmp_path, None) == "local"
-        assert localfile.read_mode(None, cache) == "all"
+        # Absent, the mode is all: every configured host is used.
+        assert localfile.load_local(tmp_path).mode == "all"
+        assert localfile.load_local(None).mode == "all"
         localfile.write_mode(tmp_path, "remote")
-        assert localfile.read_mode(tmp_path, cache) == "remote"
+        assert localfile.load_local(tmp_path).mode == "remote"
         p = tmp_path / localfile.LOCAL_FILE
         assert p.read_text() == 'mode = "remote"\n'
         # Only the mode line changes; comments and other lines stay.
@@ -3268,7 +3265,8 @@ class TestLocalFile:
         assert p.read_text() == "# mine\nproject = 'x'\nmode = \"all\"\n[local]\nworkers = 2\n"
         assert localfile.load_local(tmp_path).local_workers == 2
         p.write_text("nonsense [[[\n")
-        assert localfile.read_mode(tmp_path, cache) == "all"  # unreadable: the default
+        with pytest.raises(RuntimeError, match="cannot read"):
+            localfile.load_local(tmp_path)
         with pytest.raises(ValueError):
             localfile.write_mode(tmp_path, "everywhere")
 
@@ -3347,11 +3345,33 @@ class TestScheduling:
         self._local_workers(tmp_path, monkeypatch, 1)
         monkeypatch.setattr(parallel, "_host_commands", {})
         m, _ = _write_batch_module(tmp_path)
-        q = __import__("queue").Queue()
         store = sys.modules["valuekit.pure"]._current_store()
-        assert _Hosts(m.process, str(cache), q, store, 1).capacities()[1] == {"local": 1}
-        assert _Hosts(m.process, str(cache), q, store, 1, 3).capacities()[1] == {"local": 3}
-        assert _Hosts(m.process, str(cache), q, store, 1, 0).capacities()[1] == {"local": 0}
+        assert _Hosts(m.process, str(cache), store, 1).capacities()[1] == {"local": 1}
+        assert _Hosts(m.process, str(cache), store, 1, 3).capacities()[1] == {"local": 3}
+        assert _Hosts(m.process, str(cache), store, 1, 0).capacities()[1] == {"local": 0}
+
+    def test_no_store_means_no_remote_hosts(self, cache, tmp_path, monkeypatch):
+        from valuekit.parallel import _Hosts
+
+        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
+        m, _ = _write_batch_module(tmp_path)
+        assert _Hosts(m.process, None, None, 1).hosts == []
+        assert [h.name for h in _Hosts(m.process, str(cache), None, 1).hosts] == ["h1"]
+
+    def test_an_unreadable_file_leaves_the_last_mode_in_force(self, cache, tmp_path, monkeypatch):
+        from valuekit import localfile
+        from valuekit.parallel import _Hosts
+
+        monkeypatch.setattr(parallel, "_host_commands", {})
+        localfile.write_mode(tmp_path / "proj", "remote")
+        m, _ = _write_batch_module(tmp_path)
+        hosts = _Hosts(m.process, str(cache), None, 1)
+        assert hosts.capacities()[0] == "remote"
+        p = tmp_path / "proj" / localfile.LOCAL_FILE
+        p.write_text("nonsense [[[\n")
+        assert hosts.capacities()[0] == "remote"
+        p.write_text('mode = "local"\n')
+        assert hosts.capacities()[0] == "local"
 
     def test_no_capacity_anywhere_runs_in_this_process(self, cache, tmp_path, monkeypatch):
         monkeypatch.setattr(parallel, "_host_commands", {})
@@ -3416,7 +3436,7 @@ class TestScheduling:
         assert r.failures == []
         assert r.values == [1, 2, 3, 4, 5, 6]
         moved = [e["i"] for _, e in _records(cache, "requeue")]
-        assert 1 <= len(moved) <= 2  # what was running on the host when it died
+        assert 1 <= len(moved) <= 2  # what was running on the host when it dropped
         assert all(e["host"] == "h1" for _, e in _records(cache, "requeue"))
         outcomes = {e["i"]: e["host"] for _, e in _records(cache, "outcome")}
         assert all(outcomes[i] == "local" for i in moved)
@@ -3463,7 +3483,7 @@ class TestMonitor:
                 {"ev": "process", "pid": 1, "role": "main", "argv": ["drive.py"]},
                 {"ev": "host", "id": 1, "name": "mac", "ok": True, "capacity": 8},
                 {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
-                {"ev": "batch", "id": 1, "fn": "process", "name": "nightly", "n": 3},
+                {"ev": "batch", "id": 1, "fn": "process", "name": "nightly", "n": 3, "mode": "parallel"},
                 {"ev": "start", "id": 1, "i": 0, "host": "mac"},
                 {"ev": "start", "id": 1, "i": 1, "host": "mac"},
                 {"ev": "start", "id": 1, "i": 2, "host": "local"},
@@ -3483,7 +3503,7 @@ class TestMonitor:
 
         events = [
             {"ev": "process", "pid": 1, "role": "main", "argv": ["drive.py"]},
-            {"ev": "batch", "id": 1, "fn": "process", "name": "nightly", "n": 3},
+            {"ev": "batch", "id": 1, "fn": "process", "name": "nightly", "n": 3, "mode": "parallel"},
             {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
             {"ev": "start", "id": 1, "i": 0, "host": "mac"},
         ]
@@ -3518,11 +3538,15 @@ class TestMonitor:
         cache = tmp_path / "cache"
         assert monitor._apply_key(str(tmp_path), None) is True
         assert monitor._apply_key(str(tmp_path), "r") is True
-        assert localfile.read_mode(tmp_path, cache) == "remote"
+        assert localfile.load_local(tmp_path).mode == "remote"
         assert monitor._apply_key(str(tmp_path), "A") is True
-        assert localfile.read_mode(tmp_path, cache) == "all"
+        assert localfile.load_local(tmp_path).mode == "all"
         assert monitor._apply_key(str(tmp_path), "x") is True  # unknown keys do nothing
-        assert localfile.read_mode(tmp_path, cache) == "all"
+        assert localfile.load_local(tmp_path).mode == "all"
+        assert monitor._mode_of(str(tmp_path)) == "all"
+        (tmp_path / localfile.LOCAL_FILE).write_text("nonsense [[[\n")
+        assert monitor._mode_of(str(tmp_path)).startswith("unreadable (")
+        assert monitor._mode_of(None) is None
         assert monitor._apply_key(None, "r") is True  # no project: nothing written
         assert not list(tmp_path.glob("**/placement"))
         assert monitor._apply_key(str(tmp_path), "q") is False
@@ -3534,7 +3558,7 @@ class TestMonitor:
         (tmp_path / "pyproject.toml").write_text("[project]\nname = 'p'\nversion = '0'\n")
         monkeypatch.chdir(tmp_path)
         assert monitor.main(["--mode", "remote", str(cache)]) == 0
-        assert localfile.read_mode(tmp_path, cache) == "remote"
+        assert localfile.load_local(tmp_path).mode == "remote"
         assert monitor.main(["--mode", "sideways", str(cache)]) == 2
         assert monitor.main(["--mode"]) == 2
         monkeypatch.chdir(tmp_path.parent)  # no project here
@@ -3872,14 +3896,24 @@ class TestProtocol:
 def _hello(fn, python=None, function_hash=None, project_hash="", extensions=None):
     # An empty project hash means "no source tree": the worker imports the way
     # it always did, which is what the handshake tests are about.
-    return protocol.strings(
-        python or PYTHON,
-        fn.__module__,
-        fn.__qualname__,
-        function_hash or reachable_set(fn).hash,
-        project_hash,
-        json.dumps(extensions if extensions is not None else reachable_set(fn).extensions),
-    )
+    return json.dumps(
+        {
+            "python": python or PYTHON,
+            "module": fn.__module__,
+            "qualname": fn.__qualname__,
+            "function_hash": function_hash or reachable_set(fn).hash,
+            "project_hash": project_hash,
+            "extensions": extensions if extensions is not None else reachable_set(fn).extensions,
+            "roots": [],
+        }
+    ).encode()
+
+
+def _hello_fields(**fields):
+    """A HELLO body with the given fields and empty defaults for the rest."""
+    hello = {"python": PYTHON, "module": "", "qualname": "", "function_hash": "",
+             "project_hash": "", "extensions": {}, "roots": [], **fields}
+    return json.dumps(hello).encode()
 
 
 def _handshake(body):
@@ -3916,20 +3950,18 @@ class TestWorkerHandshake:
 
     def test_a_function_in___main___is_refused(self, tmp_path):
         m, _ = _write_batch_module(tmp_path)
-        body = protocol.strings(
-            PYTHON,
-            "__main__",
-            "work",
-            reachable_set(m.process).hash,
-            "",
-            "{}",
-        )
+        body = _hello_fields(module="__main__", qualname="work", function_hash=reachable_set(m.process).hash)
         reason = _handshake(body)
         assert "__main__" in reason and "Move it to a module" in reason
 
     def test_an_unimportable_module_refuses(self):
-        body = protocol.strings(PYTHON, "no_such_module_xyz", "f", "0" * 40, "", "{}")
+        body = _hello_fields(module="no_such_module_xyz", qualname="f", function_hash="0" * 40)
         assert "cannot import" in _handshake(body)
+
+    def test_a_malformed_hello_is_refused_by_name(self):
+        assert "malformed HELLO" in _handshake(b"not json")
+        body = json.dumps({"python": PYTHON, "module": "m"}).encode()
+        assert "malformed HELLO message: KeyError('qualname')" in _handshake(body)
 
 
 _HOST_CMD = [sys.executable]  # a Python 3 to bootstrap with, as a host entry names one
@@ -4571,8 +4603,7 @@ class TestSourceTree:
     def test_a_failed_sync_is_one_reason_not_one_per_input(self, cache, tmp_path):
         m = _load(_project(tmp_path))
         host = _remote_host(m.work, cache)
-        parts = protocol.unstrings(host._hello)
-        host._hello = protocol.strings("wrong-python", *parts[1:])
+        host._hello = json.dumps({**json.loads(host._hello), "python": "wrong-python"}).encode()
         reason = host.sync()
         host.close()
         assert "wrong-python" in reason

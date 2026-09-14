@@ -96,7 +96,7 @@ class _State:
         if ev == "process":
             run["pid"] = e.get("pid")
             run["argv"] = e.get("argv") or []
-            run["role"] = e.get("role", "main")
+            run["role"] = e["role"]
             run["started"] = t
             return
 
@@ -115,7 +115,7 @@ class _State:
             self.batches[(source, e.get("id"))] = {
                 "fn": e.get("name") or e.get("fn", "?"),
                 "n": e.get("n", 0),
-                "mode": e.get("mode", "parallel"),
+                "mode": e["mode"],
                 "done": 0,
                 "failed": 0,
                 "started": t,
@@ -124,18 +124,18 @@ class _State:
             return
 
         if ev == "start":
-            self._host_counts(source, e.get("host", "local"))["running"] += 1
+            self._host_counts(source, e["host"])["running"] += 1
             return
 
         if ev == "requeue":
             # The host went away under this input; it will start again
             # elsewhere and be counted there.
-            counts = self._host_counts(source, e.get("host", "local"))
+            counts = self._host_counts(source, e["host"])
             counts["running"] = max(0, counts["running"] - 1)
             return
 
         if ev == "outcome":
-            counts = self._host_counts(source, e.get("host", "local"))
+            counts = self._host_counts(source, e["host"])
             counts["running"] = max(0, counts["running"] - 1)
             counts["done"] += 1
             if not e.get("ok", True):
@@ -177,8 +177,8 @@ class _State:
         workers it spawned.
 
         Scoping matters for the hit rate.  Aggregated over every run file in
-        the directory, one cold first run drags the rate down for good and
-        the number stops meaning anything; what a watcher wants is the run
+        the directory, one cold first run lowers the rate permanently and
+        the number stops meaning anything; what a watcher needs is the run
         in front of them.
         """
         mains = [r for r in self.runs.values() if r["role"] != "worker"]
@@ -186,8 +186,8 @@ class _State:
             return set(self.runs)
         # No grace window: a main process writes its batch record before spawning
         # anything, so its own file always predates its workers'. Allowing
-        # slack here instead lets the previous run's stragglers leak in and
-        # quietly spoil the rate.
+        # slack here instead lets the previous run's last records count and
+        # spoil the rate without any sign of it.
         since = max(r["started"] for r in mains)
         return {s for s, r in self.runs.items() if r["started"] >= since}
 
@@ -223,10 +223,10 @@ class _Tail:
                     continue
                 try:
                     e = json.loads(line)
-                except json.JSONDecodeError:
-                    continue  # torn or corrupt: skip, same as the store does
-                if isinstance(e, dict):
-                    state.apply(p.name, e)
+                    if isinstance(e, dict):
+                        state.apply(p.name, e)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue  # torn, corrupt, or not an event: skip the line
 
 
 def _render(
@@ -304,6 +304,8 @@ def _render(
             h = synced.get(name)
             if name == "local":
                 status = "idle under remote" if caps and caps.get("local") == 0 and mode == "remote" else ""
+            elif mode not in modes.MODES:
+                status = ""  # the mode is unknown, so whether the host is used is too
             elif h is None:
                 status = "syncing" if batch_live and mode != "local" else "not used"
             elif h["ok"]:
@@ -442,6 +444,17 @@ class _Keys:
                 pass
 
 
+def _mode_of(project: str | None) -> str | None:
+    """The mode line to show: the project's mode, why its local file
+    cannot be read, or None with no project."""
+    if project is None:
+        return None
+    try:
+        return localfile.load_local(project).mode
+    except RuntimeError as e:
+        return f"unreadable ({e})"
+
+
 def _apply_key(project: str | None, key: str | None) -> bool:
     """Act on one keystroke; return False when the key asks to quit."""
     if key is None:
@@ -531,7 +544,7 @@ def main(argv: list[str] | None = None) -> int:
             tail.poll(state)
             width, height = shutil.get_terminal_size((100, 40))
             lines = _render(
-                state, width, localfile.read_mode(project, root_path) if project else None,
+                state, width, _mode_of(project),
                 configured, config.local_workers, keys.enabled
             )
             if tty:

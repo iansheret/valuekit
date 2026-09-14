@@ -5,13 +5,13 @@ A host needs only what a person would need to check the project out and
 run it: a Python to start with, the tool the project locks its
 dependencies with, a compiler if it builds an extension, and the network.
 Nothing of valuekit's is installed there beforehand.  valuekit itself is
-one of the project's dependencies, so it arrives with the rest.
+one of the project's dependencies, so it is installed with the rest.
 
 That leaves a gap: something has to run on the host before the project's
 environment exists, to receive the tree and build that environment.  This
 module is that something.  The main process sends its source over the
 connection, a one-line Python program (:data:`STAGE0`) reads it and runs
-it, and it then speaks a short protocol on the same two streams::
+it, and it then uses a short protocol on the same two streams::
 
     main   -> the source of this module, then a NUL byte
     main   -> {"root": ..., "project": ..., "project_hash": ..., "python": "3.13",
@@ -33,8 +33,8 @@ meant for it has been consumed.
 *The tree becomes an environment the way the project says.*  Which tool to
 run is read off the lock file the tree carries -- the one fact that makes
 "check it out and run it" true for a person -- through a table with one
-row per tool.  Nothing above this module knows which row was used.  A tree
-with no lock valuekit knows is refused, and the refusal names the ones it
+row per tool.  Nothing above this module depends on which row was used.  A tree
+with no lock file valuekit recognises is refused, and the refusal names the ones it
 does.
 
 *One directory per project, updated in place.*  Under the source root each
@@ -48,14 +48,14 @@ an update and written after, so a directory with no manifest is either
 being updated or was left by a failed sync; either way the next main process
 updates it in place.  A lock file beside the directory says an update is
 in progress; a second main process waits for it, then proceeds with its own if
-the tree is still not the one it wants.
+the tree is still not the one it needs.
 
 *A host holds one version at a time.*  While a host process runs, its
 bootstrap keeps a busy marker beside the directory, refreshed every few
-seconds, naming the run it serves.  A run that wants a different version
+seconds, naming the run it serves.  A run that needs a different version
 while a live marker exists is refused with that name: stop the earlier run
-or wait.  A run that wants the same version joins.  A marker that has
-stopped being refreshed belongs to a run that died and is ignored.
+or wait.  A run that needs the same version proceeds.  A marker that has
+stopped being refreshed belongs to a run whose process has exited and is ignored.
 """
 
 from __future__ import annotations
@@ -84,8 +84,8 @@ __all__ = [
 # executable, the command that installs the locked environment for a given Python
 # (``{python}``: this interpreter's path when it has the minor version the
 # main process runs, else that minor for the tool to find or fetch), where the
-# interpreter then lives relative to the tree, and where the executable
-# hides when a non-interactive shell's PATH is short.
+# interpreter then is, relative to the tree, and where the executable
+# is when a non-interactive shell's PATH is short.
 _TOOLS = {
     "uv.lock": {
         "tool": "uv",
@@ -98,7 +98,7 @@ _TOOLS = {
 KNOWN_LOCKS = tuple(_TOOLS)
 
 # Reads this module's source off stdin up to a NUL and runs it; exits if the
-# stream ends first (a main process that died before sending it), rather than
+# stream ends first (a main process that exited before sending it), rather than
 # reading empty strings forever.  Safe to pass through sh, cmd.exe and
 # PowerShell inside double quotes: no dollar, backslash, percent, caret,
 # ampersand, pipe or angle bracket.
@@ -112,7 +112,7 @@ _TAIL = 64 << 10
 
 
 def lock_tool(names) -> str | None:
-    """The lock file valuekit knows among *names*, or None."""
+    """The lock file valuekit recognises among *names*, or None."""
     present = set(names)
     for lock in KNOWN_LOCKS:
         if lock in present:
@@ -220,6 +220,9 @@ def _read_line() -> bytes | None:
 
 
 def _read_exact(n: int) -> bytes | None:
+    """*n* bytes from stdin, or None if it ends first.  Not the reader in
+    :mod:`valuekit.protocol`: this file runs before valuekit is installed
+    on the host, so it imports nothing from the package."""
     buf = bytearray()
     while len(buf) < n:
         chunk = os.read(0, min(1 << 16, n - len(buf)))
@@ -249,7 +252,7 @@ def _busy(tree: str) -> str:
         path = os.path.join(root, n)
         try:
             if time.time() - os.stat(path).st_mtime > _BUSY_STALE:
-                os.remove(path)  # its run died without cleaning up
+                os.remove(path)  # its run exited without removing it
                 continue
             with open(path, encoding="utf-8") as f:
                 return f.read().strip() or "another run"
@@ -323,7 +326,7 @@ def _take_lock(lock: str) -> str:
     """Hold *lock* for this update; wait for another main process's first.
 
     Returns "" once held, else why not.  A lock older than ``_STALE`` was
-    left by a main process that died and is removed.
+    left by a main process that exited and is removed.
     """
     deadline = time.time() + _WAIT
     while True:
@@ -438,7 +441,7 @@ def _build_environment(tree: str, py_minor: str) -> tuple[str, str]:
     lock = lock_tool(os.listdir(tree))
     if lock is None:
         return "", (
-            "the project has no lock file valuekit knows how to use "
+            "the project has no lock file valuekit recognises "
             f"({', '.join(KNOWN_LOCKS)}), so it cannot be run here"
         )
     row = _TOOLS[lock]
@@ -478,7 +481,7 @@ def _prepare(
 
     *delete* names the files to remove, *files* is the full new manifest,
     *data* a tar of the files whose content differs.  Holds the project's
-    lock throughout.  A main process that arrives while another holds the lock
+    lock throughout.  A main process that finds the lock held by another
     waits; if the other main process's update produced this project hash there is
     nothing left to do.
     """
@@ -556,7 +559,7 @@ def main() -> int:
     # The environment is activated, as a shell would: the tools the lock
     # installed beside the interpreter (cmake and ninja for an extension that
     # rebuilds on import, say) are on the PATH the workers see.  Nothing
-    # above the bootstrap knows where the environment keeps them.
+    # above the bootstrap has the environment's layout.
     bindir = os.path.dirname(python)
     env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     env["VIRTUAL_ENV"] = os.path.dirname(bindir)

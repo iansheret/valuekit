@@ -94,7 +94,9 @@ call-record layout changed (each call record is its own file, under
   belongs in `.gitignore` (valuekit warns if git tracks it); it is never
   sent to a host and never hashed. A checkout that runs on this machine
   only needs no file. The monitor's keys and `--mode` edit the file's
-  `mode` line and find the project from the current directory.
+  `mode` line and find the project from the current directory. A file
+  that cannot be read while a batch runs leaves the mode last read in
+  force, and the monitor shows the error in place of the mode.
 
 - A host keeps one directory per project, updated in place. A run sends
   only the files whose content changed and the names of those removed,

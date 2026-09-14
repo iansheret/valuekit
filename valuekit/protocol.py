@@ -36,7 +36,8 @@ __all__ = ["ProtocolError", "read_message", "write_message", "pack", "unpack"]
 # refused rather than acted on.
 MAX_MESSAGE = 1 << 31
 
-HELLO = b"\x01"  # main   -> worker: ids, project hash, import roots
+HELLO = b"\x01"  # main   -> worker: json {python, module, qualname, function_hash,
+                 #   project_hash, extensions: {module: marker}, roots: [path]}
 ACCEPTED = b"\x02"  # worker -> main process: empty if accepted, else the reason
 OBJECT = b"\x03"  # either way: one content-addressed object
 TASK = b"\x04"  # main   -> worker: the root hash of the input
@@ -44,9 +45,9 @@ RESULT = b"\x05"  # worker -> main process: ok or error
 EVENT = b"\x06"  # worker -> main process: one event
 
 # The worker's store is the main process's store.  These carry a worker's store
-# calls to the main process and the answers back; a worker holds nothing itself.
-RECORD = b"\x0a"  # worker -> main process: store this call record (fn key, doc)
-GET_RECORDS = b"\x0b"  # worker -> main process: the call records of one fn key
+# calls to the main process and the replies back; a worker holds nothing itself.
+RECORD = b"\x0a"  # worker -> main process: json {function_hash, record}: store this call record
+GET_RECORDS = b"\x0b"  # worker -> main process: the call records of one function hash
 RECORDS = b"\x0c"  # main   -> worker: the reply, as json pairs
 GET_VALUE = b"\x0d"  # worker -> main process: send me this value's objects
 VALUE = b"\x0e"  # main   -> worker: empty once sent, or why not

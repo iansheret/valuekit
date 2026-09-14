@@ -15,7 +15,7 @@ reads it back::
 Nothing here imports or runs the pipeline.  Staleness within a batch is
 impossible: every input ran under one function hash, which the record
 carries.  Across code changes the question is only "has this batch been
-re-run since the edit", and the record's ``function_hash`` answers it.
+re-run since the edit", and the record's ``function_hash`` says.
 
 Layout, under the store directory::
 
@@ -37,12 +37,11 @@ import json
 import os
 import shutil
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
 from .runlog import Selection, selection
-from .store import CacheMiss, LocalStore, SerializationError, _atomic_write, dirname_for
+from .store import CacheMiss, LocalStore, SerializationError, _atomic_write, dirname_for, unique_name
 from .values import content_hash
 
 __all__ = ["batch", "Batch", "CallRecord", "BatchWriter"]
@@ -73,7 +72,7 @@ class BatchWriter:
         inputs: list,
     ):
         self.dir = batches_dir(store) / dirname_for(name)
-        self.id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.id = unique_name()
         self.path = self.dir / self.id
         hashes: list[str | None] = []
         for x in inputs:
@@ -119,7 +118,7 @@ class CallRecord:
 
     ``row.result`` is what it returned, ``row.calls`` the memoised calls it
     made, ``row.logs`` what it and they logged.  Values load when asked
-    for, and arrays arrive as memory maps.
+    for, and arrays are returned as memory maps.
     """
 
     __slots__ = ("_store", "fn", "record_hash", "_doc", "input", "index")

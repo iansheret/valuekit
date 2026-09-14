@@ -28,7 +28,7 @@ int, float, complex, str, bytes, range, numpy scalars, numpy arrays, tuples,
 lists, sets, frozensets, dicts, ImmutableMaps and plain-data dataclasses
 (recursively of the same).  Anything else raises
 :class:`SerializationError`.  A dataclass entry names its class, but nothing
-is imported on the strength of a stored entry: the class is resolved only
+is imported because a stored entry names it: the class is resolved only
 among modules the process has already loaded, and a class that has changed
 since reads as a miss (see :mod:`valuekit.plaindata`).
 
@@ -49,6 +49,8 @@ import os
 import re
 import shutil
 import tempfile
+import time
+import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol
@@ -77,7 +79,7 @@ class CacheMiss(Exception):
 class CacheStore(Protocol):
     """The methods a store must implement.
 
-    Kept small so that a store elsewhere (a peer over a connection, say) can
+    Small, so that a store elsewhere (a peer over a connection, say) can
     be added by implementing these methods.
     """
 
@@ -120,6 +122,12 @@ def dirname_for(name: str) -> str:
     """A user-chosen name as a directory name: characters outside
     ``[A-Za-z0-9._-]`` become ``_``.  The record inside keeps the real one."""
     return _UNSAFE.sub("_", name) or "_"
+
+
+def unique_name() -> str:
+    """A directory name for something written once: sortable by the time
+    it was made, and distinct across processes and within one."""
+    return f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -323,7 +331,7 @@ class LocalStore:
     def get_record(self, function_hash: str, h: str) -> dict:
         """One record by hash; CacheMiss if it is gone or corrupt.
 
-        Answered through the listing, so a record another process has
+        Read through the listing, so a record another process has
         deleted is missed here from the next call on, like any other."""
         self.get_records(function_hash)
         listing = self._listings.get(function_hash)

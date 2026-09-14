@@ -5,14 +5,14 @@ sent to the main process, every lookup asks the main process, and every event
 goes there too, so the main process's directory is the one place a batch's
 results exist wherever the work ran.  This is also what lets a
 ``@pure_local`` function called in a worker run on the main process instead:
-the call is a request like any other, and the answer is a value.
+the call is a request like any other, and the reply is a value.
 
 The conversation is strictly sequential on this side -- one request, then
 its reply -- so nothing here multiplexes.  Replies are read off the same
 stream the task arrived on; an OBJECT message at any point is one more
-object the main process has sent, and is kept.
+object the main process has sent, and is stored.
 
-Objects sent and objects received are both remembered by hash: the main process
+Objects sent and objects received are both indexed by hash: the main process
 has all of them, so none is sent twice, and a reply can name any of them
 without repeating it.
 """
@@ -74,7 +74,8 @@ class RemoteStore:
         return [(h, t) for h, t in json.loads(body)]
 
     def put_record(self, function_hash: str, record: dict) -> str:
-        protocol.write_message(self._tx, protocol.RECORD, protocol.strings(function_hash, json.dumps(record)))
+        body = json.dumps({"function_hash": function_hash, "record": record}).encode()
+        protocol.write_message(self._tx, protocol.RECORD, body)
         return record_hash(record)
 
     # -- the main process's side of the run log ------------------------------------

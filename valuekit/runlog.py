@@ -49,14 +49,13 @@ import shutil
 import sys
 import threading
 import time
-import uuid
 import warnings
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterator
 
 from .map import ImmutableMap
-from .store import CacheMiss, LocalStore, _atomic_write, dirname_for
+from .store import CacheMiss, LocalStore, _atomic_write, dirname_for, unique_name
 from .values import content_hash, encode_key, freeze
 
 __all__ = ["logs", "Logs", "Selection", "LoggedValue"]
@@ -171,7 +170,7 @@ def current_run(store: Any) -> _Run | None:
 
 def _begin(root: Path) -> _Run:
     name = _script_name()
-    run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    run_id = unique_name()
     run = _Run(root, name, run_id)
     header = {
         "v": LOG_VERSION,
@@ -219,7 +218,7 @@ def emit(store: Any, labels_hash: str, value_hash: str, keys: dict[str, str]) ->
 
 def refer(store: Any, function_hash: str, h: str) -> None:
     """Write a reference to call record *h* of *function_hash* to this
-    run's log: a hit's line, standing for what the record holds."""
+    run's log: a hit's line, in place of the entries the record holds."""
     line = {"record": [function_hash, h], "t": time.time()}
     send = getattr(store, "emit_line", None)
     if send is not None:
@@ -269,7 +268,7 @@ def expand(store: LocalStore, record: dict, stale: list[str]) -> list[list]:
 
 class LoggedValue:
     """One logged value with its labels.  Both load from the store when
-    asked for; arrays arrive as memory maps."""
+    asked for; arrays are returned as memory maps."""
 
     __slots__ = ("_store", "_labels_hash", "_v", "_k")
 
@@ -318,11 +317,11 @@ class Selection:
     def where(self, mapping: Mapping | None = None, /, **kw: Any) -> Selection:
         want = _query(mapping, kw)
         asked = {**self._asked, **(dict(mapping) if mapping else {}), **kw}
-        kept = [
-            it for it in self._items
-            if all(it._k.get(k) == v for k, v in want.items())
-        ]
-        return Selection(kept, asked)
+
+        def does_match(logged: LoggedValue) -> bool:
+            return all(logged._k.get(k) == v for k, v in want.items())
+
+        return Selection([it for it in self._items if does_match(it)], asked)
 
     def one(self) -> LoggedValue:
         n = len(self._items)

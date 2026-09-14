@@ -267,7 +267,7 @@ def plain_data_class(name: str) -> type:
     """Resolve ``"module:qualname"`` to a class already imported in this
     process, raising ValueError if it cannot be reached.
 
-    Nothing is imported on the strength of a stored entry: a module the
+    Nothing is imported because a stored entry names it: a module the
     process has not loaded itself reads as a miss.
     """
     module_name, _, qualname = name.partition(":")
