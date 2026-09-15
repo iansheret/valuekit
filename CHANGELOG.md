@@ -10,6 +10,13 @@ Caches written by earlier versions are refused; delete the directory. The
 call-record layout changed (each call record is its own file, under
 `records/`) and a call record now holds more than it did.
 
+Three API changes. `set_cache_dir` is `set_store_dir`. `clear_cache(fn)`
+is gone: edit the function, or put a version in its arguments. `run_all`
+returns the list of results and raises `BatchError` at the first input
+that produces no result, instead of returning a `BatchResult` of
+per-input outcomes; a function that expects bad inputs returns a value
+that says so.
+
 ### Added
 
 - `log(labels, value)` records a value under a small mapping saying what
@@ -29,15 +36,6 @@ call-record layout changed (each call record is its own file, under
   meaning. This is the boundary between processing code and the plotting
   code that reads it, which imports nothing.
 
-- `run_all` records each batch under a name (default: the function's
-  qualified name; `name=` to choose) and `valuekit.batch(name)` reads it
-  back: rows by input with their results and nested calls, `b.logs` for
-  what the inputs logged, failures with their messages. Nothing is imported
-  or run to read a batch, and a batch can be read while it is still
-  running. Every input of a batch ran under one function hash, which the
-  record carries, so a batch cannot mix results from two versions of the
-  code.
-
 - `@pure_local`: memoised exactly like `@pure`, on a different promise. The
   result may depend on something outside the program -- a file on this
   machine, a database, a download that needs this machine's credentials --
@@ -46,15 +44,7 @@ call-record layout changed (each call record is its own file, under
   call back. This is what lets a batch that fetches data run remotely
   without credentials leaving the main process.
 
-- `fn.cached(...)` returns a `@pure` function's stored result without
-  executing, or raises `CacheMiss`. `run_all` uses the same lookup to answer
-  an already-cached input without starting a worker.
-
-- `python -m valuekit.sweep <module>...` deletes what the current code can no
-  longer reach: call records and batches of functions whose function hash no
-  importable function produces, then objects no remaining call record or batch
-  names. Retention is by code version, not by age; nothing is removed for
-  being old.
+- `run_all` serves an already-cached input without starting a worker.
 
 - A running pipeline can be watched from a separate process.
   `python -m valuekit.monitor <cache-dir>` shows, live, the hit rate per
@@ -65,10 +55,9 @@ call-record layout changed (each call record is its own file, under
 
 ### Changed
 
-- `set_cache_dir` is `set_store_dir`, and `cache_dir=` on `logs()` and
-  `batch()` is `store_dir=`. The directory holds everything the project's
-  code produced: values, call records, batches and run logs.
-  `python -m valuekit.sweep` takes `--store` and reads `$VALUEKIT_STORE`.
+- `set_cache_dir` is `set_store_dir`, and `cache_dir=` on `logs()` is
+  `store_dir=`. The directory holds everything the project's code
+  produced: values, call records and run logs.
 
 - The project's build is the project's lock tool's. A host installs the
   project with `uv sync --frozen` and, when a sync sends changed files that
@@ -148,11 +137,19 @@ call-record layout changed (each call record is its own file, under
   reason a hit read its whole subtree; a hit now loads its result and
   nothing else. The per-function dependency index is gone with it.
 
-- `run_all` requires a `@pure` or `@pure_local` function and raises
-  `TypeError` otherwise. A batch's results are recorded by the function that
-  produced them, an already-cached input needs no worker, and a function
-  whose effects do not matter is the only kind that can safely run
-  elsewhere.
+- `run_all` with an undecorated function runs on this machine only, with
+  nothing cached, as before. A decorated function's already-cached inputs
+  need no worker, and only a decorated function may run on another
+  machine.
+
+- This machine is a host like any other: a host process started here
+  runs one worker per input, and a worker reports a failure as the
+  exception's type name, message and traceback text, the same from any
+  machine. A worker on this machine reads and writes values and call
+  records in the store directory itself and sends everything else to the
+  main process, so there is one event file and one run per main process.
+  The `multiprocessing` worker path, the pickled exceptions and the
+  worker-role detection in the event log are gone.
 
 - Each call record is its own file, named by the hash of its content, under
   `records/<function hash>/`. Two processes writing the same record write the same

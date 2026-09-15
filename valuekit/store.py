@@ -70,7 +70,6 @@ __all__ = [
 ]
 
 FORMAT_VERSION = 8
-_MTIME_STEP = 1_000_000_000  # ns: a directory mtime moved by hand moves by this much
 
 
 class CacheMiss(Exception):
@@ -78,20 +77,29 @@ class CacheMiss(Exception):
 
 
 class CacheStore(Protocol):
-    """The methods a store must implement.
-
-    Small, so that a store elsewhere (a peer over a connection, say) can
-    be added by implementing these methods.
+    """What :mod:`valuekit.pure` asks of a store: values and call records,
+    and the two logs a run writes.  :class:`LocalStore` is a directory;
+    :class:`valuekit.remotestore.RemoteStore` is a worker's view of the
+    main process's store.
     """
 
     def get_records(self, function_hash: str) -> list[tuple[str, dict]]:
-        """``(record_hash, record)`` pairs, newest first."""
+        """``(record_hash, record)`` pairs, in no particular order."""
+
+    def get_record(self, function_hash: str, h: str) -> dict:
+        """One record by hash; CacheMiss if it is gone or corrupt."""
 
     def put_record(self, function_hash: str, record: dict) -> str:
         """Store *record*; return its hash."""
 
     def get_value(self, h: str) -> Any: ...
     def put_value(self, v: Any) -> str: ...
+
+    def log_line(self, line: dict) -> None:
+        """Write one line of the run's log (:mod:`valuekit.runlog`)."""
+
+    def event(self, record: dict) -> None:
+        """Write one record of the event log (:mod:`valuekit.events`)."""
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +165,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
 class _Listing:
     """What one function's call-record directory held when last read.
 
-    ``entries`` is newest-first ``(hash, record)``; ``docs`` keeps every parsed
+    ``entries`` is the ``(hash, record)`` pairs; ``docs`` keeps every parsed
     document by hash so a re-listing parses only files it has not seen.
     """
 
@@ -192,6 +200,26 @@ class LocalStore:
         self.objects.mkdir(exist_ok=True)
         self.records.mkdir(exist_ok=True)
         self._listings: dict[str, _Listing] = {}
+        # The run's log and the event log this process writes, set when
+        # the store becomes the current one (``set_store_dir``); a store
+        # opened to read, or for a worker's direct access, has neither.
+        self.run = None
+        self.events = None
+
+    def log_line(self, line: dict) -> None:
+        if self.run is not None:
+            self.run.write(line)
+
+    def event(self, record: dict) -> None:
+        if self.events is not None:
+            self.events.write(record)
+
+    def close(self) -> None:
+        """Close the two logs; values and records need no closing."""
+        for log in (self.run, self.events):
+            if log is not None:
+                log.close()
+        self.run = self.events = None
 
     # -- object paths -----------------------------------------------------
 
@@ -262,7 +290,8 @@ class LocalStore:
         return self.records / function_hash
 
     def get_records(self, function_hash: str) -> list[tuple[str, dict]]:
-        """``(hash, record)`` pairs for *function_hash*, newest first.
+        """``(hash, record)`` pairs for *function_hash*, in no particular
+        order.
 
         The directory is re-read only when its modification time has moved
         or this store wrote to it, so a hit costs one ``stat``.  Another
@@ -283,23 +312,15 @@ class LocalStore:
         if listing is None:
             listing = _Listing()
             self._listings[function_hash] = listing
-        found: list[tuple[int, str]] = []
         try:
             with os.scandir(d) as it:
-                for entry in it:
-                    name = entry.name
-                    if not name.endswith(".json"):
-                        continue  # a .tmp-* mid-write, or a leftover
-                    try:
-                        found.append((entry.stat().st_mtime_ns, name[:-5]))
-                    except OSError:
-                        continue
+                # A .tmp-* is a write in progress; anything else is a leftover.
+                found = [entry.name[:-5] for entry in it if entry.name.endswith(".json")]
         except OSError:
             self._listings.pop(function_hash, None)
             return []
-        found.sort(reverse=True)
         entries: list[tuple[str, dict]] = []
-        for _, h in found:
+        for h in found:
             doc = listing.docs.get(h)
             if doc is None:
                 doc = self._read_record(d / f"{h}.json", h)
@@ -344,33 +365,18 @@ class LocalStore:
     def put_record(self, function_hash: str, record: dict) -> str:
         data = record_bytes(record)
         h = _hash_bytes(data)
-        d = self._record_dir(function_hash)
-        path = d / f"{h}.json"
+        path = self._record_dir(function_hash) / f"{h}.json"
         if not path.exists():
-            try:
-                before = d.stat().st_mtime_ns
-            except OSError:
-                before = -1
             _atomic_write(path, data)
-            # The write moves the directory's mtime, which is how another
-            # store notices; on a filesystem with coarse mtime it may not
-            # have, so move it by hand, by more than any filesystem's
-            # resolution (NTFS keeps 100 ns, HFS+ one second).
-            try:
-                if d.stat().st_mtime_ns <= before:
-                    t = max(time.time_ns(), before + _MTIME_STEP)
-                    os.utime(d, ns=(t, t))
-            except OSError:
-                pass
         listing = self._listings.get(function_hash)
         if listing is not None:
             listing.stale = True
         return h
 
     def clear(self) -> None:
-        """Delete everything computed or logged: the values, call records,
-        batches and run logs.  The event log and host source trees stay."""
-        for name in ("objects", "records", "batches", "logs"):
+        """Delete everything computed or logged: the values, call records
+        and run logs.  The event log and host source trees stay."""
+        for name in ("objects", "records", "logs"):
             shutil.rmtree(self.root / name, ignore_errors=True)
         self.objects.mkdir(exist_ok=True)
         self.records.mkdir(exist_ok=True)

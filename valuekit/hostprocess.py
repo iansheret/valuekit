@@ -8,7 +8,7 @@ channel, so a batch of a thousand inputs costs one ssh handshake rather than
 a thousand.  (The Windows ssh client has no connection sharing, which is
 what rules out a connection per task.)
 
-    host   -> HOST    Python version, CPU count, pid
+    host   -> HOST    {python, cpus, pid}
     main   -> OPEN    channel, "check" | "task"     start a worker
     main   -> DATA    channel, bytes                 to that worker's stdin
     host   -> DATA    channel, bytes                 from that worker's stdout
@@ -27,6 +27,7 @@ the main process and the worker.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -103,7 +104,10 @@ def worker_env() -> dict[str, str]:
     }
 
 
-def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
+def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None, local: bool = False) -> int:
+    """Serve the main process at *rx*/*tx* until it closes the connection.
+    With *local* this is the main process's own machine: workers get its
+    environment unchanged; otherwise the allowlist."""
     python = python or sys.executable
     out_lock = threading.Lock()
     workers: dict[int, _Worker] = {}
@@ -133,8 +137,9 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None) -> int:
             protocol.channelled(ch, code.to_bytes(4, "little", signed=True) + tail),
         )
 
-    send(protocol.HOST, protocol.strings(PYTHON, str(os.cpu_count() or 1), str(os.getpid())))
-    env = worker_env()
+    started = {"python": PYTHON, "cpus": os.cpu_count() or 1, "pid": os.getpid()}
+    send(protocol.HOST, json.dumps(started).encode())
+    env = None if local else worker_env()
     try:
         while True:
             message = protocol.read_message(rx)
@@ -193,7 +198,8 @@ def _kill(proc: subprocess.Popen) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    return serve(sys.stdin.buffer, sys.stdout.buffer)
+    args = sys.argv[1:] if argv is None else argv
+    return serve(sys.stdin.buffer, sys.stdout.buffer, local="--local" in args)
 
 
 if __name__ == "__main__":

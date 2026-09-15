@@ -17,12 +17,13 @@ happened to go there first.
 
     main   -> HELLO   json: python, module, qualname, function_hash, project_hash,
                       extensions, roots
-    worker -> ACCEPTED   empty if accepted, else why not
+    worker -> RESULT  a failure, if the worker refuses; a check worker
+                      that accepts replies {value: null} and exits
     main   -> OBJECT* the input's object graph            (task workers only)
     main   -> TASK    the input's root hash
     ...               store traffic: the worker's cache is the main process's
     worker -> OBJECT* the result's object graph
-    worker -> RESULT  ok and a root hash, or a failure
+    worker -> RESULT  the result's root hash, or a failure
 
 The source tree is already here, and so is the environment it needs: the
 bootstrap (:mod:`valuekit.bootstrap`) received the tree and built the
@@ -59,7 +60,7 @@ import traceback
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from . import events, project, protocol
+from . import project, protocol
 from .remotestore import RemoteStore
 
 __all__ = ["main", "serve", "serve_check"]
@@ -182,62 +183,77 @@ def _accept(python: str, module: str, qualname: str, function_hash: str) -> str:
     return ""
 
 
-def _handshake(rx: BinaryIO, tx: BinaryIO, check_imports: bool) -> tuple[bool, str]:
+def _handshake(rx: BinaryIO, tx: BinaryIO, check_imports: bool) -> tuple[bool, str, Any]:
     """Read the HELLO message, set the process up to run the function, and reply.
 
-    Returns whether to go on and the function's module and qualname joined
-    by a colon, for :func:`serve` to resolve.
+    Returns whether to go on, the function's module and qualname joined by
+    a colon for :func:`serve` to resolve, and HELLO's ``store_dir``: the
+    main process's store directory when this worker may read and write it
+    directly, "" when the store is reached through the main process, None
+    when the main process has no store.
     """
     message = protocol.read_message(rx)
     if message is None:
-        return False, ""  # the main process went away before saying anything
+        return False, "", None  # the main process went away before saying anything
     tag, body = message
     if tag != protocol.HELLO:
-        protocol.write_message(tx, protocol.ACCEPTED, b"expected a HELLO message")
-        return False, ""
+        _send_error(tx, "refused", "expected a HELLO message")
+        return False, "", None
     try:
         hello = json.loads(body)
         python, module, qualname = hello["python"], hello["module"], hello["qualname"]
         function_hash, project_hash = hello["function_hash"], hello["project_hash"]
         extensions, roots = hello["extensions"], [r for r in hello["roots"] if r]
+        store_dir, path = hello["store_dir"], hello["path"]
     except (ValueError, KeyError, TypeError) as e:
-        protocol.write_message(tx, protocol.ACCEPTED, f"malformed HELLO message: {e!r}".encode())
-        return False, ""
+        _send_error(tx, "refused", f"malformed HELLO message: {e!r}")
+        return False, "", None
 
     source, reason = _tree(project_hash)
     loaded_before = set(sys.modules)
     if not reason:
-        # The tree goes on the path before _accept, which imports.
+        # The tree, or the main process's path, goes ahead of this
+        # process's own before _accept, which imports.
         if source is not None:
             _install(source, roots)
+        for entry in reversed(path):
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
         _take_markers(extensions)
         reason = _accept(python, module, qualname, function_hash)
     if not reason and check_imports and source is not None:
         # After the import, and before the function hash is compared: a
         # function_hash that matches the wrong file is still the wrong file.
         reason = _check_imports(source, loaded_before)
-    protocol.write_message(tx, protocol.ACCEPTED, reason.encode("utf-8"))
-    return not reason, f"{module}:{qualname}"
+    if reason:
+        _send_error(tx, "refused", reason)
+    return not reason, f"{module}:{qualname}", store_dir
 
 
 def serve_check(rx: BinaryIO, tx: BinaryIO) -> int:
-    """Once per host: import the function from the tree and check it."""
-    ok, _ = _handshake(rx, tx, check_imports=True)
+    """Once per host: import the function from the tree and check it; the
+    result is None."""
+    ok, _, _ = _handshake(rx, tx, check_imports=True)
+    if ok:
+        protocol.write_message(tx, protocol.RESULT, json.dumps({"value": None}).encode())
     return 0 if ok else 1
 
 
 def serve(rx: BinaryIO, tx: BinaryIO) -> int:
     """Run one task off *rx*, reporting on *tx*."""
-    ok, target = _handshake(rx, tx, check_imports=False)
+    ok, target, store_dir = _handshake(rx, tx, check_imports=False)
     if not ok:
         return 0 if not target else 1
     module, qualname = target.split(":", 1)
 
     from .pure import _current_store, set_store
+    from .store import LocalStore
 
-    store = RemoteStore(rx, tx)
+    store = RemoteStore(rx, tx, LocalStore(store_dir) if store_dir else None)
     previous = _current_store()  # serve() runs in-process in tests
-    set_store(store)
+    # With no store directory anywhere, memoised calls are plain calls; the
+    # RemoteStore then carries only the input and the result.
+    set_store(store if store_dir is not None else None)
     try:
         root = None
         while True:
@@ -271,29 +287,26 @@ def serve(rx: BinaryIO, tx: BinaryIO) -> int:
         except Exception as e:
             _send_error(tx, type(e).__name__, f"the result could not be sent back: {e}")
             return 1
-        protocol.write_message(tx, protocol.RESULT, b"o" + bytes.fromhex(out))
+        protocol.write_message(tx, protocol.RESULT, json.dumps({"value": out}).encode())
         return 0
     finally:
         set_store(previous)
 
 
 def _send_error(tx: BinaryIO, kind: str, text: str, tb: str = "") -> None:
-    protocol.write_message(tx, protocol.RESULT, b"e" + protocol.strings(kind, text, tb))
+    """Report that there is no result: the exception's type name, its
+    message and its traceback text."""
+    failed = {"type": kind, "message": text, "traceback": tb}
+    protocol.write_message(tx, protocol.RESULT, json.dumps({"failed": failed}).encode())
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Declared here rather than in serve(): the role is a fact about this
-    # process, and serve() is also called in-process by tests, which must
-    # not relabel their own caller.
-    events.set_role("worker")
     args = sys.argv[1:] if argv is None else argv
     rx, tx = sys.stdin.buffer, sys.stdout.buffer
     try:
         return serve_check(rx, tx) if "--check" in args else serve(rx, tx)
     except protocol.ProtocolError:
         return 2
-    finally:
-        events._flush()
 
 
 if __name__ == "__main__":

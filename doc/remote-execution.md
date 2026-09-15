@@ -81,21 +81,19 @@ store         the main process's store over the channel   remotestore.py
 
 | File | Responsibility |
 |---|---|
-| `valuekit/parallel.py` | Scheduling: capacities per host from the local file's mode, deadlines, input ordering, failure attribution, requeue on host loss, cached-input short-circuit, batch recording. |
+| `valuekit/parallel.py` | Scheduling: capacities per host from the local file's mode, deadlines, input ordering, failure attribution, requeue on host loss, cached-input short-circuit. |
 | `valuekit/localfile.py` | The local file: hosts, worker cap, mode, project name; reading and setting the mode line. |
 | `valuekit/modes.py` | What each mode means: the capacity each host has under it. |
-| `valuekit/hosts.py` | `Connection`/`ProcessConnection`, `LocalHost` (a process per input), `RemoteHost` (one connection, a channel per task), and the handle that serves a worker's store requests and runs its `@pure_local` calls. |
+| `valuekit/hosts.py` | `Connection`/`ProcessConnection`, `Host` (one connection to a host process, a channel per task; this machine included), and the handle that serves a worker's store requests and runs its `@pure_local` calls. |
 | `valuekit/bootstrap.py` | How a tree becomes an environment on a host: the lock-tool table, the layout under `source_root`, extraction, the environment build, starting the host process. Both halves of its protocol. Stdlib only. |
 | `valuekit/hostprocess.py` | The host process: starts a worker per channel, multiplexes their streams, exits on EOF. |
 | `valuekit/worker.py` | The worker process: a check mode and a single-task mode; install, admit, audit. |
 | `valuekit/remotestore.py` | `RemoteStore`: the worker's side of the store, over its channel. |
 | `valuekit/protocol.py` | Message framing, channel framing, and value transfer as content-addressed object graphs. |
-| `valuekit/codec.py` | The structural value format, and the child-hash walk the sweep uses. |
+| `valuekit/codec.py` | The structural value format. |
 | `valuekit/project.py` | `Project` (the project as sent, once per batch), manifest, project hash, packing, import roots, and the path predicate that separates project from environment. |
 | `valuekit/functionhash.py` | Function hashes (the hash of a function's reachable set), including a native extension's marker as the project hash of the tree it was built from. |
-| `valuekit/batches.py` | Batch records: written by `run_all`, read by `valuekit.batch()`. |
 | `valuekit/runlog.py` | The run's log: the values a run logged, under `logs/<script>/`, written as steps log or hit, read by `valuekit.logs()`. |
-| `valuekit/sweep.py` | Retention: delete what the current code cannot reach. |
 | `valuekit/events.py` | Records hits, misses, forced runs, errors, batch progress, host and requeue events. |
 | `valuekit/monitor.py` | Reads the event log; shows the mode and what it means for the next task; sets the mode. |
 
@@ -248,8 +246,7 @@ every test tree gets those files. The cost is `uv` in CI and a few seconds per n
 **Terminology.** "Source tree": the project's files on a host, one directory per project.
 "Project hash": its manifest hash, what the host's manifest names and a native extension's marker. "Event log": the diagnostic record of
 what happened during a run, for the monitor. "Call record": a memoised call's recorded reads, result, nested calls and
-logged values. "Batch record": what `run_all` writes under a name. "Run": one main process
-process running a script. "Run log": the values a run logged, under `logs/`. "Host": a machine that can run
+logged values. "Run": one main process running a script. "Run log": the values a run logged, under `logs/`. "Host": a machine that can run
 workers, this one included; a remote host is one reached over ssh. "Host process": the process on a
 remote host that starts its workers. "Main process": the process the user started, in which the script runs; it owns the cache,
 and during a batch it schedules the inputs and serves the workers' requests. "Worker": a process that runs
@@ -267,7 +264,7 @@ the PC (`hunk.local`, user `iansh`, 28 cores, Windows, sshd default shell `cmd.e
 into each other by key. Mac-as-main process, PC-as-host is verified: tree shipped and synced
 under `C:\Users\iansh\.cache\valuekit\source`, outcomes recorded under the host, a
 second run skipped the transfer (host ready in 1s instead of 4s), mode `all` shared a
-60-input batch between both machines, and `valuekit.batch()` read the record back. Two
+60-input batch between both machines. Two
 defects found and fixed on the way, both in `bootstrap.py`:
 
 - *uv could not inspect its managed Pythons on the PC* ("untrusted mount point", os
@@ -372,8 +369,10 @@ user's shell's job, as the README says.
    real limit is bandwidth to the main process's store; a bucket holding objects by hash would
    be a second tier, after the streaming version works.
 
-7. **Collapse `LocalHost` into a host process launched as a subprocess.** One code path;
-   inputs narrowed to storable types locally as they are remotely.
+7. ~~**Collapse `LocalHost` into a host process launched as a subprocess.**~~ Done: this
+   machine is a `Host` whose `connect` starts `python -m valuekit.hostprocess --local`;
+   its workers read and write values and call records in the store directory directly
+   (`RemoteStore(direct=...)`) and send the rest. Inputs are storable values everywhere.
 
 8. **Moving a running task.** A mode switch applies to the next task started; a task
    already running finishes where it is. Correctness never needs more.
@@ -412,7 +411,6 @@ from valuekit import parallel, localfile
 vk.set_store_dir(cache)
 parallel._host_commands = {"here": [sys.executable]}
 vk.run_all(mymodule.work, [1, 2, 3])          # mode defaults to "all"
-vk.batch("work")[1]
 ```
 
 With hosts in the project's `valuekit.local.toml`, drop the hook and `python -m valuekit.monitor

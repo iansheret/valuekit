@@ -21,28 +21,25 @@ script, and the main script and a debugging script never touch each
 other's.  Every emission is its own logged value: the same labels and
 value logged twice are two.
 
-The log is as current as the cache.  A logged value is the output of a
-pure function, so whatever removes call records, ``clear_cache()`` or
-the sweep, removes the logged values that came with them; a line naming
-a call record that is gone reads as stale, and ``logs()`` says so.
+The log is as current as the cache: ``clear_cache()`` deletes the logs
+with everything else.  A reference whose call record was deleted by
+other means reads as stale, and ``logs()`` says so.
 
 Layout, under the store directory::
 
     logs/<name>/latest                # the id of the newest run
     logs/<name>/<run-id>/header.json
-    logs/<name>/<run-id>/<pid>.jsonl  # one file per writing process
+    logs/<name>/<run-id>/<pid>.jsonl  # the main process's lines
 
 Two kinds of line.  An entry names the labels and the value by hash, both
 in the object store, and carries the labels' entries in encoded form so a
 query needs no decoding.  A reference names a call record by function
-hash and record hash.  Workers on this machine write their own file into
-the main process's run; a remote worker sends its lines to the main
-process, which writes them.  Nothing here imports or runs the pipeline.
+hash and record hash.  A worker sends its lines to the main process,
+which writes them.  Nothing here imports or runs the pipeline.
 """
 
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import shutil
@@ -58,7 +55,7 @@ from .map import ImmutableMap
 from .store import CacheMiss, LocalStore, _atomic_write, dirname_for, unique_name
 from .values import content_hash, encode_key, freeze
 
-__all__ = ["logs", "Logs", "Selection", "LoggedValue"]
+__all__ = ["logs", "Logs", "Selection", "LoggedValue", "begin_run"]
 
 LOG_VERSION = 2
 
@@ -87,8 +84,7 @@ def _script_name() -> str:
 
 
 class _Run:
-    """The run this process writes to: begun here (a main process) or
-    joined (a worker the main process told which one it belongs to)."""
+    """The run this process writes to."""
 
     __slots__ = ("root", "name", "id", "dir", "_fh", "_lock")
 
@@ -119,53 +115,11 @@ class _Run:
                 self._fh = None
 
 
-_current: _Run | None = None
-_begin_lock = threading.Lock()
-
-# The main process names its run in its own environment, so the workers it
-# spawns on this machine, which inherit that environment, write into the
-# same run rather than beginning their own.  The main process's pid is in
-# the value so that the process which set it never reads it back as a
-# child would.
-_RUN_ENV = "VALUEKIT_RUN"
-
-
-def _inherited_run() -> tuple[str, str] | None:
-    """The ``(name, id)`` a parent process named, if this is its child."""
-    value = os.environ.get(_RUN_ENV, "")
-    pid, _, rest = value.partition(":")
-    run_id, _, name = rest.partition(":")
-    if not pid or pid == str(os.getpid()) or not run_id:
-        return None
-    return name, run_id
-
-
-def current_run(store: Any) -> _Run | None:
-    """The run this process writes to for *store*, begun if needed.
-
-    None for a store without a directory (a worker whose store is the
-    main process's sends its lines there instead).  A process spawned by
-    a main process writes into that process's run, named in the
-    environment; any other process begins its own: writes the header,
-    points ``latest`` at it and removes the older runs under the same name.
-    """
-    global _current
-    root = getattr(store, "root", None)
-    if root is None:
-        return None
-    run = _current
-    if run is not None and run.root == root:
-        return run
-    with _begin_lock:
-        run = _current
-        if run is not None and run.root == root:
-            return run
-        if run is not None:
-            run.close()
-        inherited = _inherited_run()
-        run = _Run(root, *inherited) if inherited else _begin(root)
-        _current = run
-        return run
+def begin_run(store: LocalStore) -> None:
+    """Begin this process's run in *store*: write the header, point
+    ``latest`` at it, remove the older runs under the same name.  Called
+    when the store becomes the current one."""
+    store.run = _begin(store.root)
 
 
 def _begin(root: Path) -> _Run:
@@ -183,19 +137,10 @@ def _begin(root: Path) -> _Run:
     }
     _atomic_write(run.dir / "header.json", json.dumps(header).encode())
     _atomic_write(run.dir.parent / "latest", run_id.encode())
-    os.environ[_RUN_ENV] = f"{os.getpid()}:{run_id}:{name}"
     for old in list(run.dir.parent.iterdir()):
         if old.is_dir() and old.name != run_id:
             shutil.rmtree(old, ignore_errors=True)
     return run
-
-
-def _close() -> None:
-    if _current is not None:
-        _current.close()
-
-
-atexit.register(_close)
 
 
 # ---------------------------------------------------------------------------
@@ -204,61 +149,14 @@ atexit.register(_close)
 
 
 def emit(store: Any, labels_hash: str, value_hash: str, keys: dict[str, str]) -> None:
-    """Write one logged value to this run's log.  In a worker whose store
-    is the main process's, the line goes to the main process."""
-    line = {"labels": labels_hash, "v": value_hash, "k": keys, "t": time.time()}
-    send = getattr(store, "emit_line", None)
-    if send is not None:
-        send(json.dumps(line, separators=(",", ":")))
-        return
-    run = current_run(store)
-    if run is not None:
-        run.write(line)
+    """Write one logged value to the run's log of *store*."""
+    store.log_line({"labels": labels_hash, "v": value_hash, "k": keys, "t": time.time()})
 
 
 def refer(store: Any, function_hash: str, h: str) -> None:
-    """Write a reference to call record *h* of *function_hash* to this
-    run's log: a hit's line, in place of the entries the record holds."""
-    line = {"record": [function_hash, h], "t": time.time()}
-    send = getattr(store, "emit_line", None)
-    if send is not None:
-        send(json.dumps(line, separators=(",", ":")))
-        return
-    run = current_run(store)
-    if run is not None:
-        run.write(line)
-
-
-def write_line(store: Any, line: str) -> None:
-    """Internal: a line a remote worker sent; the main process writes it."""
-    d = json.loads(line)
-    run = current_run(store)
-    if run is None:
-        return
-    if "record" in d:
-        run.write({"record": list(d["record"]), "t": d.get("t", time.time())})
-    else:
-        run.write({"labels": d["labels"], "v": d["v"], "k": d["k"], "t": d.get("t", time.time())})
-
-
-def expand(store: LocalStore, record: dict, stale: list[str]) -> list[list]:
-    """Every ``[labels, value, keys]`` entry a call record and the calls
-    nested in it hold, in call-record order.  A nested call record that
-    cannot be read is skipped, and its hash added to *stale*."""
-    out: list[list] = []
-
-    def walk(t: dict) -> None:
-        for _, key, h in t.get("calls", []):
-            try:
-                sub = store.get_record(key, h)
-            except CacheMiss:
-                stale.append(h)
-                continue
-            walk(sub)
-        out.extend(t.get("logs", []))
-
-    walk(record)
-    return out
+    """Write a reference to call record *h* of *function_hash* to the run's
+    log of *store*: a hit's line, in place of the entries the record holds."""
+    store.log_line({"record": [function_hash, h], "t": time.time()})
 
 
 # ---------------------------------------------------------------------------
@@ -345,13 +243,6 @@ class Selection:
         return f"Selection({len(self._items)} logged values{asked})"
 
 
-def selection(store: LocalStore, record: dict) -> Selection:
-    """The logged values a call record holds, nested calls included.  A
-    nested call record that is gone is left out."""
-    stale: list[str] = []
-    return Selection([LoggedValue(store, *entry) for entry in expand(store, record, stale)])
-
-
 class Logs(Selection):
     """One run's log, read from its directory.  ``refresh()`` picks up
     lines written since it was opened.  ``stale`` counts the references
@@ -400,14 +291,25 @@ class Logs(Selection):
             )
 
     def _expand(self, function_hash: str, h: str, stale: list[str]) -> None:
-        try:
-            record = self._store.get_record(function_hash, h)
-        except CacheMiss:
-            stale.append(h)
-            return
-        missing: list[str] = []
-        for entry in expand(self._store, record, missing):
-            self._items.append(LoggedValue(self._store, *entry))
+        """Add the logged values call record *h* holds, nested calls
+        included, in call-record order.  A record that cannot be read, at
+        the top or nested, leaves the reference counted in *stale*; the
+        readable part is still added."""
+        missing = False
+
+        def walk(function_hash: str, h: str) -> None:
+            nonlocal missing
+            try:
+                record = self._store.get_record(function_hash, h)
+            except CacheMiss:
+                missing = True
+                return
+            for _, key, nested in record.get("calls", []):
+                walk(key, nested)
+            for entry in record.get("logs", []):
+                self._items.append(LoggedValue(self._store, *entry))
+
+        walk(function_hash, h)
         if missing:
             stale.append(h)
 

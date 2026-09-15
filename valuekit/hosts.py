@@ -19,19 +19,18 @@ here.
 A handle has one method, ``finished()``: nothing yet, or a
 :class:`Finished` saying what happened -- a result, an exception, a worker
 that exited without a result, or a connection that closed with the input
-neither done nor failed.  A worker sends its result as one of ``("ok",
-value)``, ``("err", exc, tb)`` or ``("err_str", type_name, text, tb)`` when
-the exception itself could not be sent; the handle turns that into the
-``Finished``.
+neither done nor failed.  A worker reports a result as the root hash of
+its value, or a failure as the exception's type name, message and
+traceback text; the handle turns that into the ``Finished``.
 
-Two hosts.  :class:`LocalHost` spawns a process per input on this
-host.  :class:`RemoteHost` holds one connection to a *host process*
-(:mod:`valuekit.hostprocess`), on this machine or over ssh, which starts a worker
-per task and carries each worker's stream as a numbered channel.  A worker
-on a host holds no cache: its store is this process's store, so the messages
-that arrive on a channel are not only its result but a call record to store, a
-lookup to serve, an event to write, or a ``@pure_local`` call to
-make here.
+A :class:`Host` holds one connection to a *host process*
+(:mod:`valuekit.hostprocess`), on this machine or over ssh, which starts a
+worker per task and carries each worker's stream as a numbered channel.
+A worker's store is this process's store: the messages that arrive on a
+channel are not only its result but a call record to store, a lookup to
+serve, an event to write, or a ``@pure_local`` call to make here.  A
+worker on this machine reads and writes values and call records in the
+store directory itself and sends the rest.
 
 The connection is a :class:`Connection`: two byte streams and how they ended,
 nothing more.  :class:`ProcessConnection` is a child process's pipes, whether the
@@ -44,191 +43,59 @@ transport later is another ``Connection`` and touches nothing above it.
 from __future__ import annotations
 
 import json
-import multiprocessing
 import os
 import queue
-import socket
 import subprocess
-import sys
 import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, BinaryIO, Callable, Protocol
 
 from .codec import SerializationError
 from .hostprocess import StderrTail
 
-__all__ = ["Finished", "Handle", "Connection", "ProcessConnection", "LocalHost", "RemoteHost"]
+__all__ = ["Failure", "Finished", "Connection", "ProcessConnection", "Host"]
+
+_POLL = 0.2  # seconds between checks while waiting on a handle's queue
+_CHECK_TIMEOUT = 120.0  # seconds a host's check worker may take to import the function and reply
+
+
+@dataclass(frozen=True)
+class Failure:
+    """Why an input did not produce a result, as text from wherever it ran.
+
+    ``type`` is the exception's type name, or ``"exit"`` for a worker that
+    exited without a result, ``"timeout"`` for one killed at its deadline,
+    ``"connection"`` for a host whose connection closed under the input
+    twice.  ``traceback`` is the worker's traceback text, or "".
+    """
+
+    type: str
+    message: str
+    traceback: str = ""
+
+    def __str__(self) -> str:
+        text = f"{self.type}: {self.message}"
+        return f"{text}\n{self.traceback}" if self.traceback else text
 
 
 class Finished:
     """What happened to a task.  ``kind`` is one of:
 
-    * ``"ok"``: ``value`` is the result;
-    * ``"error"``: ``exc`` is the exception the worker raised, ``tb`` its
-      traceback text;
-    * ``"error_text"``: the exception could not be sent; ``text`` names it,
-      ``tb`` is its traceback text;
-    * ``"exited"``: the worker exited without a result; ``text`` says how;
-    * ``"connection_closed"``: the connection to the host closed with the
-      input neither done nor failed, so the scheduler may run it elsewhere.
+    * ``"value"``: ``value`` is the result;
+    * ``"failed"``: ``failure`` says why there is none;
+    * ``"closed"``: the connection to the host closed with the input
+      neither done nor failed, so the scheduler may run it elsewhere.
     """
 
-    __slots__ = ("kind", "value", "exc", "text", "tb")
+    __slots__ = ("kind", "value", "failure")
 
-    def __init__(self, kind: str, value: Any = None, exc: BaseException | None = None,
-                 text: str = "", tb: str = ""):
+    def __init__(self, kind: str, value: Any = None, failure: Failure | None = None):
         self.kind = kind
         self.value = value
-        self.exc = exc
-        self.text = text
-        self.tb = tb
-
-    @classmethod
-    def from_message(cls, msg: tuple) -> "Finished":
-        """A worker's result tuple as a Finished."""
-        if msg[0] == "ok":
-            return cls("ok", value=msg[1])
-        if msg[0] == "err":
-            return cls("error", exc=msg[1], tb=msg[2])
-        return cls("error_text", text=f"{msg[1]}: {msg[2]}", tb=msg[3])
-
-
-class Handle(Protocol):
-    """One task in flight."""
-
-    def feed(self, payload: Any) -> None:
-        """Take what the host put on the completions queue for this handle."""
-
-    def finished(self) -> Finished | None:
-        """What happened, or None while the task is still running."""
-
-    def kill(self) -> None:
-        """Stop the work now."""
-
-    def release(self) -> None:
-        """Let go of what the task held, once it is finished."""
-
-
-# ---------------------------------------------------------------------------
-# local processes
-# ---------------------------------------------------------------------------
-
-
-def _local_worker_main(conn, store_dir: str | None, module: str, qualname: str, x) -> None:
-    """Runs in the worker process: configure the cache, import the function
-    by name, run one input, send one message back: ("ok", value) or
-    ("err", exc, tb) or, when the exception or value cannot be pickled,
-    ("err_str", type_name, text, tb).  What this worker logs goes into the
-    main process's run, named in the environment it inherited (see
-    :mod:`valuekit.runlog`).
-    """
-    try:
-        if store_dir is not None:
-            from .pure import set_store_dir
-
-            set_store_dir(store_dir)
-        try:
-            from .worker import _resolve
-
-            fn = _resolve(module, qualname)
-            value = fn(x)
-        except BaseException as e:
-            tb = traceback.format_exc()
-            try:
-                conn.send(("err", e, tb))
-            except Exception:
-                conn.send(("err_str", type(e).__name__, str(e), tb))
-            return
-        try:
-            conn.send(("ok", value))
-        except Exception as e:
-            conn.send(
-                (
-                    "err_str",
-                    type(e).__name__,
-                    f"the result could not be sent back: {e}",
-                    traceback.format_exc(),
-                )
-            )
-    finally:
-        conn.close()
-
-
-class _LocalHandle:
-    """One spawned process, and a thread waiting for its one message."""
-
-    __slots__ = ("proc", "conn", "_msg", "_settled")
-
-    def __init__(self, proc, conn, completions: queue.Queue):
-        self.proc = proc
-        self.conn = conn
-        self._msg: tuple | None = None
-        self._settled = False
-        threading.Thread(target=self._wait, args=(completions,), daemon=True).start()
-
-    def _wait(self, completions: queue.Queue) -> None:
-        try:
-            msg = self.conn.recv()
-        except (EOFError, OSError):
-            msg = None  # exited without sending; Windows says BrokenPipeError
-        completions.put((self, msg))
-
-    def feed(self, payload: Any) -> None:
-        self._msg = payload
-        self._settled = True
-
-    def finished(self) -> Finished | None:
-        if not self._settled:
-            return None
-        if self._msg is None:
-            return Finished(
-                "exited",
-                text=f"exit code {self.proc.exitcode}; a segfault or an out-of-memory kill?",
-            )
-        return Finished.from_message(self._msg)
-
-    def kill(self) -> None:
-        self.proc.kill()
-        self.proc.join()
-
-    def release(self) -> None:
-        self.proc.join()
-        self.conn.close()
-
-
-class LocalHost:
-    """One spawned process per input, on this machine.
-
-    Isolation is the point: a timeout kills exactly one process and a
-    segfault loses exactly one input.  Processes are daemonic, so they are
-    cleaned up if the main process exits.
-    """
-
-    name = "local"
-
-    def __init__(self, fn, store_dir: str | None, completions: queue.Queue):
-        # The function goes to the worker by name, as it does to a host.
-        self._module = getattr(fn, "__module__", "") or ""
-        self._qualname = getattr(fn, "__qualname__", "") or ""
-        self._store_dir = store_dir
-        self._completions = completions
-        self._ctx = multiprocessing.get_context("spawn")
-
-    def start(self, x: Any) -> _LocalHandle:
-        recv_end, send_end = self._ctx.Pipe(duplex=False)
-        proc = self._ctx.Process(
-            target=_local_worker_main,
-            args=(send_end, self._store_dir, self._module, self._qualname, x),
-            daemon=True,
-        )
-        proc.start()
-        send_end.close()  # keep only the child's handle: EOF then means death
-        return _LocalHandle(proc, recv_end, self._completions)
-
-    def close(self) -> None:
-        pass
+        self.failure = failure
 
 
 # ---------------------------------------------------------------------------
@@ -276,10 +143,10 @@ class _Handle:
 
     __slots__ = (
         "ch", "objects", "seen", "completions", "out", "_host", "_failure",
-        "_buf", "_result", "_eof", "_exit", "_stderr", "_lock", "_messages", "_raw",
+        "_buf", "_result", "_eof", "_exit", "_stderr", "_lock",
     )
 
-    def __init__(self, host: RemoteHost, ch: int, completions: queue.Queue, raw: bool = False):
+    def __init__(self, host: Host, ch: int, completions: queue.Queue):
         self.ch = ch
         self.objects: dict[str, bytes] = {}
         self.seen: set[str] = set()
@@ -288,13 +155,11 @@ class _Handle:
         self._host = host
         self._failure: str | None = None
         self._buf = b""
-        self._result: tuple | None = None
+        self._result: Finished | None = None
         self._eof = False
         self._exit: int | None = None
         self._stderr = b""
         self._lock = threading.Lock()  # the channel is written from two threads
-        self._messages: list[tuple[bytes, bytes]] = []  # raw messages, the check only
-        self._raw = raw  # the check: keep messages as they are, interpret nothing
 
     # -- what arrives ---------------------------------------------------------
 
@@ -314,7 +179,7 @@ class _Handle:
         try:
             self._parse(protocol)
         except protocol.ProtocolError as e:
-            self._result = ("err_str", "ProtocolError", str(e), "")
+            self._result = Finished("failed", failure=Failure("ProtocolError", str(e)))
 
     def _next_message(self, protocol) -> tuple[bytes, bytes] | None:
         if len(self._buf) < 9:
@@ -334,9 +199,6 @@ class _Handle:
             if message is None:
                 return
             tag, body = message
-            if self._raw:
-                self._messages.append(message)
-                continue
             if tag == protocol.OBJECT:
                 protocol.recv_object(body, self.objects)
                 self.seen.add(body[:20].hex())
@@ -344,41 +206,31 @@ class _Handle:
                 if store is not None:
                     # The worker's results live here and nowhere else.
                     protocol.store_object(store, body)
-            elif tag == protocol.ACCEPTED:
-                if body:
-                    self._result = (
-                        "err_str",
-                        "RuntimeError",
-                        body.decode("utf-8", "replace"),
-                        "",
-                    )
             elif tag == protocol.RESULT:
-                if body[:1] == b"o":
-                    self._result = (
-                        "ok",
-                        protocol.unpack(body[1:].hex(), self.objects, self._fallback()),
-                    )
+                message = json.loads(body)
+                if "value" in message:
+                    root = message["value"]  # None: a check worker's acceptance
+                    value = None if root is None else protocol.unpack(root, self.objects, self._fallback())
+                    self._result = Finished("value", value=value)
                 else:
-                    kind, text, tb = protocol.unstrings(body[1:])
-                    self._result = ("err_str", kind, text, tb)
+                    self._result = Finished("failed", failure=Failure(**message["failed"]))
             else:
                 self._request(protocol, tag, body)
 
-    def wait_message(self, timeout: float | None) -> tuple[bytes, bytes] | None:
-        """Block for the next message on a raw channel; None if the worker
-        went away or *timeout* passed."""
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            if self._messages:
-                return self._messages.pop(0)
-            if self._eof:
+    def wait(self, timeout: float) -> Finished | None:
+        """Feed this handle from its own queue until it has finished or
+        *timeout* seconds have passed; the outcome, or None."""
+        deadline = time.monotonic() + timeout
+        while self.finished() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return None
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             try:
-                handle, payload = self.completions.get(timeout=remaining)
+                handle, payload = self.completions.get(timeout=min(remaining, _POLL))
             except queue.Empty:
-                return None
+                continue
             handle.feed(payload)
+        return self.finished()
 
     # -- serving the worker's requests ----------------------------------------
 
@@ -396,7 +248,6 @@ class _Handle:
         return None if store is None else store.get_value
 
     def _request(self, protocol, tag: bytes, body: bytes) -> None:
-        from . import events
         from .store import CacheMiss
 
         store = self._store()
@@ -406,31 +257,30 @@ class _Handle:
                 store.put_record(message["function_hash"], message["record"])
         elif tag == protocol.GET_RECORDS:
             pairs = [] if store is None else store.get_records(body.decode())
-            self._write_message(protocol.RECORDS, json.dumps(pairs).encode())
+            self._write_message(protocol.REPLY, json.dumps(pairs).encode())
         elif tag == protocol.GET_VALUE:
             try:
                 if store is None:
                     raise CacheMiss("the main process has no store directory")
                 v = store.get_value(body.hex())
             except CacheMiss as e:
-                self._write_message(protocol.VALUE, str(e).encode())
+                self._write_message(protocol.REPLY, json.dumps({"reason": str(e)}).encode())
             else:
                 with self._lock:
                     protocol.send_value(self.out, v, self.seen)
-                    protocol.write_message(self.out, protocol.VALUE, b"")
+                    protocol.write_message(self.out, protocol.REPLY, b"{}")
         elif tag == protocol.EVENT:
             record = json.loads(body)
             record.setdefault("host", self._host.name)
-            events.record(store, record.pop("ev", "?"), **record)
-        elif tag == protocol.LOGGED:
-            from . import runlog
-
             if store is not None:
-                runlog.write_line(store, body.decode())
+                store.event(record)
+        elif tag == protocol.LOGGED:
+            if store is not None:
+                store.log_line(json.loads(body))
         elif tag == protocol.CALL:
-            module, qualname, root = protocol.unstrings(body)
-            args, kwargs = protocol.unpack(root, self.objects, self._fallback())
-            self._host._submit(self._run_call, protocol, module, qualname, args, kwargs)
+            call = json.loads(body)
+            args, kwargs = protocol.unpack(call["root"], self.objects, self._fallback())
+            self._host._submit(self._run_call, protocol, call["module"], call["qualname"], args, kwargs)
         else:
             raise protocol.ProtocolError(f"unexpected message {tag!r}")
 
@@ -441,33 +291,33 @@ class _Handle:
         try:
             fn = _resolve(module, qualname)
             value = fn(*args, **kwargs)
-            lookup = getattr(fn, "_valuekit_lookup", None)
-            found = lookup(*args, **kwargs) if lookup is not None else None
-            h = found[0] if found is not None else ""
+            memo = getattr(fn, "_valuekit", None)
+            h = (memo.record_hash(*args, **kwargs) if memo is not None else None) or ""
         except BaseException as e:
-            self._write_message(
-                protocol.CALLED,
-                b"e" + protocol.strings(type(e).__name__, str(e), traceback.format_exc()),
-            )
+            failed = {"type": type(e).__name__, "message": str(e), "traceback": traceback.format_exc()}
+            self._write_message(protocol.REPLY, json.dumps({"failed": failed}).encode())
             return
         with self._lock:
             root = protocol.send_value(self.out, value, self.seen)
-            protocol.write_message(self.out, protocol.CALLED, b"o" + protocol.strings(root, h))
+            reply = json.dumps({"root": root, "record_hash": h}).encode()
+            protocol.write_message(self.out, protocol.REPLY, reply)
 
     # -- the scheduler's view --------------------------------------------------
 
     def finished(self) -> Finished | None:
         if self._failure is not None:
-            return Finished("error_text", text=f"RuntimeError: {self._failure}")
+            return Finished("failed", failure=Failure("SerializationError", self._failure))
         if self._result is not None:
-            return Finished.from_message(self._result)
+            return self._result
         if not self._eof:
             return None
-        tail = self._stderr.decode("utf-8", "replace").strip()
         if self._exit is None:
-            return Finished("connection_closed", text=f"the connection to host {self._host.name!r} closed")
+            return Finished("closed")
+        tail = self._stderr.decode("utf-8", "replace").strip()
         why = f"exit code {self._exit} on host {self._host.name!r}"
-        return Finished("exited", text=f"{why}:\n{tail}" if tail else f"{why}; a segfault or a broken pipe?")
+        return Finished("failed", failure=Failure(
+            "exit", f"{why}:\n{tail}" if tail else f"{why}; a segfault or a broken pipe?"
+        ))
 
     def kill(self) -> None:
         from . import protocol
@@ -554,95 +404,95 @@ class ProcessConnection:
 # ---------------------------------------------------------------------------
 
 
-class RemoteHost:
-    """Workers on one host, over one connection to its host process.
+def hello_message(
+    fn, project_hash: str, roots: list[str], store_dir: str | None, path: list[str] = ()
+) -> bytes:
+    """The HELLO message every worker running *fn* gets.
 
-    *connect* opens a :class:`Connection` to a Python on the host: for a remote
-    host an ssh invocation, for this machine an interpreter here.  The
-    bootstrap (:mod:`valuekit.bootstrap`) then turns that into a host
-    process running in the project's own environment, and everything after
-    that is the same wherever the host is.
+    *project_hash* and *roots* name the source tree a remote host's worker
+    imports from ("" and [] for a worker on this machine, which imports as
+    this process does, with *path*, this process's ``sys.path``, ahead of
+    its own).  *store_dir* is this process's store directory
+    when the worker may read and write values and call records in it
+    directly, "" when they go through this process, None when there is no
+    store.  The extension markers are every one this process has computed,
+    which include the function's, so a worker's function hash is compared
+    with this process's (see :mod:`valuekit.functionhash`).
+    """
+    from .functionhash import PYTHON, extension_markers, reachable_set
+
+    function_hash = reachable_set(fn).hash  # hashes the extensions the function reaches
+    return json.dumps(
+        {
+            "python": PYTHON,
+            "module": getattr(fn, "__module__", "") or "",
+            "qualname": getattr(fn, "__qualname__", "") or "",
+            "function_hash": function_hash,
+            "project_hash": project_hash,
+            "extensions": extension_markers(),
+            "roots": list(roots),
+            "store_dir": store_dir,
+            "path": list(path),
+        },
+        sort_keys=True,
+    ).encode()
+
+
+class Host:
+    """A machine a batch runs tasks on, through one connection to a host
+    process there, which starts one worker per task.
+
+    *connect* opens the connection: for a remote host it runs ssh and the
+    bootstrap (:mod:`valuekit.bootstrap`), for this machine it starts a
+    host process here.  It returns a :class:`Connection` whose far end is
+    a host process about to send its first message, or raises with the
+    reason it cannot.  *hello* is the HELLO message every worker gets.
+    *capacity* is how many tasks the host runs at once; None means what
+    the host process reports.  With *check*, the host runs the function
+    once on a check channel before it takes any task (see :meth:`sync`);
+    this machine does not, since this process has imported the function.
     """
 
     def __init__(
         self,
-        project,
-        store_dir: str | None,
-        completions: queue.Queue,
         name: str,
         connect: Callable[[], Connection],
-        source_root: str,
-        workers: int | None = None,
+        hello: bytes,
+        store,
+        completions: queue.Queue,
+        capacity: int | None = None,
+        check: bool = True,
     ):
-        from .functionhash import PYTHON, reachable_set
-        from .pure import _current_store
-
-        fn = project.fn
         self.name = name
-        self.capacity = workers
-        self.dropped = False
+        self.capacity = capacity
+        # "new" until sync() is called; "syncing" while it runs; then
+        # "ready", or "failed" with the reason in ``failure``, which is also
+        # where a host goes when its connection closes.
+        self.state = "new"
         self.failure: str | None = None
-        self._project = project
-        self._store_dir = store_dir or ""
+        self._hello = hello
+        self._store = store
         self._completions = completions
         self._connect = connect
-        self._store = _current_store()
+        self._check = check
         self._connection: Connection | None = None
-        self._source_root = source_root
         self.pid: int | None = None  # the host process, once it has sent its first message
         self._out_lock = threading.Lock()
         self._channels: dict[int, _Handle] = {}
         self._next = 1
         self._pool: ThreadPoolExecutor | None = None
-        self._ready = False
-        self._started = time.strftime("%H:%M:%S")
-
-        reach = reachable_set(fn)
-        self._hello = json.dumps(
-            {
-                "python": PYTHON,
-                "module": getattr(fn, "__module__", "") or "",
-                "qualname": getattr(fn, "__qualname__", "") or "",
-                "function_hash": reach.hash,
-                "project_hash": project.project_hash,
-                "extensions": reach.extensions,
-                "roots": list(project.roots),
-            },
-            sort_keys=True,
-        ).encode()
 
     # -- the connection ---------------------------------------------------------
 
     def _launch(self) -> str:
-        """Connect, bring the host up, and read its first message; "" or why not."""
-        from . import bootstrap, protocol
+        """Connect and read the host process's first message; "" or why not."""
+        from . import protocol
         from .functionhash import PYTHON
 
         try:
             self._connection = self._connect()
-        except OSError as e:
+        except Exception as e:
             return f"cannot connect to host {self.name!r}: {e}"
-        try:
-            reason = bootstrap.offer(
-                self._connection.rx,
-                self._connection.tx,
-                self._source_root,
-                self._project.name,
-                self._project.project_hash,
-                PYTHON,
-                self._project.entries,
-                self._project.pack,
-                f"a run of {os.path.basename(sys.argv[0]) or 'python'} on "
-                f"{socket.gethostname()} (pid {os.getpid()}, started {self._started})",
-                self._project.dist,
-                self._project.build_inputs,
-            )
-        except (OSError, ValueError) as e:
-            reason = f"the connection to host {self.name!r} broke: {e}"
-        if reason:
-            reason = self._why(reason)
-            self._connection.close()
-            return reason
         try:
             message = protocol.read_message(self._connection.rx)
         except (protocol.ProtocolError, OSError, ValueError):
@@ -651,13 +501,13 @@ class RemoteHost:
             reason = self._why("the host process said nothing")
             self._connection.close()
             return reason
-        python, cpus, pid = (protocol.unstrings(message[1]) + ["", "", ""])[:3]
-        if python != PYTHON:
+        host = json.loads(message[1])
+        if host["python"] != PYTHON:
             self._connection.close()
-            return f"main process runs Python {PYTHON}, host {self.name!r} runs {python}"
+            return f"main process runs Python {PYTHON}, host {self.name!r} runs {host['python']}"
         if self.capacity is None:
-            self.capacity = max(1, int(cpus))
-        self.pid = int(pid) if pid.isdigit() else None
+            self.capacity = max(1, int(host["cpus"]))
+        self.pid = host["pid"]
         threading.Thread(target=self._read, daemon=True).start()
         return ""
 
@@ -690,7 +540,9 @@ class RemoteHost:
                 code = int.from_bytes(rest[:4], "little", signed=True)
                 handle.completions.put((handle, (code, rest[4:])))
                 handle.completions.put((handle, None))
-        self.dropped = True
+        if self.state != "failed":
+            self.state = "failed"
+            self.failure = self.failure or f"the connection to host {self.name!r} closed"
         for handle in list(self._channels.values()):
             handle.completions.put((handle, None))
 
@@ -712,7 +564,7 @@ class RemoteHost:
         from . import protocol
 
         ch, self._next = self._next, self._next + 1
-        handle = _Handle(self, ch, completions, raw=kind == b"check")
+        handle = _Handle(self, ch, completions)
         self._channels[ch] = handle
         self._send(protocol.OPEN, protocol.channelled(ch, kind))
         return handle
@@ -721,8 +573,9 @@ class RemoteHost:
 
     def sync(self) -> str:
         """Decide once, before this host takes any input, whether it can run
-        the function: update its copy of the project, build the environment,
-        import the function and check that what was imported is the main
+        the function: connect (for a remote host, update its copy of the
+        project and build the environment), then, with *check*, import the
+        function there and compare what was imported with the main
         process's function.
 
         Returns "" when the host can take work, else why not.  A failure
@@ -732,30 +585,39 @@ class RemoteHost:
         """
         from . import protocol
 
-        if self._ready:
+        if self.state == "ready":
             return ""
-        if self.failure is not None:
-            return self.failure
-        reason = self._project.refusal() or self._launch()
+        if self.state == "failed":
+            return self.failure or ""
+        self.state = "syncing"
+        reason = self._launch()
         if reason:
-            self.failure = reason
-            return reason
+            return self._fail(None, reason)
+        if not self._check:
+            self.state = "ready"
+            return ""
         handle = self._open(b"check", queue.Queue())
         try:
             handle._write_message(protocol.HELLO, self._hello)
-            message = handle.wait_message(timeout=600)
-            if message is None or message[0] != protocol.ACCEPTED:
+            done = handle.wait(timeout=_CHECK_TIMEOUT)
+            if done is None:
+                return self._fail(handle, (
+                    f"the worker did not reply within {_CHECK_TIMEOUT:.0f} s of being asked to "
+                    "import the function; an import that waits on something?"
+                ))
+            if done.kind == "closed":
                 return self._fail(handle, "the worker never reported")
-            if message[1]:
-                return self._fail(handle, message[1].decode("utf-8", "replace"))
+            if done.kind == "failed":
+                return self._fail(handle, done.failure.message)
         finally:
             handle.release()
-        self._ready = True
+        self.state = "ready"
         return ""
 
-    def _fail(self, handle: _Handle, reason: str) -> str:
-        tail = handle._stderr.decode("utf-8", "replace").strip()
+    def _fail(self, handle: _Handle | None, reason: str) -> str:
+        tail = handle._stderr.decode("utf-8", "replace").strip() if handle is not None else ""
         self.failure = f"{reason}:\n{tail}" if tail else reason
+        self.state = "failed"
         return self.failure
 
     # -- tasks ---------------------------------------------------------------------
@@ -773,7 +635,16 @@ class RemoteHost:
         try:
             with handle._lock:
                 protocol.write_message(handle.out, protocol.HELLO, self._hello)
-                root = protocol.send_value(handle.out, x, handle.seen)
+                # A worker never sends back an object it received, so a
+                # value it builds from its input (a result, a logged value's
+                # labels) refers to the input's objects: they are kept for
+                # this task and written to the store with everything else.
+                sent: dict[str, bytes] = {}
+                root = protocol.send_value(handle.out, x, handle.seen, sent)
+                handle.objects.update(sent)
+                if self._store is not None:
+                    for h, payload in sent.items():
+                        protocol.store_object(self._store, bytes.fromhex(h) + payload)
                 protocol.write_message(handle.out, protocol.TASK, bytes.fromhex(root))
         except SerializationError as e:
             # A value the protocol cannot carry is the caller's problem, not a

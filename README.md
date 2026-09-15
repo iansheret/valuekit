@@ -159,10 +159,6 @@ progress bars, metrics) are permitted by the contract precisely because
 they will not happen on a hit; whether that is acceptable is the user's
 decision.
 
-`step.cached(obs, cfg)` returns the stored result for those arguments
-without executing, or raises `CacheMiss`. It is the lookup half of a call,
-for code that needs to know what has been computed without computing.
-
 ## `@pure_local`
 
 A `@pure` function's result depends on its arguments and its definition and
@@ -305,8 +301,8 @@ clear_cache()             # everything computed or logged; the same as deleting 
 
 ## The store
 
-The store directory holds the values, call records, batch records and run
-logs a project's code produced. `clear_cache()` deletes all of them, and
+The store directory holds the values, call records and run logs a
+project's code produced. `clear_cache()` deletes all of them, and
 so does deleting the directory; both are always safe. Values are
 content-addressed files: read-only arrays as
 `.npy`, reloaded as memory maps that `freeze` shares without copying (a hit
@@ -363,70 +359,48 @@ nothing.
 
 ### Retention
 
-Nothing is removed for being old. A result whose function has not changed
-is current whatever its age, and it is what `valuekit.batch` reads. What
-can go is everything the current code can no longer reach:
-
-```
-python -m valuekit.sweep mypipeline.steps mypipeline.batches
-```
-
-imports the named modules, takes the function hash of every `@pure` and
-`@pure_local` function they define, and deletes the call records and batch
-records of every other function hash, then every object that no remaining
-call record, batch or run-log entry names. A run's log that names a
-removed call record reads as stale from then on, and `logs()` says so.
-Name every module whose results you want retained; a function that is not
-imported reads as gone.
-`--dry-run` reports without deleting, and `--store` names the directory
-when the modules do not configure one.
+Nothing is removed for being old: a result whose function has not
+changed is current whatever its age. The store grows until
+`clear_cache()` empties it, or you delete the directory.
 
 ## Parallelism
 
 ``run_all(fn, inputs)`` runs a module-level ``@pure`` (or ``@pure_local``)
-function over a batch of inputs in parallel and returns a ``BatchResult``
-of per-input outcomes, in input order. An input whose result is already
-cached is served without a worker. Each other input runs in its own
-process, spawned per task, with ``max_workers`` running at once on this
-machine (default: the ``[local] workers`` line of ``valuekit.local.toml``,
-else the CPU count). Isolation
-is the point: a timeout kills exactly one process, a segfault loses exactly
-one input, and neither affects the other inputs or the capacity available
-to the rest of the batch. The cost is one process start per input (roughly
-0.4 s including a numpy import). Starts overlap across workers, and for
-inputs that take seconds or more the cost does not matter; for very small
-inputs, batch them inside ``fn``. Each worker takes the parent's cache
-directory and shares the cache; every write is a content-named file, so
-concurrent writers cannot drop each other's results.
+function over a batch of inputs in parallel and returns their results as
+a list, in input order. An input whose result is already cached is served
+without a worker. Each other input runs in its own process, started per
+task by a host process on this machine, with ``max_workers`` running at
+once (default: the ``[local] workers`` line of ``valuekit.local.toml``,
+else the CPU count). Isolation is the point: a timeout kills exactly one
+process and a segfault loses exactly one input. The cost is one process
+start per input (roughly 0.4 s including a numpy import). Starts overlap
+across workers, and for inputs that take seconds or more the cost does
+not matter; for very small inputs, batch them inside ``fn``. A worker on
+this machine reads and writes values and call records in the store
+directory itself; every write is a content-named file, so concurrent
+writers cannot drop each other's results.
 
-The batch is recorded under a name, ``name=`` or the function's qualified
-name by default, for `valuekit.batch` to read (next section). A function
-that is not decorated is refused: the record is made by the function that
-produced the results.
+A function that is not decorated runs on this machine only, with nothing
+cached: it has no function hash for a host to check. Everything else
+about the batch is the same.
 
-Every input is processed, and every failure is recorded against the input
-that caused it. An exception raised by ``fn`` carries the string-form
-traceback captured in the worker. ``timeout=`` limits the seconds each
-input may spend running; a breach kills that input's process promptly and
-records a ``TimeoutError``. A process that exits without raising (a
-segfault or an out-of-memory kill) records a ``RuntimeError`` naming the
-input and the exit code.
+The first input that produces no result ends the batch: running tasks
+are killed and ``BatchError`` is raised, naming the input, the host it
+ran on, and why there is no result. An exception raised by ``fn`` is
+reported by its type name and message, with the worker's traceback as
+text; ``timeout=`` limits the seconds each input may spend running, and a
+breach kills that input's process and reports a timeout; a process that
+exits without raising (a segfault or an out-of-memory kill) reports its
+exit code. Inputs that had finished are in the cache, so the rerun after
+the fix serves them. A function that expects bad inputs returns a value
+that says so; that is where the author knows what is recoverable.
 
 ```python
-result = run_all(process_scenario, session_ids)
-
-result.values                 # plain list of results; raises an
-                              # ExceptionGroup if any input failed
-for sid, exc in result.failures:
-    ...                       # explicit handling; the batch completed
-result[i].input               # the input that produced outcome i
-result[i].result()            # the value, or re-raises the exception
+try:
+    results = run_all(process_scenario, session_ids)
+except BatchError as e:
+    e.input, e.host, e.failure.type, e.failure.message, e.failure.traceback
 ```
-
-Use ``.values`` by default: it is the plain list of results when
-everything succeeded, and it raises when something failed, so failures
-cannot be dropped by accident. ``.failures`` is for callers that handle
-failures explicitly and continue.
 
 Nothing is re-run automatically. To debug a failure, call the function
 on that one input yourself:
@@ -455,8 +429,8 @@ inside a ``@pure`` function's body (reads performed in worker processes are
 not recorded, which produces call records with missing dependencies and therefore
 stale results); and call ``set_store_dir`` at module top level, since a call
 inside an ``if __name__ == "__main__":`` block, or in a notebook, does not
-reach spawn-based workers. (``run_all`` is exempt: it passes the cache
-directory to each worker explicitly.) To drive the location from the
+reach the processes such a pool starts. (``run_all`` is exempt: it tells
+each worker the store directory.) To drive the location from the
 environment, read the variable yourself, at top level:
 
 ```python
@@ -522,19 +496,17 @@ step logged, nested calls included, and `logs()` reads them out of the
 record. So a re-run after an edit shows exactly the current code's logged
 values, the unchanged steps' from cache and the edited steps' fresh, and
 nothing from before. Each script keeps its own log, named by its file
-stem, and a run replaces the previous run of the same script; a debugging
+stem, begins when `set_store_dir` is called, and replaces the previous
+run of the same script; a debugging
 script never touches the main script's log. With one script logged under
 a store directory, `logs()` needs no name. `log` outside a memoised call,
 in the script itself, goes to the log with no call record; with no store
 directory configured it does nothing.
 
-The log is as current as the cache. A logged value is the output of a
-pure function, so whatever removes call records, `clear_cache()` or the
-sweep, removes the logged values that came with them: a line naming a
-record that is gone reads as stale, `logs()` warns and counts it in
-`L.stale`, and running the script again repairs it. Values logged outside
-any memoised call, or in a run a debugger forced, have no record and stay
-until the next run of the script.
+The log is as current as the cache: `clear_cache()` deletes the logs
+with everything else. A reference whose call record was deleted by other
+means reads as stale; `logs()` warns, counts it in `L.stale`, and running
+the script again repairs it.
 
 A script whose work is one `@pure` function, `main()`, has one line in its
 log after an unchanged re-run, and every logged value inside it is
@@ -545,28 +517,6 @@ A log is readable while its run is going: `L.refresh()` picks up new
 logged values. Arrays come back as memory maps. Logs go in `logs/` in the
 store directory with everything else, so there is nothing to configure and
 nothing recorded without a store directory.
-
-### Reading what a batch produced
-
-A batch has a record of its own, since its inputs are what analysis code
-compares across:
-
-```python
-b = valuekit.batch("process")        # the newest batch of process()
-b[7].result                          # what process(7) returned
-b[7].calls                           # the memoised calls it made, with their results
-b.logs.where(quantity="rms")         # what the batch's inputs logged
-b.failures                           # (input, exception type, message)
-b.pending                            # inputs with no outcome yet
-```
-
-The record names each input's root call record and the function hash the batch
-ran under, so a batch cannot mix results from two versions of the code,
-and the only question across a code change is whether the batch has been
-re-run since. One file is written per finished input, so a batch is
-readable the moment its first input finishes; `b.refresh()` picks up the
-rest. `b.logs` is read from the call records, so it is the batch's logged values whether
-its inputs ran or were served from cache.
 
 ## Running on other machines
 

@@ -41,7 +41,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
 import types
 from importlib.machinery import EXTENSION_SUFFIXES
 from typing import Any, Callable
@@ -61,16 +60,13 @@ PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 class ReachableSet:
     """Everything reachable by name from a function's code: its hash, the
-    source spans of the user code objects in it, and the marker of each
-    native extension in it (module name -> binary hash), which a worker on
-    another machine is given rather than computing."""
+    source spans of the user code objects in it."""
 
-    __slots__ = ("hash", "spans", "extensions")
+    __slots__ = ("hash", "spans")
 
-    def __init__(self, hash: str, spans: list[tuple[str, int, int]], extensions: dict[str, str]):
+    def __init__(self, hash: str, spans: list[tuple[str, int, int]]):
         self.hash = hash
         self.spans = spans
-        self.extensions = extensions
 
 
 # ---------------------------------------------------------------------------
@@ -127,17 +123,23 @@ def _dist_version(top: str) -> str | None:
 # file's size and modification time.
 #
 # A worker never hashes its own binary, which is built on another machine
-# and may differ byte for byte.  The main process sends the markers its walk
-# met, one per extension module, and a worker substitutes them wherever its
-# own walk meets those modules.  Results the worker computes are therefore
-# keyed by the main process's build; the sync guarantees the worker's binary
-# was built from the same sources.  An extension the main process never
-# reached has no marker on the worker, so the hashes differ and the worker
-# is refused rather than accepted.
+# and may differ byte for byte.  The main process sends every marker it has
+# computed, one per extension module, and a worker substitutes them wherever
+# its own walk meets those modules.  Results the worker computes are
+# therefore keyed by the main process's build; the sync guarantees the
+# worker's binary was built from the same sources.  An extension the main
+# process never hashed has no marker on the worker, so the hashes differ and
+# the worker is refused rather than accepted.
 
 _markers_here: dict[str, str] | None = None  # set on a worker; None on the main process
-_walk = threading.local()  # .extensions: the markers the walk in progress has met
 _binary_hashes: dict[str, tuple[tuple[int, int], str]] = {}  # path -> ((size, mtime_ns), hash)
+_markers: dict[str, str] = {}  # extension module name -> its marker, every one hashed here
+
+
+def extension_markers() -> dict[str, str]:
+    """The markers of every native extension this process has hashed, by
+    module name: what a worker is given in place of hashing its own."""
+    return dict(_markers)
 
 
 def _is_extension_file(filename: str) -> bool:
@@ -201,9 +203,7 @@ def _extension_hash(module_name: str | None, filename: str) -> str:
     if _markers_here is not None:
         return _markers_here.get(name, "?not-reached-by-the-main-process")
     h = _binary_hash(filename)
-    met = getattr(_walk, "extensions", None)
-    if met is not None:
-        met[name] = h
+    _markers[name] = h
     return h
 
 
@@ -359,7 +359,7 @@ class _Walker:
         # A @pure wrapper: walk the wrapped function like any other user
         # code.  Cycles (including mutual recursion between @pure functions)
         # are handled by the ordinary code-object seen-set.
-        if getattr(fn, "_valuekit_pure", False):
+        if hasattr(fn, "_valuekit"):
             fn = fn.__wrapped__
         if code is None:
             code = getattr(fn, "__code__", None)
@@ -422,7 +422,7 @@ class _Walker:
 
     def _add_global(self, name: str, obj: Any, co_names: tuple = ()) -> None:
         if isinstance(obj, types.FunctionType):
-            if getattr(obj, "_valuekit_pure", False):
+            if hasattr(obj, "_valuekit"):
                 self._mark(f"fn:{name}")
                 self.add_function(obj)
                 return
@@ -516,20 +516,10 @@ def reachable_set(fn: Callable, *, code: types.CodeType | None = None) -> Reacha
     @pure, which captures it at decoration time, before any debugger patches
     bytecode).
     """
-    # The extensions met are collected for the whole walk; a walk nested in
-    # another (a function hashed as a value) adds to the outer one's.
-    outer = getattr(_walk, "extensions", None)
-    if outer is None:
-        _walk.extensions = {}
-    try:
-        w = _Walker()
-        w._mark(f"python:{PYTHON}")
-        w.add_function(fn, code=code)  # type: ignore[arg-type]
-        extensions = dict(_walk.extensions)
-    finally:
-        if outer is None:
-            _walk.extensions = None
-    return ReachableSet(w.h.hexdigest(), w.spans, extensions)
+    w = _Walker()
+    w._mark(f"python:{PYTHON}")
+    w.add_function(fn, code=code)  # type: ignore[arg-type]
+    return ReachableSet(w.h.hexdigest(), w.spans)
 
 
 # ---------------------------------------------------------------------------

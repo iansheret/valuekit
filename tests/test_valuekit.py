@@ -590,10 +590,8 @@ class TestNativeExtensions:
     def test_a_walk_records_the_markers_it_met(self, fake_extension):
         mod, path = fake_extension
         fn = _using_global("solve", _NativeCallable())
-        reach = reachable_set(fn)
-        assert reach.extensions == {"_fake_ext": project._file_hash(str(path))}
-        plain = reachable_set(lambda x: x)
-        assert plain.extensions == {}
+        reachable_set(fn)
+        assert functionhash.extension_markers()["_fake_ext"] == project._file_hash(str(path))
 
     def test_the_binary_is_read_once_per_build(self, fake_extension, monkeypatch):
         mod, path = fake_extension
@@ -825,17 +823,6 @@ class TestStore:
         (d / f"{'2' * 40}.json").write_bytes(b'{"fn": "g", "deps": {}}')
         assert s.get_records("k") == [(h, t)]
 
-    def test_get_records_newest_first(self, tmp_path):
-        s = LocalStore(tmp_path)
-        old = {"fn": "f", "deps": {}, "result": "0" * 40}
-        new = {"fn": "f", "deps": {}, "result": "1" * 40}
-        h_old = s.put_record("k", old)
-        h_new = s.put_record("k", new)
-        d = tmp_path / "records" / "k"
-        os.utime(d / f"{h_old}.json", (1_000_000, 1_000_000))
-        os.utime(d / f"{h_new}.json", (2_000_000, 2_000_000))
-        assert [h for h, _ in s.get_records("k")] == [h_new, h_old]
-
     def test_listing_sees_another_stores_write(self, tmp_path):
         # The listing is cached per store on the directory's mtime, which
         # any process's write moves.
@@ -847,22 +834,6 @@ class TestStore:
         assert len(a.get_records("k")) == 1
         b.put_record("k", t2)
         assert len(a.get_records("k")) == 2
-
-    def test_a_write_moves_the_directory_mtime_on_a_coarse_clock(self, tmp_path):
-        # A write within one tick of a coarse filesystem clock leaves the
-        # directory's mtime where it was; put_record then moves it by hand.
-        # Setting the mtime ahead of the clock makes the next write's
-        # natural mtime read as not moved.
-        from valuekit import store as store_mod
-
-        s = LocalStore(tmp_path)
-        s.put_record("k", {"fn": "f", "deps": {}, "result": "0" * 40})
-        d = tmp_path / "records" / "k"
-        ahead = time.time_ns() + 3_600 * 10**9
-        os.utime(d, ns=(ahead, ahead))
-        ahead = d.stat().st_mtime_ns  # as the filesystem keeps it
-        s.put_record("k", {"fn": "f", "deps": {}, "result": "1" * 40})
-        assert d.stat().st_mtime_ns == ahead + store_mod._MTIME_STEP
 
     def test_atomic_write_onto_existing_target_is_success(self, tmp_path, monkeypatch):
         # Windows refuses to replace a file another process has mapped. The
@@ -1678,7 +1649,7 @@ class TestPure:
             return x
 
         f(1)
-        key = f._valuekit_reachable().hash
+        key = f._valuekit.reachable.hash
         here = sys.modules["valuekit.pure"]._current_store()
         [(h, _)] = here.get_records(key)
         assert here.get_record(key, h)["result"]
@@ -2024,8 +1995,8 @@ class TestNestedPure:
         def outer(x):
             return inner(x) + 1
 
-        inner_spans = inner._valuekit_reachable().spans
-        outer_spans = set(map(tuple, outer._valuekit_reachable().spans))
+        inner_spans = inner._valuekit.reachable.spans
+        outer_spans = set(map(tuple, outer._valuekit.reachable.spans))
         inner_files = {f for f, _, _ in inner_spans}
         assert any(
             f in inner_files and lo <= inner_spans[0][1] <= hi
@@ -2052,7 +2023,7 @@ class TestNestedPure:
         assert calls == ["o", "i"]
 
         # Breakpoint in *inner* only: a warm outer must NOT shortcut past it.
-        fname, lo, _ = inner._valuekit_reachable().spans[0]
+        fname, lo, _ = inner._valuekit.reachable.spans[0]
         dbg = bdb.Bdb()
         dbg.set_break(fname, lo + 1)
         monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
@@ -2077,7 +2048,7 @@ class TestNestedPure:
             calls.append("i")
             return x * 2
 
-        fname, lo, _ = inner._valuekit_reachable().spans[0]
+        fname, lo, _ = inner._valuekit.reachable.spans[0]
         armed = [True]
 
         @pure
@@ -2127,7 +2098,7 @@ class TestNestedPure:
         assert process_batch(1) == 9  # warm everything, cleanly
         assert calls == ["p", "a", "b", "c"]
 
-        fname, lo, _ = stage_c._valuekit_reachable().spans[0]
+        fname, lo, _ = stage_c._valuekit.reachable.spans[0]
         dbg = bdb.Bdb()
         dbg.set_break(fname, lo + 1)
         monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
@@ -2232,10 +2203,12 @@ def _fib(n):
 
 
 def _record_of(cache, f):
-    """The newest stored record of *f*, as ``(hash, doc)``."""
-    got = LocalStore(cache).get_records(f._valuekit_reachable().hash)
+    """The stored record of *f* written last, as ``(hash, doc)``."""
+    key = f._valuekit.reachable.hash
+    got = LocalStore(cache).get_records(key)
     assert got, "no record stored"
-    return got[0]
+    d = cache / "records" / key
+    return max(got, key=lambda hd: (d / f"{hd[0]}.json").stat().st_mtime_ns)
 
 
 class TestCallRecords:
@@ -2258,8 +2231,8 @@ class TestCallRecords:
 
         assert outer(1) == 5
         _, t = _record_of(cache, outer)
-        a_key = a._valuekit_reachable().hash
-        b_key = b._valuekit_reachable().hash
+        a_key = a._valuekit.reachable.hash
+        b_key = b._valuekit.reachable.hash
         a_hashes = {h for h, _ in LocalStore(cache).get_records(a_key)}
         (hb, _), = LocalStore(cache).get_records(b_key)
         assert [c[:2] for c in t["calls"]] == [
@@ -2286,8 +2259,8 @@ class TestCallRecords:
         outer(1)
         assert n == [1]  # the inner call inside outer was a hit
         _, t = _record_of(cache, outer)
-        assert t["calls"] == [[inner.__qualname__, inner._valuekit_reachable().hash, h_inner]]
-        assert len(LocalStore(cache).get_records(inner._valuekit_reachable().hash)) == 1
+        assert t["calls"] == [[inner.__qualname__, inner._valuekit.reachable.hash, h_inner]]
+        assert len(LocalStore(cache).get_records(inner._valuekit.reachable.hash)) == 1
 
     def test_log_records_labels_and_value_in_the_record(self, cache):
         from valuekit import runlog
@@ -2347,7 +2320,7 @@ class TestCallRecords:
             return x
 
         assert f(1) == 1
-        assert LocalStore(cache).get_records(f._valuekit_reachable().hash) == []
+        assert LocalStore(cache).get_records(f._valuekit.reachable.hash) == []
         [logged] = vk.logs()
         assert logged.labels["q"] == "a" and logged.value[3] == 3.0
 
@@ -2361,7 +2334,7 @@ class TestCallRecords:
         def inner(x):
             return x * 2
 
-        fname, lo, _ = inner._valuekit_reachable().spans[0]
+        fname, lo, _ = inner._valuekit.reachable.spans[0]
         armed = [True]
 
         @pure
@@ -2373,58 +2346,18 @@ class TestCallRecords:
             return inner(x) + 1
 
         assert outer(3) == 7
-        assert LocalStore(cache).get_records(outer._valuekit_reachable().hash) == []
-
-    def test_cached_returns_the_stored_result_without_executing(self, cache):
-        n = []
-
-        @pure
-        def f(x):
-            n.append(x)
-            return x + 1
-
-        with pytest.raises(CacheMiss):
-            f.cached(1)
-        f(1)
-        assert f.cached(1) == 2
-        assert n == [1]
-        with pytest.raises(CacheMiss):
-            f.cached(2)
-        assert n == [1]
-
-    def test_cached_without_a_store_raises(self):
-        @pure
-        def f(x):
-            return x
-
-        with pytest.raises(CacheMiss):
-            f.cached(1)
-
-    def test_cached_inside_a_miss_is_recorded_as_a_call(self, cache):
-        @pure
-        def inner(x):
-            return x + 1
-
-        @pure
-        def outer(x):
-            return inner.cached(x)
-
-        inner(1)
-        h_inner, _ = _record_of(cache, inner)
-        outer(1)
-        _, t = _record_of(cache, outer)
-        assert t["calls"][0][2] == h_inner
+        assert LocalStore(cache).get_records(outer._valuekit.reachable.hash) == []
 
     def test_lookup_returns_the_matched_hash_or_none(self, cache):
         @pure
         def f(x):
             return x
 
-        assert f._valuekit_lookup(1) is None
+        assert f._valuekit.record_hash(1) is None
         f(1)
         h, t = _record_of(cache, f)
-        assert f._valuekit_lookup(1) == (h, t)
-        assert f._valuekit_lookup(2) is None
+        assert f._valuekit.record_hash(1) == h
+        assert f._valuekit.record_hash(2) is None
 
     def test_pure_local_memoises_identically_and_is_flagged(self, cache):
         n = []
@@ -2435,13 +2368,13 @@ class TestCallRecords:
 
         f = pure(body)
         g = vk.pure_local(body)
-        assert f._valuekit_local is False and g._valuekit_local is True
+        assert f._valuekit.local is False and g._valuekit.local is True
         f(1)
         assert g(1) == 2 and n == [1]  # same code, same function hash: a hit
 
     def test_recursion_records_the_calls_it_made(self, cache):
         _fib(3)
-        key = _fib._valuekit_reachable().hash
+        key = _fib._valuekit.reachable.hash
         records = {h: t for h, t in LocalStore(cache).get_records(key)}
         (top,) = [t for t in records.values() if t["deps"]["n"]["hash"] == content_hash(3)]
         assert [c[:2] for c in top["calls"]] == [[_fib.__qualname__, key]] * 2
@@ -2467,8 +2400,8 @@ class TestCallRecords:
         for th in threads:
             th.join()
         s = LocalStore(cache)
-        inner_x = {h: t["deps"]["x"]["hash"] for h, t in s.get_records(inner._valuekit_reachable().hash)}
-        outers = s.get_records(outer._valuekit_reachable().hash)
+        inner_x = {h: t["deps"]["x"]["hash"] for h, t in s.get_records(inner._valuekit.reachable.hash)}
+        outers = s.get_records(outer._valuekit.reachable.hash)
         assert len(outers) == 2
         for _, t in outers:
             [(_, _, h)] = t["calls"]
@@ -2480,13 +2413,19 @@ class TestCallRecords:
 
 
 def _new_run(monkeypatch, script):
-    """Pretend this process is a fresh run of *script*: the next memoised
-    call or log begins an run under that name."""
+    """Make this process's run a fresh run of *script*.  A previous run
+    that logged nothing (the one begun under this process's own script
+    name when the store was configured) is removed, so only scripts the
+    test named are logged."""
     from valuekit import runlog
 
+    store = sys.modules["valuekit.pure"]._current_store()
+    previous = store.run
+    store.close()
+    if previous is not None and not any(previous.dir.glob("*.jsonl")):
+        shutil.rmtree(previous.dir.parent, ignore_errors=True)
     monkeypatch.setattr(sys, "argv", [script])
-    runlog._close()
-    monkeypatch.setattr(runlog, "_current", None)
+    runlog.begin_run(store)
 
 
 class TestRunLog:
@@ -2605,7 +2544,7 @@ class TestRunLog:
         _new_run(monkeypatch, "physics.py")
         outer(1)  # a hit: one line naming the record, no copy of its entries
         [d] = _log_lines(cache)
-        assert d["record"] == [outer._valuekit_reachable().hash, outer._valuekit_lookup(1)[0]]
+        assert d["record"] == [outer._valuekit.reachable.hash, outer._valuekit.record_hash(1)]
         assert n == [1]
         got = {logged.labels["q"]: logged.value for logged in vk.logs()}
         assert got == {"inner": 10, "outer": 1}
@@ -2646,7 +2585,7 @@ class TestRunLog:
         outer(1)
         _new_run(monkeypatch, "physics.py")
         outer(1)  # a hit: the log is one reference
-        shutil.rmtree(cache / "records" / inner._valuekit_reachable().hash)
+        shutil.rmtree(cache / "records" / inner._valuekit.reachable.hash)
         with pytest.warns(UserWarning, match="1 logged calls .* no longer in the cache"):
             L = vk.logs()
         assert L.stale == 1
@@ -2732,7 +2671,7 @@ class TestDebugHook:
             calls.append(1)
             return x
 
-        fname, lo, hi = f._valuekit_reachable().spans[0]
+        fname, lo, hi = f._valuekit.reachable.spans[0]
 
         dbg = bdb.Bdb()
         dbg.set_break(fname, lo)
@@ -2971,6 +2910,12 @@ def _write_batch_module(tmp_path):
         "    time.sleep(1.5)\n"
         "    return x\n"
         "@pure\n"
+        "def big_array(n):\n"
+        "    return np.arange(float(n))\n"
+        "@pure\n"
+        "def wrap(x):\n"
+        "    return {'x': x}\n"
+        "@pure\n"
         "def with_log(sid):\n"
         "    vklog({'q': 'twice', 'sid': sid}, sid * 2)\n"
         "    vklog({'q': 'twice', 'sid': sid}, sid * 3)\n"
@@ -2997,6 +2942,11 @@ def _write_batch_module(tmp_path):
         "@pure\n"
         "def process(sid):\n"
         "    return analyse(sid, load(sid))\n"
+        "def plain(sid):\n"
+        "    _note(f'P{sid}')\n"
+        "    if sid == 3:\n"
+        "        raise ValueError('bad calibration in scenario 3')\n"
+        "    return sid * 3\n"
         "@pure\n"
         "def hard_death(x):\n"
         "    import os\n"
@@ -3053,54 +3003,59 @@ class TestRunAll:
         m, counts = _write_batch_module(tmp_path)
         ids = [7, 5, 6]
         r1 = vk.run_all(m.process, ids, max_workers=2)
-        assert r1.values == [71, 51, 61]  # input order preserved
-        assert [o.input for o in r1] == ids
-        assert r1.failures == []
+        assert r1 == [71, 51, 61]  # input order preserved
         n = len(counts())
         assert n == 6  # 3 loads + 3 analyses, all in workers
         r2 = vk.run_all(m.process, ids, max_workers=2)
-        assert r2.values == r1.values
+        assert r2 == r1
         assert len(counts()) == n  # second round: all hits, zero executions
 
-    def test_spontaneous_worker_death_isolated_and_recorded(self, cache, tmp_path):
-        # A segfault-like death loses exactly its own input; siblings and
-        # the rest of the batch are unaffected.
+    def test_a_local_worker_writes_its_result_into_the_store_itself(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.hard_death, [1, 2, 3], max_workers=2)
-        assert isinstance(r, vk.BatchResult)
-        assert r[1].result() == 4 and r[2].result() == 6  # isolation
-        [(x, exc)] = r.failures
-        assert x == 1
-        assert "exited without raising" in str(exc) and "exit code" in str(exc)
+        [big] = vk.run_all(m.big_array, [2_000_000], max_workers=1)
+        assert big.shape == (2_000_000,) and big[-1] == 1_999_999.0
+        # The worker put the array into the store; the main process read it back.
+        assert list((cache / "objects").rglob("*.npy*"))
+        assert m.big_array(2_000_000)[3] == 3.0  # a hit here
 
-    # ---- failure collection --------------------------------------------------
+    def test_an_edit_while_a_batch_runs_is_refused_by_the_task_it_affects(self, cache, tmp_path):
+        import threading
 
-    def test_collect_mode_processes_everything(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        mod = tmp_path / "proj" / "vk_batch_mod.py"
+
+        def edit_slow():
+            mod.write_text(mod.read_text().replace("time.sleep(1.5)", "time.sleep(1.55)"))
+
+        threading.Timer(0.7, edit_slow).start()
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.slow, [1, 2, 3], max_workers=1)
+        assert ei.value.input in (2, 3) and ei.value.host == "local"
+        assert "differs here" in ei.value.failure.message
+
+    def test_a_worker_that_exits_without_a_result_fails_the_batch(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.hard_death, [2, 1, 3], max_workers=1)
+        err = ei.value
+        assert err.input == 1 and err.failure.type == "exit"
+        assert "exit code" in err.failure.message and "hard_death(1)" in str(err)
+
+    # ---- the first failure ends the batch --------------------------------------
+
+    def test_the_first_failure_ends_the_batch(self, cache, tmp_path):
         m, counts = _write_batch_module(tmp_path)
-        r = vk.run_all(m.process, [1, 2, 3, 4], max_workers=1)
-        # scenario 3 failed, but 4 was still processed afterwards:
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.process, [1, 2, 3, 4], max_workers=1)
+        err = ei.value
+        assert err.input == 3 and err.host == "local"
+        assert err.failure.type == "ValueError" and "scenario 3" in err.failure.message
+        assert "Traceback" in err.failure.traceback
+        assert "process(3) on local: ValueError: bad calibration" in str(err)
         c = counts()
-        assert "L4" in c and "A4" in c
-        assert isinstance(r, vk.BatchResult)
-        assert len(r) == 4
-        assert [(x, type(e).__name__) for x, e in r.failures] == [(3, "ValueError")]
-        assert r[2].input == 3
-        assert isinstance(r[2].exception(), ValueError)
-        with pytest.raises(ValueError, match="scenario 3"):
-            r[2].result()
-        assert r[0].result() == 11
-
-    def test_collect_mode_values_raises_exception_group(self, cache, tmp_path):
-        m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.process, [1, 3], max_workers=1)
-        with pytest.raises(ExceptionGroup, match="1 of 2 inputs failed") as ei:
-            r.values
-        (sub,) = ei.value.exceptions
-        assert isinstance(sub, ValueError)
-        assert "input: 3" in getattr(sub, "__notes__", [])
-        with pytest.raises(ExceptionGroup):
-            r.values  # a second access must not duplicate the note
-        assert getattr(sub, "__notes__", []).count("input: 3") == 1
+        assert "A3" in c and "L4" not in c  # input 4 never started
+        assert m.process(1) == 11  # what finished is cached
+        assert "L1" in counts() and counts().count("L1") == 1
 
     # ---- timeout -------------------------------------------------------------
 
@@ -3109,29 +3064,16 @@ class TestRunAll:
 
         m, counts = _write_batch_module(tmp_path)
         t0 = time.monotonic()
-        r = vk.run_all(m.quick_or_hang, [7, 9, 8], max_workers=3, timeout=1.5)
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.quick_or_hang, [7, 9, 8], max_workers=3, timeout=1.5)
         assert time.monotonic() - t0 < 20  # the hang did not stall the batch
-        # the healthy inputs completed normally:
-        assert r[0].result() == 70 and r[2].result() == 80
-        [(x, exc)] = r.failures
-        assert x == 9 and isinstance(exc, TimeoutError)
+        assert ei.value.input == 9 and ei.value.failure.type == "timeout"
         time.sleep(0.5)
         assert "W9" not in counts()  # the hung process was killed, not finished
 
-    def test_capacity_not_degraded_by_timeout(self, cache, tmp_path):
-        # After a kill, queued inputs still start: worker capacity is
-        # replaced, not consumed, by a timed-out input.
+    def test_an_unbreached_timeout_changes_nothing(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.quick_or_hang, [9, 1, 2, 3], max_workers=2, timeout=1.5)
-        assert len(r) == 4
-        assert [x for x, _ in r.failures] == [9]
-        assert [o.result() for o in r if o.input != 9] == [10, 20, 30]
-
-    def test_timeout_unbreached_collects_normally(self, cache, tmp_path):
-        m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.process, [1, 2, 3], max_workers=2, timeout=60)
-        assert [x for x, _ in r.failures] == [3]
-        assert r[0].result() == 11
+        assert vk.run_all(m.process, [1, 2], max_workers=2, timeout=60) == [11, 21]
 
     # ---- an attached debugger is not, by itself, a mode -----------------------
 
@@ -3142,14 +3084,10 @@ class TestRunAll:
         # debugger attached must not: failures are collected exactly as
         # they are without one, and every input is still processed.
         m, counts = _write_batch_module(tmp_path)
-        r = vk.run_all(m.process, [1, 2, 3, 4], max_workers=2)
-        assert isinstance(r, vk.BatchResult)
-        assert len(r) == 4
-        assert [(x, type(e).__name__) for x, e in r.failures] == [(3, "ValueError")]
-        assert r[0].result() == 11
-        c = counts()
-        assert "L4" in c and "A4" in c  # input 4 ran despite 3 failing
-        assert c.count("A3") == 1  # the failure was not re-run
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.process, [1, 2, 3], max_workers=2)
+        assert ei.value.input == 3 and ei.value.failure.type == "ValueError"
+        assert counts().count("A3") == 1  # the failure was not re-run
 
     # ---- sequential mode (breakpoints) ---------------------------------------
 
@@ -3167,12 +3105,12 @@ class TestRunAll:
         def batch(x):
             return step(x)
 
-        fname, lo, _ = step._valuekit_reachable().spans[0]
+        fname, lo, _ = step._valuekit.reachable.spans[0]
         dbg = bdb.Bdb()
         dbg.set_break(fname, lo + 1)
         monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
 
-        assert vk.run_all(batch, [1, 2, 3]).values == [2, 3, 4]
+        assert vk.run_all(batch, [1, 2, 3]) == [2, 3, 4]
         assert calls == [1, 2, 3]  # sequential, in-process: breakpoints fire
 
 
@@ -3183,125 +3121,6 @@ class TestRunAll:
 # The cache's whole promise is that it can stay on, and none of it is
 # visible from outside: a step that ought to hit and silently does not looks
 # exactly like a slow one. These assert what the event stream records.
-
-
-class TestBatches:
-    """run_all records what it produced under a name; valuekit.batch reads
-    it back without importing or running the pipeline."""
-
-    def test_run_all_requires_a_memoised_function(self, cache):
-        def plain(x):
-            return x
-
-        with pytest.raises(TypeError, match="@pure"):
-            vk.run_all(plain, [1])
-
-    def test_a_batch_is_recorded_and_readable(self, cache, tmp_path):
-        m, _ = _write_batch_module(tmp_path)
-        vk.run_all(m.process, [1, 2, 3, 4], max_workers=2)
-        b = vk.batch("process")
-        assert (b.name, b.fn, b.n) == ("process", "process", 4)
-        assert b.function_hash == m.process._valuekit_reachable().hash
-        assert b.inputs == [1, 2, 3, 4]
-        assert b.complete and b.pending == []
-        assert b.failures == [(3, "ValueError", "bad calibration in scenario 3")]
-        assert [r.input for r in b.rows] == [1, 2, 4]
-        row = b[1]
-        assert row.result == 11
-        assert [c.fn for c in row.calls] == ["load", "analyse"]
-        assert [c.result for c in row.calls] == [10, 11]
-        with pytest.raises(KeyError, match="failed"):
-            b[3]
-        with pytest.raises(KeyError, match="not an input"):
-            b[99]
-
-    def test_cached_inputs_skip_workers_and_are_still_recorded(self, cache, tmp_path):
-        m, counts = _write_batch_module(tmp_path)
-        vk.run_all(m.process, [1, 2], max_workers=2)
-        first = vk.batch("process")
-        n = len(counts())
-        vk.run_all(m.process, [1, 2], max_workers=2)
-        assert len(counts()) == n  # nothing executed anywhere
-        second = vk.batch("process")
-        assert second._path != first._path  # a new batch under the same name
-        assert [r.input for r in second.rows] == [1, 2]
-        assert second[2].record_hash == first[2].record_hash  # the same call records
-        assert [p.name for p in first._path.parent.iterdir() if p.is_dir()] == [
-            second._path.name
-        ]  # the older record is gone
-
-    def test_batch_names(self, cache, tmp_path):
-        m, _ = _write_batch_module(tmp_path)
-        vk.run_all(m.process, [1], name="nightly")
-        assert vk.batch("nightly").fn == "process"
-        with pytest.raises(LookupError):
-            vk.batch("process")
-        with pytest.raises(LookupError):
-            vk.batch("nightly", store_dir=tmp_path / "elsewhere")
-
-    def test_logged_values_are_read_back_from_the_batch_and_the_log(self, cache, tmp_path):
-        m, _ = _write_batch_module(tmp_path)
-        vk.run_all(m.with_log, [1, 2, 3, 4], max_workers=2)
-        b = vk.batch("with_log")
-        assert sorted(it.value for it in b.logs.where(q="twice", sid=2)) == [4, 6]
-        assert b.logs.where(q="parity", sid=2).one().value == 0
-        np.testing.assert_array_equal(b.logs.where(q="arr", sid=3).one().value, [0.0, 3.0, 6.0])
-        assert b[2].logs.where(q="parity").one().value == 0
-        assert len(b.logs.where(q="parity")) == 4
-        # The workers logged into this run's runlog, one file each.
-        L = vk.logs()
-        assert len(L.where(q="parity")) == 4
-        assert {it.value for it in L.where(q="parity")} == {0, 1}
-        assert len(list(L._path.glob("*.jsonl"))) == 4
-        # A batch of already-cached inputs emits the items again: the
-        # run's runlog says what this run produced, hit or miss.
-        vk.run_all(m.with_log, [1, 2], max_workers=2)
-        assert len(vk.logs().where(q="parity")) == 6
-        # An item logged in a nested call belongs to the root's row too.
-        vk.run_all(m.outer_log, [5], max_workers=1)
-        assert vk.batch("outer_log")[5].logs.where(q="parity").one().value == 1
-
-    def test_a_batch_is_readable_while_it_runs(self, cache, tmp_path):
-        import threading
-
-        m, _ = _write_batch_module(tmp_path)
-        done = []
-        th = threading.Thread(
-            target=lambda: done.append(
-                vk.run_all(m.quick_or_hang, [7, 9], max_workers=2, timeout=4)
-            )
-        )
-        th.start()
-        b = None
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            try:
-                b = vk.batch("quick_or_hang")
-            except LookupError:
-                time.sleep(0.1)
-                continue
-            if 7 not in b.pending:
-                break
-            time.sleep(0.1)
-        assert b is not None and not b.complete  # input 9 is still hanging
-        assert b[7].result == 70
-        th.join()
-        b.refresh()
-        assert b.complete
-        assert [(x, kind) for x, kind, _ in b.failures] == [(9, "TimeoutError")]
-
-    def test_a_batch_inside_a_pure_function_is_recorded_as_calls(self, cache, tmp_path):
-        m, _ = _write_batch_module(tmp_path)
-
-        @pure
-        def batch_driver(n):
-            return vk.run_all(m.process, list(range(1, n + 1))).values
-
-        assert batch_driver(2) == [11, 21]
-        _, t = _record_of(cache, batch_driver)
-        key = m.process._valuekit_reachable().hash
-        assert [c[:2] for c in t["calls"]] == [["process", key]] * 2
-        assert {c[2] for c in t["calls"]} == {r.record_hash for r in vk.batch("process")}
 
 
 class TestLocalFile:
@@ -3417,8 +3236,7 @@ class TestScheduling:
         localfile.write_mode(tmp_path / "proj", "all")
         m, _ = _write_batch_module(tmp_path)
         # Enough work that both hosts have joined before it runs out.
-        r = vk.run_all(m.slow, list(range(1, 13)))
-        assert r.failures == []
+        vk.run_all(m.slow, list(range(1, 13)))
         by_host = {}
         for _, e in _records(cache, "outcome"):
             by_host.setdefault(e["host"], []).append(e["i"])
@@ -3433,7 +3251,7 @@ class TestScheduling:
         monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
         localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
-        assert vk.run_all(m.process, [1, 2, 4, 5]).failures == []
+        assert vk.run_all(m.process, [1, 2, 4, 5]) == [11, 21, 41, 51]
         assert {e["host"] for _, e in _records(cache, "outcome")} == {"h1"}
         [(_, h)] = _records(cache, "host")
         assert h["ok"] and h["capacity"] == 2
@@ -3445,9 +3263,9 @@ class TestScheduling:
         monkeypatch.setattr(parallel, "_host_commands", {})
         m, _ = _write_batch_module(tmp_path)
         store = sys.modules["valuekit.pure"]._current_store()
-        assert _Hosts(m.process, str(cache), store, 1).capacities()[1] == {"local": 1}
-        assert _Hosts(m.process, str(cache), store, 1, 3).capacities()[1] == {"local": 3}
-        assert _Hosts(m.process, str(cache), store, 1, 0).capacities()[1] == {"local": 0}
+        assert _Hosts(m.process, str(cache), store, 1).capacities("all") == {"local": 1}
+        assert _Hosts(m.process, str(cache), store, 1, 3).capacities("all") == {"local": 3}
+        assert _Hosts(m.process, str(cache), store, 1, 0).capacities("all") == {"local": 0}
 
     def test_no_store_means_no_remote_hosts(self, cache, tmp_path, monkeypatch):
         from valuekit.parallel import _Hosts
@@ -3465,22 +3283,36 @@ class TestScheduling:
         localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
         hosts = _Hosts(m.process, str(cache), None, 1)
-        assert hosts.capacities()[0] == "remote"
+        assert hosts.mode() == "remote"
         p = tmp_path / "proj" / localfile.LOCAL_FILE
         p.write_text("nonsense [[[\n")
-        assert hosts.capacities()[0] == "remote"
+        assert hosts.mode() == "remote"
         p.write_text('mode = "local"\n')
-        assert hosts.capacities()[0] == "local"
+        assert hosts.mode() == "local"
+
+    def test_an_undecorated_function_runs_here_uncached_and_unrecorded(self, cache, tmp_path, monkeypatch):
+        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
+        _local_file(tmp_path, 'mode = "remote"\n')
+        m, counts = _write_batch_module(tmp_path)
+        assert vk.run_all(m.plain, [1, 2], max_workers=2) == [3, 6]
+        assert {e["host"] for _, e in _records(cache, "outcome")} == {"local"}
+        assert not _records(cache, "host")  # no host was tried
+        assert not any((cache / "records").iterdir())  # nothing cached
+        vk.run_all(m.plain, [1, 2], max_workers=2)
+        assert sorted(c for c in counts() if c.startswith("P")) == ["P1", "P1", "P2", "P2"]
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.plain, [3], max_workers=2)
+        assert ei.value.input == 3 and ei.value.failure.type == "ValueError"
 
     def test_no_capacity_anywhere_runs_in_this_process(self, cache, tmp_path, monkeypatch):
         monkeypatch.setattr(parallel, "_host_commands", {})
         m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.process, [1, 2], max_workers=0)
-        assert r.values == [11, 21]
+        assert vk.run_all(m.process, [1, 2], max_workers=0) == [11, 21]
         assert {e["host"] for _, e in _records(cache, "start")} == {"main"}
         assert {e["host"] for _, e in _records(cache, "outcome")} == {"main"}
-        r = vk.run_all(m.process, [3, 4], max_workers=0)  # process(3) raises
-        assert [x for x, _ in r.failures] == [3] and r[1].result() == 41
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.process, [3, 4], max_workers=0)  # process(3) raises
+        assert ei.value.input == 3 and ei.value.host == "main"
 
     def test_remote_mode_with_no_host_runs_locally_and_says_so(self, cache, tmp_path, monkeypatch):
         from valuekit import localfile
@@ -3488,7 +3320,7 @@ class TestScheduling:
         monkeypatch.setattr(parallel, "_host_commands", {})
         localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
-        assert vk.run_all(m.process, [1]).values == [11]
+        assert vk.run_all(m.process, [1]) == [11]
         [(_, o)] = _records(cache, "outcome")
         assert o["host"] == "local" and not _records(cache, "host")
 
@@ -3502,8 +3334,7 @@ class TestScheduling:
         localfile.write_mode(tmp_path / "proj", "local")
         m, _ = _write_batch_module(tmp_path)
         threading.Timer(2.0, lambda: localfile.write_mode(tmp_path / "proj", "remote")).start()
-        r = vk.run_all(m.slow, [1, 2, 3, 4, 5, 6, 7, 8])
-        assert r.failures == []
+        vk.run_all(m.slow, [1, 2, 3, 4, 5, 6, 7, 8])
         outcomes = [e for _, e in _records(cache, "outcome")]
         hosts = [e["host"] for e in sorted(outcomes, key=lambda e: e["t"])]
         assert hosts[0] == "local" and hosts[-1] == "h1"
@@ -3518,22 +3349,20 @@ class TestScheduling:
 
         monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
         localfile.write_mode(tmp_path / "proj", "remote")
-        real_sync = machines_mod.RemoteHost.sync
+        real_sync = machines_mod.Host.sync
 
         def sync_then_die(self):
             # The host process itself dies a second after it has taken work,
             # as a host going down would; the bootstrap that started it
             # is not the host, so killing the link's process would not do.
             reason = real_sync(self)
-            if not reason:
+            if not reason and self.name != "local":
                 threading.Timer(1.0, os.kill, (self.pid, signal.SIGTERM)).start()
             return reason
 
-        monkeypatch.setattr(machines_mod.RemoteHost, "sync", sync_then_die)
+        monkeypatch.setattr(machines_mod.Host, "sync", sync_then_die)
         m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.slow, [1, 2, 3, 4, 5, 6])
-        assert r.failures == []
-        assert r.values == [1, 2, 3, 4, 5, 6]
+        assert vk.run_all(m.slow, [1, 2, 3, 4, 5, 6]) == [1, 2, 3, 4, 5, 6]
         moved = [e["i"] for _, e in _records(cache, "requeue")]
         assert 1 <= len(moved) <= 2  # what was running on the host when it dropped
         assert all(e["host"] == "h1" for _, e in _records(cache, "requeue"))
@@ -3553,17 +3382,18 @@ class TestScheduling:
         localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
         # Every host dies as soon as it is given a task.
-        real_start = machines_mod.RemoteHost.start
+        real_start = machines_mod.Host.start
 
         def start_and_die(self, x):
             handle = real_start(self, x)
             os.kill(self.pid, signal.SIGTERM)
             return handle
 
-        monkeypatch.setattr(machines_mod.RemoteHost, "start", start_and_die)
-        r = vk.run_all(m.process, [1])
-        [(x, exc)] = r.failures
-        assert x == 1 and "closed" in str(exc)
+        monkeypatch.setattr(machines_mod.Host, "start", start_and_die)
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.process, [1])
+        assert ei.value.input == 1 and ei.value.failure.type == "connection"
+        assert "closed" in ei.value.failure.message
         assert [e["i"] for _, e in _records(cache, "requeue")] == [0]
 
 
@@ -3579,7 +3409,7 @@ class TestMonitor:
     def test_state_folds_hosts_and_per_host_counts(self):
         st = self._state(
             [
-                {"ev": "process", "pid": 1, "role": "main", "argv": ["drive.py"]},
+                {"ev": "process", "pid": 1, "argv": ["drive.py"]},
                 {"ev": "host", "id": 1, "name": "mac", "ok": True, "capacity": 8},
                 {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
                 {"ev": "batch", "id": 1, "fn": "process", "name": "nightly", "n": 3, "mode": "parallel"},
@@ -3601,7 +3431,7 @@ class TestMonitor:
         from valuekit import monitor
 
         events = [
-            {"ev": "process", "pid": 1, "role": "main", "argv": ["drive.py"]},
+            {"ev": "process", "pid": 1, "argv": ["drive.py"]},
             {"ev": "batch", "id": 1, "fn": "process", "name": "nightly", "n": 3, "mode": "parallel"},
             {"ev": "host", "id": 1, "name": "pc", "ok": False, "reason": "ssh failed\nmore"},
             {"ev": "start", "id": 1, "i": 0, "host": "mac"},
@@ -3664,70 +3494,6 @@ class TestMonitor:
         assert monitor.main(["--mode", "local", str(cache)]) == 2
 
 
-class TestSweep:
-    def _module(self, tmp_path, body_of_f):
-        mod = tmp_path / "vk_sweep_mod.py"
-        mod.write_text(
-            "from valuekit import pure\n"
-            "import numpy as np\n"
-            "@pure\n"
-            f"def f(x):\n    return {body_of_f}\n"
-            "@pure\n"
-            "def g(x):\n    return (x, np.arange(4.0) * x)\n"
-        )
-        sys.modules.pop("vk_sweep_mod", None)
-        if str(tmp_path) not in sys.path:
-            sys.path.insert(0, str(tmp_path))
-        import importlib
-
-        return importlib.import_module("vk_sweep_mod")
-
-    def test_sweep_removes_what_the_current_code_cannot_reach(self, cache, tmp_path):
-        from valuekit import sweep
-
-        m = self._module(tmp_path, "np.arange(1000.0) * x")
-        vk.run_all(m.f, [1, 2], max_workers=1)
-        vk.run_all(m.g, [1], max_workers=1)
-        vk.log({"q": "note"}, np.arange(5.0))  # from the main process: no record names it
-        old_key = m.f._valuekit_reachable().hash
-        g_key = m.g._valuekit_reachable().hash
-        n_objects = len([p for p in (cache / "objects").rglob("*") if p.is_file()])
-
-        m = self._module(tmp_path, "np.arange(1000.0) * x + 1")  # f edited
-        counts = sweep.sweep(cache, ["vk_sweep_mod"], dry_run=True)
-        assert counts["records"] == 2 and counts["batches"] == 1
-        assert (cache / "records" / old_key).exists()  # a dry run removes nothing
-
-        counts = sweep.sweep(cache, ["vk_sweep_mod"])
-        assert counts == {"functions": 2, "records": 2, "batches": 1, "objects": counts["objects"]}
-        assert counts["objects"] >= 2  # f's two old result arrays, at least
-        assert not (cache / "records" / old_key).exists()
-        assert (cache / "records" / g_key).exists()
-        with pytest.raises(LookupError):
-            vk.batch("f")
-        b = vk.batch("g")
-        np.testing.assert_array_equal(b[1].result[1], [0.0, 1.0, 2.0, 3.0])  # still readable
-        np.testing.assert_array_equal(vk.logs().where(q="note").one().value, np.arange(5.0))
-        assert len([p for p in (cache / "objects").rglob("*") if p.is_file()]) < n_objects
-
-        vk.run_all(m.f, [1], max_workers=1)  # the edited f runs and records afresh
-        assert vk.batch("f")[1].result[1] == 2.0
-        sys.modules.pop("vk_sweep_mod", None)
-
-    def test_sweep_command(self, cache, tmp_path):
-        from valuekit import sweep
-
-        self._module(tmp_path, "x")
-        out = subprocess.run(
-            [sys.executable, "-m", "valuekit.sweep", "--store", str(cache), "--dry-run",
-             "vk_sweep_mod"],
-            cwd=tmp_path, capture_output=True, text=True,
-        )
-        assert out.returncode == 0, out.stderr
-        assert "2 live functions" in out.stdout
-        sys.modules.pop("vk_sweep_mod", None)
-
-
 def _log_lines(store_dir):
     """The lines of the newest run's log under *store_dir*, in file order."""
     base = _Path(store_dir) / "logs"
@@ -3743,7 +3509,6 @@ def _records(store_dir, ev=None):
     """Every log record under a store directory, oldest first, optionally of
     one kind. Reads the files back and parses them, the same out-of-band shape
     the batch tests already use for run counts."""
-    events._flush()  # writes are batched on an interval; force them out
     out = []
     runs = _Path(store_dir) / "events"
     for p in sorted(runs.glob("*.jsonl")) if runs.exists() else []:
@@ -3804,7 +3569,7 @@ class TestEventLog:
             return x + 1
 
         step(1)  # recorded
-        fname, lo, _ = step._valuekit_reachable().spans[0]
+        fname, lo, _ = step._valuekit.reachable.spans[0]
         dbg = bdb.Bdb()
         dbg.set_break(fname, lo + 1)
         monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
@@ -3850,22 +3615,19 @@ class TestEventLog:
 
     def test_run_all_reports_a_failure_against_its_input(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
-        vk.run_all(m.process, [1, 3, 4])
+        with pytest.raises(vk.BatchError):
+            vk.run_all(m.process, [1, 3, 4])
         failed = [e for _, e in _records(cache, "outcome") if not e["ok"]]
         assert len(failed) == 1 and failed[0]["i"] == 1
         assert failed[0]["exc"] == "ValueError"
 
-    def test_workers_write_their_own_files(self, cache, tmp_path):
+    def test_workers_write_no_event_file(self, cache, tmp_path):
+        # A worker's events reach the main process's file through the host
+        # process; the event log has one file per main process.
         m, _ = _write_batch_module(tmp_path)
         vk.run_all(m.process, [1, 2, 4], max_workers=3)
-        by_pid = {}
-        for source, e in _records(cache, "process"):
-            by_pid.setdefault(e["pid"], set()).add(source)
-        # No file is shared between processes: concurrent appends are what
-        # does not work on Windows.
-        assert all(len(files) == 1 for files in by_pid.values())
-        roles = [e["role"] for _, e in _records(cache, "process")]
-        assert roles.count("main") == 1 and roles.count("worker") == 3
+        assert len(_records(cache, "process")) == 1
+        assert {e["host"] for _, e in _records(cache, "miss")} == {"local"}
 
     def test_sequential_fallback_still_reports(self, cache, tmp_path, monkeypatch):
         import bdb
@@ -3883,12 +3645,14 @@ class TestEventLog:
         assert batch["mode"] == "sequential"  # debugging a batch is not dark
         assert len(_records(cache, "outcome")) == 2
 
-    def test_emission_failure_does_not_break_a_run(self, cache):
+    def test_emission_failure_does_not_break_a_run(self, tmp_path):
         # A diagnostic that can break a pipeline is worse than no diagnostic.
         # A plain file where the directory belongs makes the mkdir fail, so
         # this is the real failure rather than a patched one.
+        cache = tmp_path / "cache"
         cache.mkdir(parents=True, exist_ok=True)
         (cache / "events").write_text("in the way")
+        vk.set_store_dir(cache)
 
         @pure
         def step(x):
@@ -4002,8 +3766,10 @@ def _hello(fn, python=None, function_hash=None, project_hash="", extensions=None
             "qualname": fn.__qualname__,
             "function_hash": function_hash or reachable_set(fn).hash,
             "project_hash": project_hash,
-            "extensions": extensions if extensions is not None else reachable_set(fn).extensions,
+            "extensions": extensions if extensions is not None else functionhash.extension_markers(),
             "roots": [],
+            "store_dir": "",
+            "path": [],
         }
     ).encode()
 
@@ -4011,12 +3777,13 @@ def _hello(fn, python=None, function_hash=None, project_hash="", extensions=None
 def _hello_fields(**fields):
     """A HELLO body with the given fields and empty defaults for the rest."""
     hello = {"python": PYTHON, "module": "", "qualname": "", "function_hash": "",
-             "project_hash": "", "extensions": {}, "roots": [], **fields}
+             "project_hash": "", "extensions": {}, "roots": [], "store_dir": "", "path": [], **fields}
     return json.dumps(hello).encode()
 
 
 def _handshake(body):
-    """Run a worker's handshake in-process; return the ACCEPTED reason."""
+    """Run a worker's handshake in-process; return the reason it refused,
+    or "" when it accepted."""
     from valuekit import worker
 
     rx, tx = io.BytesIO(), io.BytesIO()
@@ -4024,9 +3791,12 @@ def _handshake(body):
     rx.seek(0)
     worker.serve(rx, tx)
     tx.seek(0)
-    tag, reason = protocol.read_message(tx)
-    assert tag == protocol.ACCEPTED
-    return reason.decode()
+    message = protocol.read_message(tx)
+    if message is None:
+        return ""  # accepted: a task worker sends nothing until its result
+    tag, body = message
+    assert tag == protocol.RESULT
+    return json.loads(body)["failed"]["message"]
 
 
 class TestWorkerHandshake:
@@ -4067,30 +3837,20 @@ _HOST_CMD = [sys.executable]  # a Python 3 to bootstrap with, as a host entry na
 
 
 def _remote_host(fn, cache, name="h1", completions=None):
-    """A RemoteHost over a host process launched on this host."""
+    """A Host over a host process launched on this machine through the
+    bootstrap, as a remote host would be."""
     import queue
-    from valuekit.hosts import RemoteHost
-
-    from valuekit.hosts import ProcessConnection
+    from valuekit.hosts import Host, hello_message
+    from valuekit.parallel import _remote_connect
 
     _locked_files()
-    return RemoteHost(
-        project.Project(fn), str(cache), completions or queue.Queue(), name,
-        lambda: ProcessConnection(bootstrap.local_command(sys.executable)), str(cache / "source"),
-    )
+    proj = project.Project(fn)
+    connect = _remote_connect(name, [sys.executable, "-c", bootstrap.STAGE0], proj, str(cache / "source"))
+    hello = hello_message(fn, proj.project_hash, proj.roots, "")
+    from valuekit.pure import _current_store
 
+    return Host(name, connect, hello, _current_store(), completions or queue.Queue())
 
-def _settle(handle, completions, timeout=30):
-    """Feed *handle* from *completions* until it has an answer or the time is up."""
-    import queue
-
-    deadline = time.monotonic() + timeout
-    while handle.finished() is None and time.monotonic() < deadline:
-        try:
-            h, payload = completions.get(timeout=0.2)
-        except queue.Empty:
-            continue
-        h.feed(payload)
 
 
 class TestRemoteHost:
@@ -4106,33 +3866,30 @@ class TestRemoteHost:
 
     def test_results_come_back_in_input_order(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.process, [1, 2, 4], max_workers=2)
-        assert r.values == [11, 21, 41]
+        assert vk.run_all(m.process, [1, 2, 4], max_workers=2) == [11, 21, 41]
 
     def test_a_raised_exception_is_attributed_to_its_input(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.process, [1, 3, 4])
-        assert [x for x, _ in r.failures] == [3]
-        # The protocol cannot carry an exception object, so a remote failure is a
-        # RuntimeError naming the original -- unlike the local host, which
-        # pickles the exception itself.
-        (_, exc), = r.failures
-        assert isinstance(exc, RuntimeError)
-        assert "bad calibration" in str(exc)
-        assert "ValueError" in str(exc.__cause__) or "ValueError" in str(exc)
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.process, [1, 3, 4])
+        err = ei.value
+        assert err.input == 3 and err.host == "h1"
+        assert err.failure.type == "ValueError" and "bad calibration" in err.failure.message
+        assert "Traceback" in err.failure.traceback
 
     def test_a_worker_that_dies_is_recorded_against_its_input(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.hard_death, [0, 1, 2])
-        failed = [x for x, _ in r.failures]
-        assert failed == [1]
-        assert r[0].result() == 0 and r[2].result() == 4  # neighbours unharmed
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.hard_death, [1])
+        assert ei.value.input == 1 and ei.value.failure.type == "exit"
+        assert "h1" in ei.value.failure.message
 
     def test_a_non_storable_input_names_the_type(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
-        r = vk.run_all(m.process, [lambda z: z])
-        (_, exc), = r.failures
-        assert "function" in str(exc)  # not a pickle error
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.process, [lambda z: z])
+        assert ei.value.failure.type == "SerializationError"
+        assert "function" in ei.value.failure.message  # not a pickle error
 
     def test_the_cache_is_shared_with_workers(self, cache, tmp_path):
         m, counts = _write_batch_module(tmp_path)
@@ -4146,22 +3903,18 @@ class TestRemoteHost:
         # values all arrive here, and it opens no run file of its own.
         m, _ = _write_batch_module(tmp_path)
         vk.run_all(m.process, [1, 2])
-        roles = [e["role"] for _, e in _records(cache, "process")]
-        assert roles == ["main"]
+        assert len(_records(cache, "process")) == 1
         misses = [e["fn"] for _, e in _records(cache, "miss")]
         assert sorted(misses) == ["analyse", "analyse", "load", "load", "process", "process"]
-        assert LocalStore(cache).get_records(m.load._valuekit_reachable().hash)
+        assert LocalStore(cache).get_records(m.load._valuekit.reachable.hash)
 
     def test_a_pure_local_call_in_a_worker_runs_in_the_main_process(self, cache, tmp_path):
         m, _ = _write_batch_module(tmp_path)
         r = vk.run_all(m.via_local, [1, 2])
-        assert r.values == [os.getpid()] * 2  # this process, not a worker
-        b = vk.batch("via_local")
-        assert b[1].logs.where(q="where").one().value == os.getpid()
-        assert [c.result for c in b[1].calls] == [os.getpid()]
+        assert r == [os.getpid()] * 2  # this process, not a worker
         assert vk.logs().where(q="where", x=1).one().value == os.getpid()
         # The main process stored the call's record; the worker's row names it.
-        assert LocalStore(cache).get_records(m.here._valuekit_reachable().hash)
+        assert LocalStore(cache).get_records(m.here._valuekit.reachable.hash)
 
     def test_values_logged_in_a_worker_reach_the_main_process_log(self, cache, tmp_path):
         m, counts = _write_batch_module(tmp_path)
@@ -4170,24 +3923,51 @@ class TestRemoteHost:
         L = vk.logs()
         np.testing.assert_array_equal(L.where(q="arr", sid=2).one().value, [0.0, 2.0, 4.0])
         assert len(L.where(q="twice")) == 4
+        # The labels refer to the input, which the worker received and so
+        # never sent back; the main process stored it when it sent it.
+        assert L.where(q="arr", sid=2).one().labels["sid"] == 2
         assert len(list(L._path.glob("*.jsonl"))) == 1  # the main process's file; no worker wrote
         # A hit inside a worker asks the main process to emit what the record
         # recorded: outer_log misses there, with_log hits.
         vk.run_all(m.outer_log, [1])
         assert len(vk.logs().where(q="parity", sid=1)) == 2
-        assert vk.batch("outer_log")[1].logs.where(q="arr").one().value[1] == 1.0
+
+    def test_a_message_the_main_process_cannot_parse_fails_the_task(self, cache, tmp_path):
+        # A worker speaking another protocol version, say.  The task fails
+        # with the reason; the batch does not hang.
+        from valuekit import hosts as hosts_mod
+
+        m, _ = _write_batch_module(tmp_path)
+        real = hosts_mod._Handle._request
+
+        def unknown_message(self, protocol, tag, body):
+            raise protocol.ProtocolError(f"unexpected message {tag!r}")
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(hosts_mod._Handle, "_request", unknown_message)
+        try:
+            with pytest.raises(vk.BatchError) as ei:
+                vk.run_all(m.process, [1])
+        finally:
+            monkeypatch.undo()
+        assert ei.value.failure.type == "ProtocolError"
+
+    def test_a_result_that_contains_the_input_is_stored_whole(self, cache, tmp_path):
+        m, _ = _write_batch_module(tmp_path)
+        assert vk.run_all(m.wrap, [5]) == [{"x": 5}]
+        assert m.wrap(5) == {"x": 5}  # a hit, decoded from the store
 
     def test_the_worker_environment_is_an_allowlist(self, cache, tmp_path, monkeypatch):
         m, _ = _write_batch_module(tmp_path)
         monkeypatch.setenv("VK_UNRELATED_SECRET", "hunter2")
-        assert vk.run_all(m.env_var, ["VK_UNRELATED_SECRET"]).values == ["absent"]
+        assert vk.run_all(m.env_var, ["VK_UNRELATED_SECRET"]) == ["absent"]
 
     def test_the_environment_is_activated_for_workers(self, cache, tmp_path):
         # A tool the lock installed beside the interpreter (cmake, for an
         # extension that rebuilds on import) must be findable by name; no
         # shell activated anything on the host, so the bootstrap does.
         m, _ = _write_batch_module(tmp_path)
-        seen = vk.run_all(m.activation, [1]).values[0]
+        seen = vk.run_all(m.activation, [1])[0]
         assert os.path.normcase(seen["path0"]) == os.path.normcase(seen["bindir"])
         assert os.path.normcase(seen["venv"]) == os.path.normcase(seen["prefix"])
 
@@ -4198,11 +3978,10 @@ class TestRemoteHost:
         # back to enforce it.
         m, _ = _write_batch_module(tmp_path)
         t0 = time.monotonic()
-        r = vk.run_all(m.quick_or_hang, [7, 9, 8], max_workers=3, timeout=1.5)
+        with pytest.raises(vk.BatchError) as ei:
+            vk.run_all(m.quick_or_hang, [7, 9, 8], max_workers=3, timeout=1.5)
         assert time.monotonic() - t0 < 20  # the hang did not stall the batch
-        failed = [(x, type(e).__name__) for x, e in r.failures]
-        assert failed == [(9, "TimeoutError")]
-        assert r[0].result() == 70 and r[2].result() == 80
+        assert ei.value.input == 9 and ei.value.failure.type == "timeout"
 
     def test_a_breakpoint_still_short_circuits_before_any_host(
         self, cache, tmp_path, monkeypatch
@@ -4215,7 +3994,7 @@ class TestRemoteHost:
         dbg.set_break(fname, lo + 1)
         monkeypatch.setattr("sys.gettrace", lambda: dbg.trace_dispatch)
         try:
-            assert vk.run_all(m.process, [1, 2]).values == [11, 21]
+            assert vk.run_all(m.process, [1, 2]) == [11, 21]
         finally:
             dbg.clear_all_breaks()
         (_, batch), = _records(cache, "batch")
@@ -4580,7 +4359,7 @@ class TestBootstrap:
         # The one-liner runs this module off stdin, as ssh will feed it.
         script = _Path(bootstrap.__file__).read_bytes()
         out = subprocess.run(
-            bootstrap.local_command(sys.executable),
+            [sys.executable, "-c", bootstrap.STAGE0],
             input=script + b"\0" + b"not json\n",
             capture_output=True,
         )
@@ -4592,7 +4371,7 @@ class TestBootstrap:
         # end the process, not be joined forever (this once left an orphan
         # spinning at full CPU and growing without bound on both platforms).
         p = subprocess.run(
-            bootstrap.local_command(sys.executable), input=b"", capture_output=True, timeout=30
+            [sys.executable, "-c", bootstrap.STAGE0], input=b"", capture_output=True, timeout=30
         )
         assert p.returncode == 1
 
@@ -4611,7 +4390,7 @@ class TestSourceTree:
 
     def test_a_batch_runs_from_a_source_tree(self, cache, tmp_path):
         m = _load(_project(tmp_path))
-        assert vk.run_all(m.work, [1, 2]).values == [101, 102]
+        assert vk.run_all(m.work, [1, 2]) == [101, 102]
         [tree] = _trees(cache)
         assert tree.name == "p" and (tree / "vk_sync_mod.py").exists()  # the project's name
         # The environment the host built lives in the tree, and the manifest
@@ -4633,10 +4412,9 @@ class TestSourceTree:
         # against the live tree this cannot survive.
         (root / "vk_sync_mod.py").unlink()
         handle = host.start(7)
-        _settle(handle, completions)
+        done = handle.wait(timeout=30)
         try:
-            done = handle.finished()
-            assert done.kind == "ok" and done.value == 107
+            assert done is not None and done.kind == "value" and done.value == 107
         finally:
             handle.release()
             host.close()
@@ -4644,7 +4422,7 @@ class TestSourceTree:
     def test_an_edit_updates_the_tree_in_place(self, cache, tmp_path):
         root = _project(tmp_path)
         m = _load(root)
-        assert vk.run_all(m.work, [1]).values == [101]
+        assert vk.run_all(m.work, [1]) == [101]
         [tree] = _trees(cache)
         kept = tree / "build" / "CMakeCache.txt"  # what an extension build leaves
         kept.parent.mkdir()
@@ -4653,7 +4431,7 @@ class TestSourceTree:
             "from valuekit import pure\n@pure\ndef work(x):\n    return x + 999999\n"  # a different length: a
         )                                            # same-length edit within
         m = _load(root)                              # one second reloads the
-        assert vk.run_all(m.work, [1]).values == [1000000]  # stale .pyc
+        assert vk.run_all(m.work, [1]) == [1000000]  # stale .pyc
         assert _trees(cache) == [tree]  # the same directory, updated
         assert kept.read_text() == "keep"
         assert json.loads(tree.with_name("p.manifest").read_text())["project_hash"] == project.Project(m.work).project_hash
@@ -4662,7 +4440,7 @@ class TestSourceTree:
         root = _project(tmp_path)
         m = _load(root)
         assert (root / "valuekit.local.toml").exists()  # the fixture wrote the mode there
-        assert vk.run_all(m.work, [1]).values == [101]
+        assert vk.run_all(m.work, [1]) == [101]
         [tree] = _trees(cache)
         assert not (tree / "valuekit.local.toml").exists()
 
@@ -4692,7 +4470,7 @@ class TestSourceTree:
         )
         assert host.sync() == ""
         host.close()
-        assert vk.run_all(m.work, [1]).values == [101]
+        assert vk.run_all(m.work, [1]) == [101]
 
     def test_a_host_in_use_refuses_a_run_with_different_code(self, cache, tmp_path):
         root = _project(tmp_path)
@@ -4729,7 +4507,7 @@ class TestSourceTree:
         root = _project(tmp_path)
         (root / "uv.lock").unlink()
         m = _load(root)
-        assert vk.run_all(m.work, [1]).values == [101]  # locally
+        assert vk.run_all(m.work, [1]) == [101]  # locally
         [(_, host)] = _records(cache, "host")
         assert host["ok"] is False
         assert "no lock file" in host["reason"] and "uv.lock" in host["reason"]
@@ -4751,7 +4529,7 @@ class TestSourceTree:
             )
             # The host is refused before any worker starts, once, as a fact
             # about the host; the batch then runs where it can.
-            assert vk.run_all(m.work, [1]).values == [1]
+            assert vk.run_all(m.work, [1]) == [1]
             [(_, host)] = _records(cache, "host")
             assert host["ok"] is False and "outside its project" in host["reason"]
             [(_, outcome)] = _records(cache, "outcome")

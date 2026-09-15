@@ -35,8 +35,9 @@ every field listed is always present.  ``SCHEMA_VERSION`` is the version
 of this table.
 
 ``process``
-    First in every file.  ``v`` (the schema version), ``pid``, ``role``
-    (``main`` or ``worker``), ``argv``, ``cwd``.
+    First in every file.  ``v`` (the schema version), ``pid``, ``argv``,
+    ``cwd``.  A worker writes no file: its events reach the main
+    process's.
 ``hit``, ``miss``, ``forced``, ``error``
     One memoised call, written by :mod:`valuekit.pure`.  ``fn`` is the
     function's qualified name and ``function_hash`` its function hash.
@@ -46,8 +47,8 @@ of this table.
     exception's type name.  A forced run has neither duration.
 ``batch``
     A :func:`valuekit.run_all` call begins.  ``id`` numbers the batch
-    within the process, ``fn`` is the function's qualified name, ``name``
-    the batch's name, ``n`` the number of inputs, ``mode`` ``parallel`` or
+    within the process, ``fn`` is the function's qualified name, ``n``
+    the number of inputs, ``mode`` ``parallel`` or
     ``sequential`` (a debugger forced the batch to run in this process).
 ``start``, ``requeue``, ``outcome``
     One input of a batch: ``id`` the batch, ``i`` the input's index,
@@ -71,7 +72,6 @@ process, which adds ``host``, the host's name, to it.
 
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import sys
@@ -79,58 +79,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-__all__ = ["record", "events_dir"]
+__all__ = ["record", "open_log"]
 
 SCHEMA_VERSION = 1
 
 _MAX_BYTES = 32 << 20  # per event file; then detail stops and drops are counted
 _MAX_FILES = 50  # event files retained in a directory
 _MAX_AGE = 7 * 24 * 3600  # seconds
-_FLUSH_INTERVAL = 0.25  # seconds between flushes
-
-
-_role_override: str | None = None
-
-
-def set_role(role: str) -> None:
-    """Declare this process a "main" or a "worker".
-
-    A worker that was not started by :mod:`multiprocessing` cannot be
-    recognised by inspecting the process tree, so one says so instead.  Must
-    be called before the first record, since the role is recorded in the
-    process header.
-    """
-    global _role_override
-    _role_override = role
-
-
-def _role() -> str:
-    """"main" or "worker".
-
-    A batch runs one worker per input, each recording its own file; without
-    this a twelve-input batch reads as thirteen runs.  The multiprocessing
-    check covers spawned workers, which do not announce themselves; anything
-    else has to call :func:`set_role`.  Imported here rather than at module
-    scope to keep this module cheap for :mod:`valuekit.pure`.
-    """
-    if _role_override is not None:
-        return _role_override
-    try:
-        import multiprocessing
-
-        return "main" if multiprocessing.parent_process() is None else "worker"
-    except Exception:
-        return "main"
-
-
-def events_dir(store: Any) -> Path | None:
-    """The runs directory of *store*, or None if it has no directory.
-
-    Duck-typed on ``.root`` rather than importing LocalStore: this module is
-    imported by :mod:`valuekit.pure` and must not import it back.
-    """
-    root = getattr(store, "root", None)
-    return None if root is None else Path(root) / "events"
 
 
 class _Writer:
@@ -140,13 +95,12 @@ class _Writer:
     are no-ops.
     """
 
-    __slots__ = ("_fh", "_bytes", "_dropped", "_last_flush", "_disabled")
+    __slots__ = ("_fh", "_bytes", "_dropped", "_disabled")
 
     def __init__(self, directory: Path):
         self._fh = None
         self._bytes = 0
         self._dropped = 0
-        self._last_flush = 0.0
         self._disabled = False
         try:
             directory.mkdir(parents=True, exist_ok=True)
@@ -157,42 +111,25 @@ class _Writer:
         except Exception:
             self._disabled = True
             return
-        self.write(
-            "process",
-            v=SCHEMA_VERSION,
-            pid=os.getpid(),
-            role=_role(),
-            argv=sys.argv,
-            cwd=os.getcwd(),
-        )
+        self.write({
+            "ev": "process", "t": time.time(), "v": SCHEMA_VERSION,
+            "pid": os.getpid(), "argv": sys.argv, "cwd": os.getcwd(),
+        })
 
-    def write(self, ev: str, **fields: Any) -> None:
+    def write(self, record: dict) -> None:
         if self._disabled:
             return
         if self._bytes >= _MAX_BYTES:
             self._dropped += 1
             return
         try:
-            record = {"ev": ev, "t": time.time()}
-            record.update(fields)
             line = json.dumps(record, default=_unrepresentable) + "\n"
             self._fh.write(line)  # type: ignore[union-attr]
+            self._fh.flush()  # type: ignore[union-attr]
             self._bytes += len(line)
-            now = time.monotonic()
-            if now - self._last_flush >= _FLUSH_INTERVAL:
-                self._fh.flush()  # type: ignore[union-attr]
-                self._last_flush = now
         except Exception:
             self.close()
             self._disabled = True
-
-    def flush(self) -> None:
-        try:
-            if self._fh is not None:
-                self._fh.flush()
-                self._last_flush = time.monotonic()
-        except Exception:
-            pass
 
     def close(self) -> None:
         fh, self._fh = self._fh, None
@@ -211,39 +148,22 @@ class _Writer:
             pass
 
 
-# The writer for the store currently in use.  set_store_dir may point
-# somewhere else mid-process, so the root is checked on every record -- but it
-# is compared as given, never rebuilt: deriving the path here instead cost
-# more than everything else in this function put together.
-_writer: _Writer | None = None
-_writer_root: Any = None
+def open_log(store) -> None:
+    """Open *store*'s event log for this process: one file under
+    ``events/``.  Called when the store becomes the current one."""
+    store.events = _Writer(Path(store.root) / "events")
 
 
 def record(store: Any, ev: str, **fields: Any) -> None:
     """Write one record to *store*'s event log.
 
-    A no-op when the store has no directory.  Never raises: a diagnostic
-    that can break a pipeline is worse than no diagnostic.
+    A no-op with no store.  Never raises: a diagnostic that can break a
+    pipeline is worse than no diagnostic.
     """
-    global _writer, _writer_root
+    if store is None:
+        return
     try:
-        emit = getattr(store, "emit", None)
-        if emit is not None:
-            # A worker whose store is the main process's: the record goes there,
-            # into the main process's own event file.
-            record = {"ev": ev, "t": time.time()}
-            record.update(fields)
-            emit(json.loads(json.dumps(record, default=_unrepresentable)))
-            return
-        root = getattr(store, "root", None)
-        if root is None:
-            return
-        if _writer is None or root != _writer_root:
-            if _writer is not None:
-                _writer.close()
-            _writer = _Writer(Path(root) / "events")
-            _writer_root = root
-        _writer.write(ev, **fields)
+        store.event({"ev": ev, "t": time.time(), **fields})
     except Exception:
         pass
 
@@ -280,25 +200,3 @@ def prune(directory: Path) -> None:
             p.unlink(missing_ok=True)
         except OSError:
             pass
-
-
-def _flush() -> None:
-    """Push buffered records to disk without closing the file.
-
-    Writes are batched on an interval so that a cache hit costs no syscall,
-    which means a reader is normally a fraction of a second behind. A caller
-    that must see everything now -- a test, above all -- asks here.
-    """
-    if _writer is not None:
-        _writer.flush()
-
-
-def _close() -> None:
-    global _writer, _writer_root
-    if _writer is not None:
-        _writer.close()
-        _writer = None
-        _writer_root = None
-
-
-atexit.register(_close)

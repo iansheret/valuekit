@@ -76,7 +76,6 @@ __all__ = [
     "STAGE0",
     "lock_tool",
     "remote_command",
-    "local_command",
     "offer",
     "main",
 ]
@@ -176,11 +175,6 @@ def lock_tool(names) -> str | None:
 def remote_command(python: str) -> str:
     """The command an ssh session runs: *python* is any Python 3 there."""
     return f'{python} -c "{STAGE0}"'
-
-
-def local_command(python: str) -> list[str]:
-    """The same as a plain argv, for a host on this machine."""
-    return [python, "-c", STAGE0]
 
 
 # ---------------------------------------------------------------------------

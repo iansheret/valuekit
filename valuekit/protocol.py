@@ -28,7 +28,7 @@ from typing import Any, BinaryIO
 import numpy as np
 
 from .codec import decode, encode
-from .values import _blob, _read_blob, content_hash
+from .values import _blob, content_hash
 
 __all__ = ["ProtocolError", "read_message", "write_message", "pack", "unpack"]
 
@@ -36,28 +36,28 @@ __all__ = ["ProtocolError", "read_message", "write_message", "pack", "unpack"]
 # refused rather than acted on.
 MAX_MESSAGE = 1 << 31
 
-HELLO = b"\x01"  # main   -> worker: json {python, module, qualname, function_hash,
-                 #   project_hash, extensions: {module: marker}, roots: [path]}
-ACCEPTED = b"\x02"  # worker -> main process: empty if accepted, else the reason
-OBJECT = b"\x03"  # either way: one content-addressed object
-TASK = b"\x04"  # main   -> worker: the root hash of the input
-RESULT = b"\x05"  # worker -> main process: ok or error
+# Bodies are raw bytes where the comment says so, else JSON.
+HELLO = b"\x01"  # main   -> worker: {python, module, qualname, function_hash, project_hash,
+                 #   extensions: {module: marker}, roots: [path], store_dir, path: [path]}
+OBJECT = b"\x03"  # either way: one content-addressed object (bytes: hash, then payload)
+TASK = b"\x04"  # main   -> worker: the root hash of the input (bytes)
+RESULT = b"\x05"  # worker -> main process: {value: root} or {failed: {type, message, traceback}};
+                  #   a refusal of the HELLO is a failure; a check's success is {value: null}
 EVENT = b"\x06"  # worker -> main process: one event
 
 # The worker's store is the main process's store.  These carry a worker's store
-# calls to the main process and the replies back; a worker holds nothing itself.
-RECORD = b"\x0a"  # worker -> main process: json {function_hash, record}: store this call record
-GET_RECORDS = b"\x0b"  # worker -> main process: the call records of one function hash
-RECORDS = b"\x0c"  # main   -> worker: the reply, as json pairs
-GET_VALUE = b"\x0d"  # worker -> main process: send me this value's objects
-VALUE = b"\x0e"  # main   -> worker: empty once sent, or why not
-CALL = b"\x0f"  # worker -> main process: run this @pure_local call here
-CALLED = b"\x10"  # main   -> worker: its result root and record hash, or error
+# calls to the main process; a worker sends one request and reads its REPLY.
+RECORD = b"\x0a"  # worker -> main process: {function_hash, record}: store this call record
+GET_RECORDS = b"\x0b"  # worker -> main process: the call records of one function hash (bytes)
+GET_VALUE = b"\x0d"  # worker -> main process: send me this value's objects (bytes: the hash)
+CALL = b"\x0f"  # worker -> main process: {module, qualname, root}: run this @pure_local call here
+REPLY = b"\x0c"  # main   -> worker: to GET_RECORDS, [[hash, record], ...]; to GET_VALUE, {} once
+                 #   the objects are sent or {reason}; to CALL, {root, record_hash} or {failed: {...}}
 LOGGED = b"\x17"  # worker -> main process: one line of the run's log (an entry or a reference)
 
 # Between the main process and a host process (valuekit.hostprocess), which runs one
 # worker per task and carries each worker's stream as a numbered channel.
-HOST = b"\x11"  # host -> main process: on start, its Python version, CPU count and pid
+HOST = b"\x11"  # host -> main process: on start, {python, cpus, pid}
 OPEN = b"\x12"  # main   -> host: channel id, then "check" or "task"
 DATA = b"\x13"  # both: channel id, then bytes of that worker's stdin or stdout
 CLOSE = b"\x14"  # main   -> host: channel id; close the worker's stdin
@@ -188,12 +188,16 @@ def unpack(root: str, objects: dict[str, bytes], fallback=None) -> Any:
     return get(root)
 
 
-def send_value(f: BinaryIO, v: Any, seen: set[str]) -> str:
-    """Send whatever of *v* the peer lacks; return the root hash."""
+def send_value(f: BinaryIO, v: Any, seen: set[str], keep: dict[str, bytes] | None = None) -> str:
+    """Send whatever of *v* the peer lacks; return the root hash.  With
+    *keep*, the objects sent are recorded in it: the peer will not send
+    them back, so a value it returns that contains them resolves here."""
     root, objects = pack(v, seen)
     for h, payload in objects.items():
         write_message(f, OBJECT, bytes.fromhex(h) + payload)
         seen.add(h)
+        if keep is not None:
+            keep[h] = payload
     return root
 
 
@@ -220,19 +224,3 @@ def store_object(store, body: bytes) -> None:
     except KeyError:
         raise ProtocolError(f"unknown object marker {body[20:21]!r}") from None
     store.put_object(body[:20].hex(), ext, body[21:])
-
-
-def strings(*parts: str) -> bytes:
-    """Pack several strings into one body."""
-    return b"".join(_blob(b"s", p.encode("utf-8")) for p in parts)
-
-
-def unstrings(body: bytes) -> list[str]:
-    out, pos = [], 0
-    while pos < len(body):
-        try:
-            _, part, pos = _read_blob(body, pos)
-        except ValueError as e:
-            raise ProtocolError(str(e)) from None
-        out.append(part.decode("utf-8"))
-    return out

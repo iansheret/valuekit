@@ -3,13 +3,12 @@
 ``run_all(fn, inputs)`` runs ``fn`` over ``inputs`` in parallel and returns
 a :class:`BatchResult` of per-input outcomes, in input order.
 
-``fn`` must be memoised (``@pure`` or ``@pure_local``).  Three things rest
-on that.  An input whose result the cache already holds needs no worker,
-and is served here.  Each input's root call record can be named in a *batch
-record* (see :mod:`valuekit.batches`), which is how analysis code reaches
-what the batch produced without reconstructing arguments.  And running
-somewhere other than this machine is safe only for a function whose
-effects do not matter, which is what memoisation already assumes.
+A memoised function (``@pure`` or ``@pure_local``) gets two things an
+undecorated one does not.  An input whose result the cache already holds
+needs no worker, and is served here.  And running somewhere other than
+this machine is safe only for a function whose effects do not matter,
+which is what memoisation already assumes, so only a memoised function
+runs on a host.
 
 Each input runs in its own process (spawned per task, up to ``max_workers``
 at once) rather than in a shared worker pool.  Isolation is the point: a
@@ -66,19 +65,21 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import socket
+import sys
 import time
+import traceback
 from collections import deque
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable
 
-from . import bootstrap, events, localfile, modes, runlog
+from . import bootstrap, events, localfile, modes
 from .project import Project, ProjectError, project_root
-from .hosts import Finished, LocalHost, ProcessConnection, RemoteHost
-from .batches import BatchWriter
+from .hosts import Failure, Finished, Host, ProcessConnection, hello_message
 from .functionhash import reachable_set
 from .debughook import breakpoints_force
 from .store import CacheMiss, LocalStore
 
-__all__ = ["run_all", "BatchResult", "Outcome"]
+__all__ = ["run_all", "BatchError"]
 
 _POLL = 0.2  # seconds between checks of deadlines and of the mode file
 
@@ -95,100 +96,21 @@ _batch_seq = 0
 _host_commands: dict[str, Any] | None = None
 
 
-class Outcome:
-    """The outcome of one input of a batch.
+class BatchError(Exception):
+    """An input of a batch produced no result, so the batch stopped.
 
-    ``input`` is the element of the submitted inputs that produced this
-    outcome, carried for attribution: exceptions do not record which input
-    started the call chain, and a filtered subset of outcomes would
-    otherwise lose its alignment with the inputs.  ``result()`` returns the
-    value, or re-raises the input's exception; ``exception()`` returns the
-    exception, or None.
+    ``input`` is the input, ``host`` where it ran, ``failure`` why there
+    is no result (see :class:`valuekit.hosts.Failure`).  Inputs that had
+    finished are in the cache; the failed input is the one to call by
+    hand.
     """
 
-    __slots__ = ("input", "_value", "_exc")
-
-    def __init__(
-        self, input: Any, value: Any = None, exc: BaseException | None = None
-    ):
+    def __init__(self, fn: str, input: Any, host: str, failure: Failure):
+        self.fn = fn
         self.input = input
-        self._value = value
-        self._exc = exc
-
-    def result(self) -> Any:
-        if self._exc is not None:
-            raise self._exc
-        return self._value
-
-    def exception(self) -> BaseException | None:
-        return self._exc
-
-    def __repr__(self) -> str:
-        if self._exc is None:
-            return f"Outcome({self.input!r}, ok)"
-        return f"Outcome({self.input!r}, {type(self._exc).__name__})"
-
-
-class BatchResult:
-    """Per-input outcomes of :func:`run_all`, in input order.
-
-    Iterating yields :class:`Outcome` objects.  Two accessors cover the two
-    ways of handling failure:
-
-    * ``.values``: the plain list of results.  If any input failed, this
-      raises an ExceptionGroup instead, so failures cannot be dropped by
-      accident; each grouped exception carries an ``input: ...`` note.
-    * ``.failures``: the ``(input, exception)`` pairs of the failed inputs,
-      for callers that handle failures explicitly and continue.
-    """
-
-    __slots__ = ("_outcomes",)
-
-    def __init__(self, outcomes: Iterable[Outcome]):
-        self._outcomes = list(outcomes)
-
-    def __iter__(self) -> Iterator[Outcome]:
-        return iter(self._outcomes)
-
-    def __len__(self) -> int:
-        return len(self._outcomes)
-
-    def __getitem__(self, i):
-        return self._outcomes[i]
-
-    @property
-    def failures(self) -> list[tuple[Any, BaseException]]:
-        return [(o.input, o._exc) for o in self._outcomes if o._exc is not None]
-
-    @property
-    def values(self) -> list:
-        failed = [o for o in self._outcomes if o._exc is not None]
-        if failed:
-            for o in failed:
-                note = f"input: {o.input!r}"
-                if note not in getattr(o._exc, "__notes__", []):
-                    o._exc.add_note(note)
-            raise BaseExceptionGroup(
-                f"{len(failed)} of {len(self._outcomes)} inputs failed",
-                [o._exc for o in failed],
-            )
-        return [o._value for o in self._outcomes]
-
-    def __repr__(self) -> str:
-        n_failed = len(self.failures)
-        n_ok = len(self._outcomes) - n_failed
-        return f"BatchResult({n_ok} ok, {n_failed} failed)"
-
-
-class _RemoteTraceback(Exception):
-    """Carries the string-form traceback captured in the worker, attached
-    as the ``__cause__`` of a collected exception so that it prints."""
-
-    def __init__(self, tb: str):
-        self.tb = tb
-
-    def __str__(self) -> str:
-        return self.tb
+        self.host = host
+        self.failure = failure
+        super().__init__(f"{fn}({input!r}) on {host}: {failure}")
 
 
 class _Task:
@@ -202,118 +124,107 @@ class _Task:
         self.where = where
 
 
-def _outcome_of(t: _Task, done: Finished, name: str, timeout) -> Outcome:
-    """A finished task's result as an Outcome against its input."""
-    if done.kind == "ok":
-        return Outcome(t.x, value=done.value)
-    if done.kind == "error":
-        exc: BaseException = done.exc
-        exc.__cause__ = _RemoteTraceback(f"\n{done.tb}")
-        return Outcome(t.x, exc=exc)
-    if done.kind == "error_text":  # the worker's exception could not be sent
-        exc = RuntimeError(done.text)
-        exc.__cause__ = _RemoteTraceback(f"\n{done.tb}")
-        return Outcome(t.x, exc=exc)
-    if done.kind == "timed_out":
-        return Outcome(t.x, exc=TimeoutError(
-            f"{name}({t.x!r}) exceeded the {timeout} s limit and was "
-            f"killed. Completed steps are cached; to debug a "
-            f"deterministic hang, call {name}({t.x!r}) and pause the "
-            f"debugger."
-        ))
-    # "exited", or "connection_closed" for the second time
-    return Outcome(t.x, exc=RuntimeError(
-        f"a worker exited without raising while processing "
-        f"{name}({t.x!r}) ({done.text}). Completed steps are "
-        f"cached; call {name}({t.x!r}) yourself to debug it."
-    ))
-
-
 class _BatchRecorder:
-    """Everything one batch reports about an input as it finishes: the run
-    log, the batch record, and the enclosing call's call list."""
+    """What one batch reports about an input as it finishes: an event, and
+    for a memoised function that produced a result, the call record noted
+    in the enclosing call's call list, as a call made directly would be."""
 
-    def __init__(self, store, fn, name: str, batch_id: int, inputs: list):
+    def __init__(self, store, fn, batch_id: int):
         from .pure import _note_call
 
         self._store = store
         self._fn = fn
-        self._name = name
+        self._memo = getattr(fn, "_valuekit", None)
         self._id = batch_id
         self._note_call = _note_call
-        self._writer = None
-        if isinstance(store, LocalStore):
-            try:
-                self._writer = BatchWriter(
-                    store, name, fn.__qualname__, fn._valuekit_reachable().hash, inputs
-                )
-            except Exception:
-                self._writer = None  # the record is a diagnostic, never a failure
 
-    def outcome(self, i: int, o: Outcome, host: str = "local") -> None:
-        exc = o.exception()
-        record = None
-        if exc is None:
-            found = self._fn._valuekit_lookup(o.input)
-            if found is not None:
-                record = found[0]
-                self._note_call(
-                    self._fn.__qualname__, self._fn._valuekit_reachable().hash, record
-                )
+    def outcome(self, i: int, x: Any, failure: Failure | None, host: str = "local") -> None:
+        if failure is None and self._memo is not None:
+            h = self._memo.record_hash(x)
+            if h is not None:
+                self._note_call(self._fn.__qualname__, self._memo.reachable.hash, h)
         events.record(
             self._store,
             "outcome",
             id=self._id,
             i=i,
-            ok=exc is None,
+            ok=failure is None,
             host=host,
-            exc=None if exc is None else type(exc).__name__,
+            exc=None if failure is None else failure.type,
         )
-        if self._writer is not None:
-            self._writer.outcome(i, record, exc)
 
 
-def _cached(fn, x) -> Outcome | None:
-    """The stored outcome for *x*, if this store already holds one."""
-    found = fn._valuekit_lookup(x)
-    if found is None:
-        return None
-    from .pure import _current_store, take_hit
+_NOT_CACHED = object()
 
+
+def _cached(fn, x) -> Any:
+    """The stored result for *x*, or ``_NOT_CACHED``."""
     try:
-        value = take_hit(_current_store(), fn._valuekit_reachable().hash, found[0], found[1])
+        return fn._valuekit.hit(x)
     except CacheMiss:
-        return None  # the result value is gone: a worker runs the input
-    return Outcome(x, value=value)
+        return _NOT_CACHED  # no record holds, or its value is gone: a worker runs the input
 
 
-def _launcher(command: list[str]):
-    return lambda: ProcessConnection(command)
+def _refused(reason: str):
+    """A ``connect`` for a host the project cannot go to: fails with the reason."""
+
+    def connect():
+        raise RuntimeError(reason)
+
+    return connect
+
+
+def _remote_connect(name: str, command: list[str], project: Project, source_root: str):
+    """A ``connect`` for a remote host: run *command* (an ssh invocation
+    that starts the bootstrap there), send the project, and return the
+    connection once the host process is about to send its first message.
+    Raises with the reason the host cannot be used."""
+    from .functionhash import PYTHON
+
+    def connect() -> ProcessConnection:
+        conn = ProcessConnection(command)
+        try:
+            reason = bootstrap.offer(
+                conn.rx, conn.tx, source_root, project.name, project.project_hash, PYTHON,
+                project.entries, project.pack,
+                f"a run of {os.path.basename(sys.argv[0]) or 'python'} on "
+                f"{socket.gethostname()} (pid {os.getpid()}, started {time.strftime('%H:%M:%S')})",
+                project.dist, project.build_inputs,
+            )
+        except (OSError, ValueError) as e:
+            reason = f"the connection to host {name!r} broke: {e}"
+        if reason:
+            detail = conn.failure()
+            conn.close()
+            raise RuntimeError(f"{reason}:\n{detail}" if detail else reason)
+        return conn
+
+    return connect
 
 
 class _Hosts:
     """The hosts a batch may run on, and how many tasks each may hold.
 
-    Remote hosts come from the local file (or the test hook); each syncs
-    on its own thread and counts only once it is ready.  The mode is
-    re-read from the file every time capacities are asked for, so a switch
-    made while the batch runs applies to the next task started; a file
-    that cannot be read leaves the mode last read in force.
+    This machine is a host through a host process started here.  Remote
+    hosts come from the local file (or the test hook); each syncs on its
+    own thread and counts only once it is ready.  The mode is re-read from
+    the file every time capacities are asked for, so a switch made while
+    the batch runs applies to the next task started; a file that cannot
+    be read leaves the mode last read in force.
     """
 
     def __init__(
-        self, fn, store_dir: str | None, store, batch: int, max_workers: int | None = None
+        self, fn, store_dir: str | None, store, batch: int, max_workers: int | None = None,
+        remote: bool = True,
     ):
         # Every host puts (handle, payload) here as a worker returns, sends
         # a request, or exits; deliver() passes each to its handle.
         completions: queue.Queue = queue.Queue()
         self._completions = completions
-        self.local = LocalHost(fn, store_dir, completions)
-        self.hosts: list[RemoteHost] = []
-        self._states: dict[str, str] = {}  # name -> syncing | ready | failed
+        self.hosts: list[Host] = []
+        self._reported: dict[str, str] = {}  # host name -> the state last recorded as an event
         self._store = store
         self._batch = batch
-        self._store_dir = store_dir
         self._closed = False
         # The local file is in the function's project; a function with
         # no project (defined in __main__, or exec'd) has no file and so no
@@ -325,95 +236,89 @@ class _Hosts:
         config = localfile.load_local(self._root)
         self.local_workers = config.local_workers if max_workers is None else max_workers
         self._mode = config.mode
-        if store_dir is None:
+
+        hello = hello_message(fn, "", [], store_dir, sys.path)
+        self.local = Host(
+            "local", lambda: ProcessConnection([sys.executable, "-m", "valuekit.hostprocess", "--local"]),
+            hello, store, completions, self.local_workers, check=False,
+        )
+        self.local.sync()  # a local host that fails has no capacity; the scheduler runs inputs here
+
+        if store_dir is None or not remote:
             # A remote host sends every result to this process's store;
-            # with none configured there is nowhere to put them.
-            pass
-        elif _host_commands is not None:
-            project = Project(fn, config.project) if _host_commands else None
-            source_root = os.path.join(store_dir, "source") if store_dir else ""
-            for name, spec in _host_commands.items():
-                command, workers = spec if isinstance(spec, tuple) else (spec, None)
-                self.hosts.append(
-                    RemoteHost(
-                        project, store_dir, completions, name,
-                        _launcher([*command, "-c", bootstrap.STAGE0]),
-                        source_root, workers,
-                    )
-                )
+            # with none configured there is nowhere to put them.  An
+            # undecorated function has no function hash for a host to check
+            # and makes no promise about its effects, so it runs here only.
+            return
+        entries = []
+        if _host_commands is not None:
+            entries = [
+                (name, [*(spec[0] if isinstance(spec, tuple) else spec), "-c", bootstrap.STAGE0],
+                 spec[1] if isinstance(spec, tuple) else None, os.path.join(store_dir, "source"))
+                for name, spec in _host_commands.items()
+            ]
         else:
-            # One project for every host: the tree is walked once per batch.
-            project = Project(fn, config.project) if config.hosts else None
-            for h in config.hosts:
-                command = [
-                    "ssh", "-T", "-o", "BatchMode=yes", h.ssh,
-                    bootstrap.remote_command(h.python),
-                ]
-                self.hosts.append(
-                    RemoteHost(
-                        project, store_dir, completions, h.name, _launcher(command),
-                        h.source_root, h.workers,
-                    )
-                )
+            entries = [
+                (h.name, ["ssh", "-T", "-o", "BatchMode=yes", h.ssh, bootstrap.remote_command(h.python)],
+                 h.workers, h.source_root)
+                for h in config.hosts
+            ]
+        if not entries:
+            return
+        # One project for every host: the tree is walked once per batch.
+        project = Project(fn, config.project)
+        refusal = project.refusal()
+        hello = hello_message(fn, project.project_hash, project.roots, "")
+        for name, command, workers, source_root in entries:
+            if refusal:
+                connect = _refused(refusal)
+            else:
+                connect = _remote_connect(name, command, project, source_root)
+            self.hosts.append(Host(name, connect, hello, store, completions, workers))
 
     def all(self) -> list:
         return [*self.hosts, self.local]
 
-    def sync(self, wait: bool) -> None:
-        """Sync every host not yet tried; block if *wait*."""
-        threads = []
-        for b in self.hosts:
-            if b.name in self._states:
-                continue
-            self._states[b.name] = "syncing"
-            t = threading.Thread(target=self._sync_one, args=(b,), daemon=True)
-            t.start()
-            threads.append(t)
-        if wait:
-            for t in threads:
-                t.join()
-
-    def _sync_one(self, b: RemoteHost) -> None:
-        reason = b.sync()
-        self._states[b.name] = "failed" if reason else "ready"
-        if self._closed:
-            return  # the batch ended first; nothing to report it to
-        events.record(
-            self._store, "host", id=self._batch, name=b.name, ok=not reason,
-            reason=reason or None, capacity=b.capacity,
-        )
-
-    def syncing(self) -> bool:
-        """Whether any host is still syncing, and so may yet take work."""
-        return any(s == "syncing" for s in self._states.values())
-
-    def capacities(self) -> tuple[str, dict[str, int]]:
-        """The mode in force and each host's capacity under it.
-
-        Syncing is started here, never waited for: this machine's workers
-        start at once and a host starts taking tasks when it is ready,
-        whether the mode named it from the start or a switch mid-batch added it.
-        """
+    def mode(self) -> str:
+        """The mode in force: the local file's, re-read now; the mode last
+        read when the file cannot be read."""
         try:
             self._mode = localfile.load_local(self._root).mode
         except RuntimeError:
-            pass  # the file cannot be read since the last time: that mode stays in force
-        mode = self._mode
-        if mode != "local" and self.hosts:
-            self.sync(wait=False)
-        remote = {}
+            pass
+        return self._mode
+
+    def start_syncs(self) -> None:
+        """Start syncing every host not yet tried, each on its own thread.
+        Never waited for: this machine's workers start at once and a host
+        takes tasks once it is ready."""
         for b in self.hosts:
-            if b.name not in self._states:
-                continue  # never asked, under a local mode
-            usable = self._states[b.name] == "ready" and not b.dropped
-            remote[b.name] = (b.capacity or 0) if usable else 0
-            if b.dropped and self._states[b.name] == "ready":
-                self._states[b.name] = "failed"
+            if b.state == "new":
+                threading.Thread(target=b.sync, daemon=True).start()
+
+    def syncing(self) -> bool:
+        """Whether any host is still syncing, and so may yet take work."""
+        return any(b.state == "syncing" for b in self.hosts)
+
+    def report(self) -> None:
+        """Record a ``host`` event for each remote host whose state settled
+        or changed since the last report, and for this machine's host only
+        when it failed: a local host process that started is not news."""
+        for b in (*self.hosts, self.local):
+            if b is self.local and b.state != "failed":
+                continue
+            if b.state in ("ready", "failed") and self._reported.get(b.name) != b.state:
+                self._reported[b.name] = b.state
                 events.record(
-                    self._store, "host", id=self._batch, name=b.name, ok=False,
-                    reason=b.failure or "the connection closed", capacity=b.capacity,
+                    self._store, "host", id=self._batch, name=b.name, ok=b.state == "ready",
+                    reason=b.failure if b.state == "failed" else None, capacity=b.capacity,
                 )
-        return mode, modes.capacities(mode, self.local_workers, remote, self.syncing())
+
+    def capacities(self, mode: str) -> dict[str, int]:
+        """Each host's capacity under *mode*, from the hosts' states."""
+        remote = {b.name: (b.capacity or 0) if b.state == "ready" else 0 for b in self.hosts}
+        local = self.local_workers if self.local.state == "ready" else 0
+        return modes.capacities(mode, local, remote, self.syncing())
 
     def deliver(self, block: bool) -> None:
         """Pass what the hosts have delivered to the handles it is for;
@@ -445,37 +350,36 @@ def run_all(
     max_workers: int | None = None,
     *,
     timeout: float | None = None,
-    name: str | None = None,
-) -> BatchResult:
-    """Run ``fn`` over ``inputs`` in parallel; return a BatchResult in
+) -> list:
+    """Run ``fn`` over ``inputs`` in parallel; return their results in
     input order.
 
-    ``fn`` must be ``@pure`` or ``@pure_local``.  Each input runs in its
-    own process; ``max_workers`` is how many run at once on this machine
+    Each input runs in its own process; ``max_workers`` is how many run at once on this machine
     (default: the ``[local] workers`` line of the local file, else the CPU
     count).  Remote hosts, if the local file names any, add their own
     capacity.  An input whose result is already cached is served without
     a worker.  ``timeout`` limits the seconds each input may spend
     running; a breach kills that input's process and records a
     TimeoutError on its outcome, leaving the rest of the batch unaffected.
-    Worker deaths are likewise recorded per input.  When no host may run
-    anything (``max_workers=0`` and no remote host is usable) the inputs
-    run one at a time in this process, without the timeout.
+    When no host may run anything (``max_workers=0`` and no remote host is
+    usable) the inputs run one at a time in this process, without the
+    timeout.
 
-    Every input is processed and failures are collected on the
-    BatchResult: ``.values`` raises an ExceptionGroup if any input failed,
-    and ``.failures`` gives the ``(input, exception)`` pairs.  Nothing is
-    re-run automatically; to debug one input, call ``fn(x)`` on it.
+    The first input that produces no result ends the batch: running tasks
+    are killed and :class:`BatchError` is raised, naming the input, the
+    host it ran on and why there is no result (an exception, by type name
+    and message with the worker's traceback as text; a timeout; a worker
+    that exited without a result).  Inputs that had finished are in the
+    cache.  A function that expects bad inputs returns a value that says
+    so.  To debug the failed input, call ``fn(x)`` on it.
 
-    The batch is recorded under ``name`` (default: the function's qualified
-    name) for :func:`valuekit.batch` to read.
+    A ``@pure`` or ``@pure_local`` function's inputs are served from the
+    cache where it holds them, and may run on the local file's hosts.  An
+    undecorated function runs on this machine only, with nothing cached:
+    it has no function hash for a host to check.  Either way the function
+    must be importable by name in a worker.
     """
-    if not getattr(fn, "_valuekit_pure", False):
-        raise TypeError(
-            f"run_all() takes a @pure or @pure_local function; got "
-            f"{getattr(fn, '__qualname__', fn)!r}. Decorate it: a batch's "
-            "results are recorded by the function that produced them."
-        )
+    decorated = hasattr(fn, "_valuekit")
     inputs = list(inputs)
 
     # Resolved before the breakpoint check below, so that the sequential
@@ -486,8 +390,6 @@ def run_all(
     store = _current_store()
     store_dir = str(store.root) if isinstance(store, LocalStore) else None
     qualname = getattr(fn, "__qualname__", repr(fn))
-    name = name or qualname
-    runlog.current_run(store)  # begun here, so that every worker writes into this run
 
     global _batch_seq
     _batch_seq += 1
@@ -501,47 +403,45 @@ def run_all(
     except Exception:
         spans = []
     if breakpoints_force(spans):
-        events.record(
-            store, "batch", id=batch, fn=qualname, name=name, n=len(inputs),
-            mode="sequential",
-        )
-        recorder = _BatchRecorder(store, fn, name, batch, inputs)
-        seq: list[Outcome] = []
+        events.record(store, "batch", id=batch, fn=qualname, n=len(inputs), mode="sequential")
+        recorder = _BatchRecorder(store, fn, batch)
+        results: list = []
         try:
             for i, x in enumerate(inputs):
-                o = Outcome(x, value=fn(x))  # exceptions propagate
-                seq.append(o)
-                recorder.outcome(i, o)
+                results.append(fn(x))  # an exception propagates: a debugger is attached
+                recorder.outcome(i, x, None, host="main")
         finally:
             events.record(store, "end", id=batch)
-        return BatchResult(seq)
+        return results
 
-    events.record(
-        store, "batch", id=batch, fn=qualname, name=name, n=len(inputs), mode="parallel"
-    )
-    recorder = _BatchRecorder(store, fn, name, batch, inputs)
+    events.record(store, "batch", id=batch, fn=qualname, n=len(inputs), mode="parallel")
+    recorder = _BatchRecorder(store, fn, batch)
 
-    outcomes: list[Outcome | None] = [None] * len(inputs)
+    results: list = [None] * len(inputs)
     pending = deque()
     for i, x in enumerate(inputs):
-        o = _cached(fn, x) if store is not None else None
-        if o is None:
+        value = _cached(fn, x) if store is not None and decorated else _NOT_CACHED
+        if value is _NOT_CACHED:
             pending.append((i, x))
         else:
-            outcomes[i] = o
-            recorder.outcome(i, o)
+            results[i] = value
+            recorder.outcome(i, x, None)
     if not pending:
         events.record(store, "end", id=batch)
-        return BatchResult(o for o in outcomes if o is not None)
+        return results
 
-    hosts = _Hosts(fn, store_dir, store, batch, max_workers)
+    hosts = _Hosts(fn, store_dir, store, batch, max_workers, remote=decorated)
 
     running: list[_Task] = []
     busy: dict[str, int] = {}  # host name -> tasks running there
     requeued: set[int] = set()  # inputs already run again once after losing their host
 
     def _start_pending() -> None:
-        _, caps = hosts.capacities()
+        mode = hosts.mode()
+        if mode != "local":
+            hosts.start_syncs()
+        hosts.report()
+        caps = hosts.capacities(mode)
         for host in hosts.all():
             while pending and busy.get(host.name, 0) < caps.get(host.name, 0):
                 idx, x = pending.popleft()
@@ -557,11 +457,12 @@ def run_all(
         idx, x = pending.popleft()
         events.record(store, "start", id=batch, i=idx, host="main")
         try:
-            o = Outcome(x, value=fn(x))
-        except Exception as e:  # noqa: BLE001 - collected on the outcome
-            o = Outcome(x, exc=e)
-        outcomes[idx] = o
-        recorder.outcome(idx, o, host="main")
+            results[idx] = fn(x)
+        except Exception as e:
+            failure = Failure(type(e).__name__, str(e), traceback.format_exc())
+            recorder.outcome(idx, x, failure, host="main")
+            raise BatchError(qualname, x, "main", failure) from None
+        recorder.outcome(idx, x, None, host="main")
 
     try:
         while pending or running:
@@ -580,26 +481,30 @@ def run_all(
                 done = t.handle.finished()
                 if done is None and t.deadline is not None and now >= t.deadline:
                     t.handle.kill()
-                    hosts.deliver(block=False)
-                    done = t.handle.finished()
-                    if done is None or done.kind in ("exited", "connection_closed"):
-                        done = Finished("timed_out")  # only a result means it finished first
+                    done = Finished("failed", failure=Failure(
+                        "timeout", f"exceeded the {timeout} s limit and was killed"
+                    ))
                 if done is None:
                     continue
                 running.remove(t)
                 busy[t.where] -= 1
                 t.handle.release()
-                if done.kind == "connection_closed" and t.idx not in requeued:
-                    # The input is not done, not failed.  Run it again
-                    # elsewhere, once: an input that takes a host down each
-                    # time is a failure after all.
-                    requeued.add(t.idx)
-                    pending.appendleft((t.idx, t.x))
-                    events.record(store, "requeue", id=batch, i=t.idx, host=t.where)
-                    continue
-                o = _outcome_of(t, done, qualname, timeout)
-                outcomes[t.idx] = o
-                recorder.outcome(t.idx, o, host=t.where)
+                if done.kind == "closed":
+                    if t.idx not in requeued:
+                        # The input is not done, not failed.  Run it again
+                        # elsewhere, once: an input that takes a host down
+                        # each time is a failure after all.
+                        requeued.add(t.idx)
+                        pending.appendleft((t.idx, t.x))
+                        events.record(store, "requeue", id=batch, i=t.idx, host=t.where)
+                        continue
+                    done = Finished("failed", failure=Failure(
+                        "connection", f"the connection to host {t.where!r} closed under this input twice"
+                    ))
+                recorder.outcome(t.idx, t.x, done.failure, host=t.where)
+                if done.kind == "failed":
+                    raise BatchError(qualname, t.x, t.where, done.failure)
+                results[t.idx] = done.value
     finally:
         # Covers KeyboardInterrupt: no worker process outlives the batch.
         for t in running:
@@ -612,4 +517,4 @@ def run_all(
         # exactly the one whose final state is worth having.
         events.record(store, "end", id=batch)
 
-    return BatchResult(o for o in outcomes if o is not None)
+    return results

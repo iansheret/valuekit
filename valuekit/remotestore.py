@@ -29,11 +29,19 @@ __all__ = ["RemoteStore"]
 
 
 class RemoteStore:
-    """:class:`~valuekit.store.CacheStore` over a framed connection."""
+    """:class:`~valuekit.store.CacheStore` over a framed connection.
 
-    def __init__(self, rx: BinaryIO, tx: BinaryIO):
+    Events, run-log lines and ``@pure_local`` calls always go to the main
+    process.  Values and call records do too, unless *direct* is a
+    :class:`~valuekit.store.LocalStore` on the main process's store
+    directory, which a worker on the main process's machine is given so
+    that it reads and writes them itself.
+    """
+
+    def __init__(self, rx: BinaryIO, tx: BinaryIO, direct=None):
         self._rx = rx
         self._tx = tx
+        self._direct = direct
         self._objects: dict[str, bytes] = {}  # everything sent or received
         self._seen: set[str] = set()  # the same, as the hashes protocol.pack skips
 
@@ -45,9 +53,12 @@ class RemoteStore:
         self._seen.add(body[:20].hex())
 
     def unpack(self, root: str) -> Any:
-        return protocol.unpack(root, self._objects)
+        fallback = self._direct.get_value if self._direct is not None else None
+        return protocol.unpack(root, self._objects, fallback)
 
     def put_value(self, v: Any) -> str:
+        if self._direct is not None:
+            return self._direct.put_value(v)
         root, objects = protocol.pack(v, self._seen)
         for h, payload in objects.items():
             protocol.write_message(self._tx, protocol.OBJECT, bytes.fromhex(h) + payload)
@@ -56,11 +67,13 @@ class RemoteStore:
         return root
 
     def get_value(self, h: str) -> Any:
+        if self._direct is not None:
+            return self._direct.get_value(h)
         if h not in self._objects:
             protocol.write_message(self._tx, protocol.GET_VALUE, bytes.fromhex(h))
-            reason = self._reply(protocol.VALUE)
-            if reason:
-                raise CacheMiss(f"{h}: {reason.decode('utf-8', 'replace')}")
+            reply = json.loads(self._reply())
+            if "reason" in reply:
+                raise CacheMiss(f"{h}: {reply['reason']}")
         try:
             return self.unpack(h)
         except protocol.ProtocolError as e:
@@ -69,24 +82,27 @@ class RemoteStore:
     # -- call records -------------------------------------------------------------
 
     def get_records(self, function_hash: str) -> list[tuple[str, dict]]:
+        if self._direct is not None:
+            return self._direct.get_records(function_hash)
         protocol.write_message(self._tx, protocol.GET_RECORDS, function_hash.encode())
-        body = self._reply(protocol.RECORDS)
-        return [(h, t) for h, t in json.loads(body)]
+        return [(h, t) for h, t in json.loads(self._reply())]
 
     def put_record(self, function_hash: str, record: dict) -> str:
+        if self._direct is not None:
+            return self._direct.put_record(function_hash, record)
         body = json.dumps({"function_hash": function_hash, "record": record}).encode()
         protocol.write_message(self._tx, protocol.RECORD, body)
         return record_hash(record)
 
     # -- the main process's side of the run log ------------------------------------
 
-    def emit(self, record: dict) -> None:
+    def event(self, record: dict) -> None:
         protocol.write_message(self._tx, protocol.EVENT, json.dumps(record).encode())
 
     # -- the main process's side of the run's log ------------------------------------
 
-    def emit_line(self, line: str) -> None:
-        protocol.write_message(self._tx, protocol.LOGGED, line.encode())
+    def log_line(self, line: dict) -> None:
+        protocol.write_message(self._tx, protocol.LOGGED, json.dumps(line).encode())
 
     # -- a call that must run on the main process ----------------------------------
 
@@ -98,18 +114,21 @@ class RemoteStore:
         the main process's traceback as the message.
         """
         root = self.put_value((args, kwargs))
-        protocol.write_message(self._tx, protocol.CALL, protocol.strings(module, qualname, root))
-        body = self._reply(protocol.CALLED)
-        if body[:1] == b"o":
-            result_root, h = protocol.unstrings(body[1:])
-            return self.unpack(result_root), h
-        kind, text, tb = protocol.unstrings(body[1:])
-        raise RuntimeError(f"{qualname} failed on the main process: {kind}: {text}\n{tb}")
+        call = json.dumps({"module": module, "qualname": qualname, "root": root}).encode()
+        protocol.write_message(self._tx, protocol.CALL, call)
+        reply = json.loads(self._reply())
+        if "failed" in reply:
+            f = reply["failed"]
+            raise RuntimeError(
+                f"{qualname} failed on the main process: {f['type']}: {f['message']}\n{f['traceback']}"
+            )
+        return self.unpack(reply["root"]), reply["record_hash"]
 
     # -- replies ----------------------------------------------------------------
 
-    def _reply(self, tag: bytes) -> bytes:
-        """Read messages until the reply tagged *tag*; keep objects on the way."""
+    def _reply(self) -> bytes:
+        """Read messages until the reply to the request just sent; keep the
+        objects that arrive before it."""
         while True:
             message = protocol.read_message(self._rx)
             if message is None:
@@ -117,7 +136,7 @@ class RemoteStore:
             got, body = message
             if got == protocol.OBJECT:
                 self.receive(body)
-            elif got == tag:
+            elif got == protocol.REPLY:
                 return body
             else:
-                raise protocol.ProtocolError(f"expected {tag!r}, got {got!r}")
+                raise protocol.ProtocolError(f"expected a reply, got {got!r}")

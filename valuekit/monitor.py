@@ -89,14 +89,13 @@ class _State:
         t = e.get("t", 0.0)
         run = self.runs.setdefault(
             source,
-            {"pid": None, "argv": [], "role": "main", "started": t, "last": t},
+            {"pid": None, "argv": [], "started": t, "last": t},
         )
         run["last"] = max(run["last"], t)
 
         if ev == "process":
             run["pid"] = e.get("pid")
             run["argv"] = e.get("argv") or []
-            run["role"] = e["role"]
             run["started"] = t
             return
 
@@ -113,7 +112,7 @@ class _State:
 
         if ev == "batch":
             self.batches[(source, e.get("id"))] = {
-                "fn": e.get("name") or e.get("fn", "?"),
+                "fn": e["fn"],
                 "n": e.get("n", 0),
                 "mode": e["mode"],
                 "done": 0,
@@ -173,21 +172,16 @@ class _State:
         del self.failures[:-_MAX_FAILURES]
 
     def current(self) -> set[str]:
-        """The sources belonging to the newest run: its main process and the
-        workers it spawned.
+        """The sources belonging to the newest run.
 
         Scoping matters for the hit rate.  Aggregated over every run file in
         the directory, one cold first run lowers the rate permanently and
         the number stops meaning anything; what a watcher needs is the run
         in front of them.
         """
-        mains = [r for r in self.runs.values() if r["role"] != "worker"]
+        mains = list(self.runs.values())
         if not mains:
             return set(self.runs)
-        # No grace window: a main process writes its batch record before spawning
-        # anything, so its own file always predates its workers'. Allowing
-        # slack here instead lets the previous run's last records count and
-        # spoil the rate without any sign of it.
         since = max(r["started"] for r in mains)
         return {s for s, r in self.runs.items() if r["started"] >= since}
 
@@ -241,11 +235,9 @@ def _render(
     out: list[str] = []
 
     live = [r for r in state.runs.values() if now - r["last"] < _LIVE_AFTER]
-    mains = [r for r in live if r["role"] != "worker"]
-    workers = len(live) - len(mains)
+    mains = live
     idle = len(state.runs) - len(live)
-    extra = f", {workers} worker{'s' if workers != 1 else ''}" if workers else ""
-    out.append(f"runs: {len(mains)} live{extra}, {idle} finished")
+    out.append(f"runs: {len(mains)} live, {idle} finished")
 
     scope = state.current()
     batch_live = any(
