@@ -148,7 +148,9 @@ that says so.
   machine. A worker on this machine reads and writes values and call
   records in the store directory itself and sends everything else to the
   main process, so there is one event file and one run per main process.
-  The `multiprocessing` worker path, the pickled exceptions and the
+  An event's `t` is the time the main process wrote it, so one file holds
+  one clock's times whichever machine the event came from. The
+  `multiprocessing` worker path, the pickled exceptions and the
   worker-role detection in the event log are gone.
 
 - Each call record is its own file, named by the hash of its content, under

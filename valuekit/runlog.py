@@ -143,13 +143,13 @@ def _begin(root: Path) -> _Run:
 
 def emit(store: Any, labels_hash: str, value_hash: str, keys: dict[str, str]) -> None:
     """Write one logged value to the run's log of *store*."""
-    store.log_line({"labels": labels_hash, "v": value_hash, "k": keys, "t": time.time()})
+    store.log_line({"labels": labels_hash, "v": value_hash, "k": keys})
 
 
 def refer(store: Any, function_hash: str, h: str) -> None:
     """Write a reference to call record *h* of *function_hash* to the run's
     log of *store*: a hit's line, in place of the entries the record holds."""
-    store.log_line({"record": [function_hash, h], "t": time.time()})
+    store.log_line({"record": [function_hash, h]})
 
 
 # ---------------------------------------------------------------------------

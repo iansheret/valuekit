@@ -16,8 +16,9 @@ the cap, records are counted rather than written.  The oldest files
 beyond a count are removed when a new one is opened.
 
 The events.  Every record is a JSON object with ``ev``, the event's name,
-and ``t``, the time it was written; its other fields are these, and
-every field listed is always present.  ``SCHEMA_VERSION`` is the version
+and ``t``, the time it was written to the file by the clock of the process
+that owns the file; its other fields are these, and every field listed is
+always present.  ``SCHEMA_VERSION`` is the version
 of this table.
 
 ``process``
@@ -53,7 +54,9 @@ of this table.
     The file reached its cap; ``dropped`` counts the records not written.
 
 An event a remote worker wrote reaches this log through the main
-process, which adds ``host``, the host's name, to it.
+process, which adds ``host``, the host's name, to it.  Its ``t`` is the
+time it arrived: the file holds one clock's times, so the order of
+``t`` is the order of the records.
 """
 
 from __future__ import annotations
@@ -97,18 +100,19 @@ class _Writer:
             self._disabled = True
             return
         self.write({
-            "ev": "process", "t": time.time(), "v": SCHEMA_VERSION,
+            "ev": "process", "v": SCHEMA_VERSION,
             "pid": os.getpid(), "argv": sys.argv, "cwd": os.getcwd(),
         })
 
     def write(self, record: dict) -> None:
+        """Append *record* with ``t``, the time of this write."""
         if self._disabled:
             return
         if self._bytes >= _MAX_BYTES:
             self._dropped += 1
             return
         try:
-            line = json.dumps(record, default=_unrepresentable) + "\n"
+            line = json.dumps({**record, "t": time.time()}, default=_unrepresentable) + "\n"
             self._fh.write(line)  # type: ignore[union-attr]
             self._fh.flush()  # type: ignore[union-attr]
             self._bytes += len(line)
@@ -148,7 +152,7 @@ def record(store: Any, ev: str, **fields: Any) -> None:
     if store is None:
         return
     try:
-        store.event({"ev": ev, "t": time.time(), **fields})
+        store.event({"ev": ev, **fields})
     except Exception:
         pass
 

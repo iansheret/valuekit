@@ -2542,7 +2542,7 @@ class TestRunLog:
 
         _new_run(monkeypatch, "physics.py")
         outer(1)
-        assert [set(d) - {"t"} for d in _log_lines(cache)] == [{"labels", "v", "k"}] * 2
+        assert [set(d) for d in _log_lines(cache)] == [{"labels", "v", "k"}] * 2
         _new_run(monkeypatch, "physics.py")
         outer(1)  # a hit: one line naming the record, no copy of its entries
         [d] = _log_lines(cache)
