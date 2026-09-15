@@ -73,11 +73,12 @@ class StderrTail:
 
 
 class _Worker:
-    __slots__ = ("proc", "stderr")
+    __slots__ = ("proc", "stderr", "forwarder")
 
     def __init__(self, proc: subprocess.Popen):
         self.proc = proc
         self.stderr = StderrTail(proc)
+        self.forwarder: threading.Thread | None = None  # forwards stdout, then reports the exit
 
 
 # What a process needs from the environment to start and to find its
@@ -157,7 +158,8 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None, local: bool = F
                     env=env,
                 )
                 w = workers[ch] = _Worker(proc)
-                threading.Thread(target=forward_stdout, args=(ch, w), daemon=True).start()
+                w.forwarder = threading.Thread(target=forward_stdout, args=(ch, w), daemon=True)
+                w.forwarder.start()
             elif tag == protocol.DATA:
                 w = workers.get(ch)
                 if w is not None:
@@ -184,6 +186,12 @@ def serve(rx: BinaryIO, tx: BinaryIO, python: str | None = None, local: bool = F
     finally:
         for w in workers.values():
             _kill(w.proc)
+        # Each forwarder sends the killed worker's EXIT and returns.  Wait
+        # for them: a thread still writing to stdout when the interpreter
+        # shuts down makes Python abort.
+        for w in workers.values():
+            if w.forwarder is not None:
+                w.forwarder.join(timeout=5)
 
 
 def _kill(proc: subprocess.Popen) -> None:

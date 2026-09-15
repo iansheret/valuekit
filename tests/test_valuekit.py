@@ -584,7 +584,9 @@ class TestNativeExtensions:
         before = _fp(fn)
         (path.parent / "native.cpp").write_text("int solve(int x) { return x + 1; }\n")
         assert _fp(fn) == before  # an edit alone changes nothing: the build is the code that runs
-        path.write_bytes(b"compiled bytes, version two")
+        path.write_bytes(b"compiled bytes, version two")  # the same size
+        t = path.stat().st_mtime_ns + 1_000_000_000
+        os.utime(path, ns=(t, t))  # a rebuild's mtime moves; a coarse clock may not have
         assert _fp(fn) != before
 
     def test_a_walk_records_the_markers_it_met(self, fake_extension):
