@@ -302,8 +302,8 @@ work starting a second before the host joined. Two things to know when repeating
 **A native extension, on the Mac, through a same-machine host process (2026-09-08).**
 `C:\Users\iansh\trial\ext` is a minimal scikit-build-core project (`fastproj._core`, one
 C function, `editable.rebuild`, `build-dir = "build/{wheel_tag}"`, `cmake` and `ninja`
-from PyPI, non-isolated build; `drive.py` uses `parallel._host_commands` when
-`VALUEKIT_HOSTS` is unset, `hosts-mac.toml` and `hosts-pc.toml` otherwise). Copied to
+from PyPI, non-isolated build; `drive.py --self` replaces `parallel._host_command` so the
+local file's host is a host process on this machine). Copied to
 `/Users/ians/exttrial` and driven there in mode `remote`: the host built its own binary in
 its tree under `cache/source/<project hash>/build/`, the check passed (the worker compares
 function hashes and refuses a difference, so they matched), three inputs ran through the
@@ -406,10 +406,11 @@ machine and set a mode:
 ```python
 import sys
 import valuekit as vk
-from valuekit import parallel, localfile
+from valuekit import bootstrap, parallel, localfile
 
 vk.set_store_dir(cache)
-parallel._host_commands = {"here": [sys.executable]}
+# The local file names a host; run its bootstrap on this machine instead of over ssh.
+parallel._host_command = lambda entry: [sys.executable, "-c", bootstrap.STAGE0]
 vk.run_all(mymodule.work, [1, 2, 3])          # mode defaults to "all"
 ```
 

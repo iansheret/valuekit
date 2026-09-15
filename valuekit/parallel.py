@@ -1,7 +1,8 @@
-"""Parallel batch execution.
+"""Parallel batch execution: the scheduler.
 
 ``run_all(fn, inputs)`` runs ``fn`` over ``inputs`` in parallel and returns
-a :class:`BatchResult` of per-input outcomes, in input order.
+their results in input order, or raises :class:`BatchError` at the first
+input that produces no result.  The user's contract is on :func:`run_all`.
 
 A memoised function (``@pure`` or ``@pure_local``) gets two things an
 undecorated one does not.  An input whose result the cache already holds
@@ -10,54 +11,16 @@ this machine is safe only for a function whose effects do not matter,
 which is what memoisation already assumes, so only a memoised function
 runs on a host.
 
-Each input runs in its own process (spawned per task, up to ``max_workers``
-at once) rather than in a shared worker pool.  Isolation is the point: a
-timeout kills exactly one process, a segfault loses exactly one input, and
-neither affects the inputs running beside it or the number of workers
-available to the rest of the batch.  The cost is one process start per
-input, roughly 0.4 s including a numpy import; this overlaps across
-workers, and is noise for inputs that take seconds or more.  For very
-small inputs, batch them inside ``fn``.
+Each input runs in its own process, started per task by a host process
+(:mod:`valuekit.hostprocess`) on this machine or on a remote host, rather
+than in a shared pool: a timeout kills one process and a segfault loses
+one input.  This module owns the scheduling, which host takes the next
+input, deadlines, requeueing an input whose host dropped, and the order of
+results; :mod:`valuekit.hosts` owns starting and killing a task.
 
-Every input is processed, and every failure is recorded against the input
-that caused it.  There are three kinds, treated alike:
-
-* an exception raised by ``fn``, carrying the string-form traceback
-  captured in the worker;
-* a timeout.  ``timeout=`` limits the seconds each input may spend
-  running; a breach kills that input's process promptly and records a
-  TimeoutError;
-* a process that exits without raising (a segfault or an out-of-memory
-  kill), recorded as a RuntimeError naming the input and the exit code.
-
-``.values`` returns the plain list of results, raising an ExceptionGroup if
-any input failed, so failures cannot be dropped by accident; ``.failures``
-lists ``(input, exception)`` pairs for callers that handle them explicitly.
-
-Nothing is re-run automatically.  To debug one input, call ``fn(x)`` on
-it: the cached prefix is served without executing and the failing step runs
-inline, in this process, with a live stack — and you choose which input to
-debug, rather than whichever one happened to fail first.
-
-One debugger accommodation remains, because breakpoints do not reach
-spawned workers: if a live breakpoint intersects anything reachable by name
-from ``fn``, the whole batch runs sequentially in this process, where
-breakpoints fire and the usual debugger rules apply.  The sequential
-fallback does not enforce the timeout.
-
-This module owns the scheduling -- admission, deadlines, input-order
-reassembly, and attributing each failure to the input that caused it --
-while :mod:`valuekit.hosts` owns starting and killing a task.
-The split is what lets work run somewhere other than this machine without
-the scheduling being written twice.
-
-Workers are configured automatically (each process applies the parent's
-store directory before running) and share the cache: every write is a
-content-named file, so concurrent writers cannot drop each other's
-results.  ``fn`` must be a module-level function (it is sent to workers by
-reference).  Worker processes are daemonic: they are cleaned up if the
-parent exits, and ``fn`` cannot itself start processes (parallelise in this
-main process, not inside it).
+A batch that a live breakpoint reaches runs its inputs one after another
+in this process, where the breakpoint can stop, with no hosts and no
+timeout: a debug run is a different situation from a batch.
 """
 
 from __future__ import annotations
@@ -87,13 +50,13 @@ _POLL = 0.2  # seconds between checks of deadlines and of the mode file
 # the run file already carries the pid, so a counter is identifier enough.
 _batch_seq = 0
 
-# Where work happens is configuration (the local file), never a call-site
-# argument: a host list in code could reach a function hash, and where a call
-# ran must not be able to affect its result.  This private hook replaces
-# the local file's hosts in tests: a name to the command
-# that runs a Python 3 to bootstrap with, or to ``(command, workers)``; a host
-# with no capacity given reports its own.
-_host_commands: dict[str, Any] | None = None
+
+
+def _host_command(entry: localfile.HostEntry) -> list[str]:
+    """The command that starts the bootstrap on the host *entry* names: an
+    ssh session running a Python 3 there.  Tests replace this function with
+    one that runs the bootstrap on this machine."""
+    return ["ssh", "-T", "-o", "BatchMode=yes", entry.ssh, bootstrap.remote_command(entry.python)]
 
 
 class BatchError(Exception):
@@ -206,7 +169,7 @@ class _Hosts:
     """The hosts a batch may run on, and how many tasks each may hold.
 
     This machine is a host through a host process started here.  Remote
-    hosts come from the local file (or the test hook); each syncs on its
+    hosts come from the local file; each syncs on its
     own thread and counts only once it is ready.  The mode is re-read from
     the file every time capacities are asked for, so a switch made while
     the batch runs applies to the next task started; a file that cannot
@@ -250,31 +213,18 @@ class _Hosts:
             # undecorated function has no function hash for a host to check
             # and makes no promise about its effects, so it runs here only.
             return
-        entries = []
-        if _host_commands is not None:
-            entries = [
-                (name, [*(spec[0] if isinstance(spec, tuple) else spec), "-c", bootstrap.STAGE0],
-                 spec[1] if isinstance(spec, tuple) else None, os.path.join(store_dir, "source"))
-                for name, spec in _host_commands.items()
-            ]
-        else:
-            entries = [
-                (h.name, ["ssh", "-T", "-o", "BatchMode=yes", h.ssh, bootstrap.remote_command(h.python)],
-                 h.workers, h.source_root)
-                for h in config.hosts
-            ]
-        if not entries:
+        if not config.hosts:
             return
         # One project for every host: the tree is walked once per batch.
         project = Project(fn, config.project)
         refusal = project.refusal()
         hello = hello_message(fn, project.project_hash, project.roots, "")
-        for name, command, workers, source_root in entries:
+        for h in config.hosts:
             if refusal:
                 connect = _refused(refusal)
             else:
-                connect = _remote_connect(name, command, project, source_root)
-            self.hosts.append(Host(name, connect, hello, store, completions, workers))
+                connect = _remote_connect(h.name, _host_command(h), project, h.source_root)
+            self.hosts.append(Host(h.name, connect, hello, store, completions, h.workers))
 
     def all(self) -> list:
         return [*self.hosts, self.local]

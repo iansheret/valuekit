@@ -10,10 +10,10 @@ objects received", so children become messages.  Content-addressing then
 deduplicates on the protocol for exactly the reason it deduplicates on disk --
 an array shared by fifty values is transferred once.
 
-There is no pickle here, which matters more once a peer is involved than it
-ever did on disk: the decode side reaches only a fixed set of types,
-registered codecs, and dataclasses whose class the receiving process has
-already imported.  Bytes from elsewhere can describe data, never code.
+There is no pickle here: the decode side reaches only a fixed set of
+types, registered codecs, and dataclasses whose class the receiving
+process has already imported, so bytes from another process describe
+data and cannot name code.
 
 ndarrays are the one thing this module does not handle.  Their
 representation is ``np.save`` rather than a tag-and-hash structure, so each

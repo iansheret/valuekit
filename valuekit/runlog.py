@@ -11,19 +11,12 @@ code that will read it.  Retrieval selects by containment::
         logged.labels, logged.value
 
 A *run* is one main process running a script, named by the script's
-file stem.  Its log is the complete set of logged values that run
-produced, as if the code had run from scratch: a step that executes
-writes each logged value as it makes it, and a step served from cache
-writes one line naming its call record, which holds what the step
-logged, nested calls included.  A new run under the same name replaces
-the last, so the log never carries a value from an earlier run of the
-script, and the main script and a debugging script never touch each
-other's.  Every emission is its own logged value: the same labels and
-value logged twice are two.
-
-The log is as current as the cache: ``clear_cache()`` deletes the logs
-with everything else.  A reference whose call record was deleted by
-other means reads as stale, and ``logs()`` says so.
+file stem; it begins when the store is configured and replaces the
+previous run of the same name.  A step that executes writes each logged
+value as it makes it; a step served from cache writes one line naming
+its call record, and the reader takes the logged values from the record,
+nested calls included.  A reference whose call record has been deleted
+reads as stale, and ``logs()`` says so.
 
 Layout, under the store directory::
 

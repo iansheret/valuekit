@@ -1027,7 +1027,7 @@ class TestPlainDataHashing:
 
         n = Node()
         n.child = n
-        with pytest.raises(TypeError, match="contains itself"):
+        with pytest.raises(RecursionError):  # as a list containing itself does
             content_hash(n)
 
     @pytest.mark.parametrize(
@@ -2863,14 +2863,34 @@ def _lay_project(root):
 
 
 def _local_file(tmp_path, text):
-    """Write the test project's valuekit.local.toml (the project is
-    tmp_path/proj, which _write_batch_module and _project create)."""
+    """Add *text* to the test project's valuekit.local.toml (the project is
+    tmp_path/proj, which _write_batch_module and _project create).  Lines
+    that are not a table go before the first table, so a later top-level
+    key is not read as a table's."""
     from valuekit.localfile import LOCAL_FILE
 
     root = tmp_path / "proj"
     root.mkdir(parents=True, exist_ok=True)
     p = root / LOCAL_FILE
-    p.write_text((p.read_text() if p.exists() else "") + text)
+    existing = p.read_text() if p.exists() else ""
+    if text.lstrip().startswith("["):
+        p.write_text(existing + text)
+        return
+    head, sep, tables = existing.partition("[")
+    p.write_text(head + text + sep + tables)
+
+
+def _use_hosts(tmp_path, monkeypatch, cache, **workers):
+    """Name remote hosts in the test project's local file, each reached as
+    a host process on this machine through the real bootstrap.  *workers*
+    maps a host's name to its worker count, or None for what it reports."""
+    monkeypatch.setattr(parallel, "_host_command", lambda entry: [sys.executable, "-c", bootstrap.STAGE0])
+    text = ""
+    for name, n in workers.items():
+        text += f"[hosts.{name}]\nssh = '{name}'\npython = 'python3'\nsource_root = '{cache / 'source'}'\n"
+        if n is not None:
+            text += f"workers = {n}\n"
+    _local_file(tmp_path, text)
 
 
 def _write_batch_module(tmp_path):
@@ -3229,9 +3249,7 @@ class TestScheduling:
     def test_mode_all_fills_remote_hosts_first(self, cache, tmp_path, monkeypatch):
         from valuekit import localfile
 
-        monkeypatch.setattr(
-            parallel, "_host_commands", {"h1": (_HOST_CMD, 1), "h2": (_HOST_CMD, 1)}
-        )
+        _use_hosts(tmp_path, monkeypatch, cache, h1=1, h2=1)
         self._local_workers(tmp_path, monkeypatch, 2)
         localfile.write_mode(tmp_path / "proj", "all")
         m, _ = _write_batch_module(tmp_path)
@@ -3248,7 +3266,7 @@ class TestScheduling:
     def test_mode_remote_keeps_local_idle(self, cache, tmp_path, monkeypatch):
         from valuekit import localfile
 
-        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
+        _use_hosts(tmp_path, monkeypatch, cache, h1=2)
         localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
         assert vk.run_all(m.process, [1, 2, 4, 5]) == [11, 21, 41, 51]
@@ -3260,7 +3278,6 @@ class TestScheduling:
         from valuekit.parallel import _Hosts
 
         self._local_workers(tmp_path, monkeypatch, 1)
-        monkeypatch.setattr(parallel, "_host_commands", {})
         m, _ = _write_batch_module(tmp_path)
         store = sys.modules["valuekit.pure"]._current_store()
         assert _Hosts(m.process, str(cache), store, 1).capacities("all") == {"local": 1}
@@ -3270,7 +3287,7 @@ class TestScheduling:
     def test_no_store_means_no_remote_hosts(self, cache, tmp_path, monkeypatch):
         from valuekit.parallel import _Hosts
 
-        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
+        _use_hosts(tmp_path, monkeypatch, cache, h1=2)
         m, _ = _write_batch_module(tmp_path)
         assert _Hosts(m.process, None, None, 1).hosts == []
         assert [h.name for h in _Hosts(m.process, str(cache), None, 1).hosts] == ["h1"]
@@ -3279,7 +3296,6 @@ class TestScheduling:
         from valuekit import localfile
         from valuekit.parallel import _Hosts
 
-        monkeypatch.setattr(parallel, "_host_commands", {})
         localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
         hosts = _Hosts(m.process, str(cache), None, 1)
@@ -3291,7 +3307,7 @@ class TestScheduling:
         assert hosts.mode() == "local"
 
     def test_an_undecorated_function_runs_here_uncached_and_unrecorded(self, cache, tmp_path, monkeypatch):
-        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
+        _use_hosts(tmp_path, monkeypatch, cache, h1=2)
         _local_file(tmp_path, 'mode = "remote"\n')
         m, counts = _write_batch_module(tmp_path)
         assert vk.run_all(m.plain, [1, 2], max_workers=2) == [3, 6]
@@ -3305,7 +3321,6 @@ class TestScheduling:
         assert ei.value.input == 3 and ei.value.failure.type == "ValueError"
 
     def test_no_capacity_anywhere_runs_in_this_process(self, cache, tmp_path, monkeypatch):
-        monkeypatch.setattr(parallel, "_host_commands", {})
         m, _ = _write_batch_module(tmp_path)
         assert vk.run_all(m.process, [1, 2], max_workers=0) == [11, 21]
         assert {e["host"] for _, e in _records(cache, "start")} == {"main"}
@@ -3317,7 +3332,6 @@ class TestScheduling:
     def test_remote_mode_with_no_host_runs_locally_and_says_so(self, cache, tmp_path, monkeypatch):
         from valuekit import localfile
 
-        monkeypatch.setattr(parallel, "_host_commands", {})
         localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
         assert vk.run_all(m.process, [1]) == [11]
@@ -3329,7 +3343,7 @@ class TestScheduling:
 
         from valuekit import localfile
 
-        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
+        _use_hosts(tmp_path, monkeypatch, cache, h1=2)
         self._local_workers(tmp_path, monkeypatch, 1)
         localfile.write_mode(tmp_path / "proj", "local")
         m, _ = _write_batch_module(tmp_path)
@@ -3347,7 +3361,7 @@ class TestScheduling:
         from valuekit import hosts as machines_mod
         from valuekit import localfile
 
-        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 2)})
+        _use_hosts(tmp_path, monkeypatch, cache, h1=2)
         localfile.write_mode(tmp_path / "proj", "remote")
         real_sync = machines_mod.Host.sync
 
@@ -3377,7 +3391,7 @@ class TestScheduling:
         from valuekit import hosts as machines_mod
         from valuekit import localfile
 
-        monkeypatch.setattr(parallel, "_host_commands", {"h1": (_HOST_CMD, 1), "h2": (_HOST_CMD, 1)})
+        _use_hosts(tmp_path, monkeypatch, cache, h1=1, h2=1)
         self._local_workers(tmp_path, monkeypatch, 0)
         localfile.write_mode(tmp_path / "proj", "remote")
         m, _ = _write_batch_module(tmp_path)
@@ -3833,7 +3847,6 @@ class TestWorkerHandshake:
         assert "malformed HELLO message: KeyError('qualname')" in _handshake(body)
 
 
-_HOST_CMD = [sys.executable]  # a Python 3 to bootstrap with, as a host entry names one
 
 
 def _remote_host(fn, cache, name="h1", completions=None):
@@ -3861,7 +3874,7 @@ class TestRemoteHost:
         from valuekit import localfile
 
         _locked_files()
-        monkeypatch.setattr(parallel, "_host_commands", {"h1": _HOST_CMD})
+        _use_hosts(tmp_path, monkeypatch, cache, h1=None)
         _local_file(tmp_path, 'mode = "remote"\n')
 
     def test_results_come_back_in_input_order(self, cache, tmp_path):
@@ -4382,7 +4395,7 @@ class TestSourceTree:
         from valuekit import localfile
 
         _locked_files()
-        monkeypatch.setattr(parallel, "_host_commands", {"h1": _HOST_CMD})
+        _use_hosts(tmp_path, monkeypatch, cache, h1=None)
         _local_file(tmp_path, 'mode = "remote"\n')
         yield
         for name in [k for k in sys.modules if k.startswith("vk_sync_mod")]:

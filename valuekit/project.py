@@ -7,13 +7,12 @@ its project as a *manifest*, the worker unpacks a copy of it -- a *source
 tree* -- and imports from that rather than from whatever happens to be on
 its own disk.
 
-What gets sent is the user-code partition and nothing else, the same
-boundary :func:`valuekit.functionhash._classify` already draws: the project's own
-files, never libraries.  A dependency is the environment's job on both
-machines, exactly as numpy is -- and shipping a locally built extension would
-be worse than useless anyway, since it is the wrong architecture as often as
-not.  Compiled artefacts are therefore excluded outright rather than by
-relying on the project's ignore rules.
+What gets sent is the project's own files and nothing else, the boundary
+:func:`valuekit.functionhash._classify` draws.  Dependencies are installed
+on the host from the project's lock file, and the project is built there:
+a binary built here is for this machine's architecture, so compiled
+artefacts are excluded outright rather than by relying on the project's
+ignore rules.
 
 A host keeps one source tree per project, updated in place from the
 manifest's difference, so a build directory there persists across edits;
@@ -57,7 +56,6 @@ __all__ = [
     "distribution_name",
     "manifest",
     "manifest_hash",
-    "project_hash",
     "find_root",
     "project_root",
     "pack_tree",
@@ -213,17 +211,6 @@ def _store_dirs() -> list[str]:
 
     store = _current_store()
     return [str(store.root)] if isinstance(store, LocalStore) else []
-
-
-def project_hash(root: str) -> str:
-    """The hash of the project at *root*: its manifest hash, right now.
-
-    Not memoised across calls: the manifest is what says whether the tree
-    changed, so a stored result is the one thing it must not be.  A
-    caller that needs it repeatedly within one operation keeps it for that
-    operation (the walk does).
-    """
-    return manifest_hash(manifest(root, exclude=_store_dirs()))
 
 
 class Project:

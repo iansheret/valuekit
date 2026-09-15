@@ -113,23 +113,12 @@ def _dist_version(top: str) -> str | None:
 # native extensions
 # ---------------------------------------------------------------------------
 #
-# A compiled extension has no source to walk and no code object to hash.
-# Where its version is a sufficient marker -- a distribution installed from a
-# released artefact changes only through a reinstall, which moves the
-# version -- the version is its marker.  One built from a local directory,
-# editable or not, is rebuilt in place under the same version, so its
-# marker is the hash of its binary: the code that actually runs, which
-# changes exactly when the build did.  Read once per build, memoised on the
-# file's size and modification time.
-#
-# A worker never hashes its own binary, which is built on another machine
-# and may differ byte for byte.  The main process sends every marker it has
-# computed, one per extension module, and a worker substitutes them wherever
-# its own walk meets those modules.  Results the worker computes are
-# therefore keyed by the main process's build; the sync guarantees the
-# worker's binary was built from the same sources.  An extension the main
-# process never hashed has no marker on the worker, so the hashes differ and
-# the worker is refused rather than accepted.
+# A compiled extension has no source to walk.  From a released
+# distribution, its version is its marker (see _dist_dir); built from a
+# local directory, its binary's hash is (see _binary_hash).  A worker on
+# another machine has a different binary and never hashes it: the main
+# process sends every marker it has computed, and the worker substitutes
+# them for the modules it meets (see _extension_hash).
 
 _markers_here: dict[str, str] | None = None  # set on a worker; None on the main process
 _binary_hashes: dict[str, tuple[tuple[int, int], str]] = {}  # path -> ((size, mtime_ns), hash)

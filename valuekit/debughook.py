@@ -16,8 +16,7 @@ never skips a breakpoint.  An unknown trace function that is not a debugger
 (coverage, profilers) never forces execution, so caching works normally
 under those tools.
 
-Overrides: every @pure function exposes ``.uncached`` (the raw function),
-and ``VALUEKIT_ALWAYS_RUN=1`` forces execution globally.
+``VALUEKIT_ALWAYS_RUN=1`` forces execution everywhere.
 """
 
 from __future__ import annotations

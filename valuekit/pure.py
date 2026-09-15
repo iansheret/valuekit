@@ -1,48 +1,24 @@
-"""The @pure decorator.
+"""The @pure decorator: memoisation by function hash and traced reads.
 
-``@pure`` asserts that a function is pure: its output depends only on what
-it reads from its inputs, and it has no observable effects.  Pure functions
-can be memoised, so valuekit memoises them.
+A call of a memoised function is looked up by its function hash (see
+:mod:`valuekit.functionhash`) and its arguments.  An :class:`~valuekit.ImmutableMap`
+argument is wrapped on a miss in a recording proxy, so the call record
+holds the keys the function read and their values; every other argument is
+hashed whole.  On a lookup the stored call records for the function hash
+are matched against the arguments, and the one that holds gives the result
+without executing.
 
-Arguments are hashed, not converted: a dict stays a dict, a list stays a
-list, an array keeps its writeability.  A cache hit returns a value equal to
-what the call would have produced, of the same type — including on the miss
-that recorded it, where the function's own object is returned.
-
-Fine-grained invalidation is opt-in, and the opt-in is passing an
-:class:`~valuekit.ImmutableMap`.  Such an argument is wrapped on a miss in a
-recording proxy (itself an ImmutableMap, so the function cannot tell); the
-function runs; the observed reads, plus whole-value content hashes of every
-other argument, become a *call record*, stored alongside the content hash of the
-return value.
-
-On a lookup, the stored call records for the function's function hash are scanned.
-If every recorded fact still holds against the current arguments (same
-values at the read paths, same absences, same whole-map hashes where the
-function observed everything), the stored result is returned without
-executing.  Keys the function never read are irrelevant, so unrelated
-additions to a data or config map do not invalidate — whereas a plain dict
-argument is depended on whole, since nothing observed how it was used.
-
-A call record also records what happened inside the call: every memoised
-call it made (function name, function hash and record hash, in completion
-order) and every :func:`log` call (labels and value, by hash).  A hit
-writes one line to the run's log naming the record, and
+A call record holds the reads, the result's hash, the memoised calls made
+inside the call (name, function hash and record hash, in completion
+order), and the values logged inside it (labels and value, by hash).  A
+hit writes one line to the run's log naming the record;
 :mod:`valuekit.runlog` reads the logged values out of the record, nested
 calls included.
 
-``@pure_local`` is memoised identically but promises less about the code
-and more about the world: the result may depend on this machine's
-environment (credentials, local files, a network the function can reach),
-which the user promises does not change.  It runs only on the machine the
-user configured, never on a remote worker.
-
-Note that the function body does not run on a hit: prints, plots, and any
-other side effect inside a @pure function are skipped.
-
-With no store directory configured, @pure is a plain call.  For debugging
-see :mod:`valuekit.debughook`: a breakpoint anywhere in the function's
-reachable set forces execution, without writing.
+The user's contract is on :func:`pure` and :func:`pure_local`.  With no
+store directory configured a memoised function is a plain call.  A
+breakpoint anywhere in the function's reachable set forces execution
+without a call record (see :mod:`valuekit.debughook`).
 """
 
 from __future__ import annotations
@@ -76,8 +52,7 @@ _store: CacheStore | None = None
 
 
 def _current_store() -> "CacheStore | None":
-    """Internal: the configured store, late-bound (used by valuekit.parallel;
-    the name ``pure`` in the package namespace shadows this module)."""
+    """The configured store, or None."""
     return _store
 
 
@@ -234,7 +209,7 @@ class _Frame:
 
 # The innermost executing call.  A contextvar rather than a global:
 # each thread sees its own, and the token reset in ``finally`` restores the
-# enclosing frame on any exit.  A spawned worker starts at None, which is
+# enclosing frame on any exit.  A worker starts at None, which is
 # right: its root call has no enclosing call in that process.
 _ctx: ContextVar[_Frame | None] = ContextVar("valuekit_call", default=None)
 
@@ -381,12 +356,10 @@ def pure(fn: Callable):
     argument is depended on whole.
 
     Takes no options. If a dependency is not reachable by name, pass it as
-    an argument; if something invisible changed anyway, call
-    ``clear_cache(fn)``.
+    an argument; if something invisible changed anyway, edit the function,
+    which gives it a new function hash.
 
-    The wrapper has ``cached(*args)``, which returns the stored result or
-    raises :class:`CacheMiss` without ever executing, and ``uncached``, the
-    raw function.
+    The wrapper has ``uncached``, the raw function.
     """
     return _pure(fn, local=False)
 

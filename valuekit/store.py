@@ -69,7 +69,7 @@ __all__ = [
     "record_hash",
 ]
 
-FORMAT_VERSION = 8
+FORMAT_VERSION = 9
 
 
 class CacheMiss(Exception):

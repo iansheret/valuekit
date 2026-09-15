@@ -1,33 +1,19 @@
-"""The event log: a live record of what a pipeline is doing.
+"""The event log: what a run did, for another process to watch.
 
-The cache's whole promise is that it can stay on, but nothing about it is
-visible from outside: a step that should be hitting and silently is not
-looks exactly like one that is.  This module writes what happened -- hits,
-misses, forced runs, batch outcomes -- so that another process can watch a
-run in progress.  See :mod:`valuekit.monitor` for the reader.
+This module writes hits, misses, forced runs, batch starts and outcomes,
+and host states as they happen, so that :mod:`valuekit.monitor` can show a
+run in progress.  A step that should hit and does not is otherwise
+indistinguishable from a slow one.
 
-Records go in the configured store directory, under ``events/``.  That is the
-whole configuration: the store directory is where valuekit writes, and
-nothing is written until one is named, so importing valuekit still has no
-effect on its own.  A batch run with no store directory is therefore
-unobservable, which is the price of not inventing a second location.
+Records go under ``events/`` in the store directory, one file per main
+process, ``events/<start>-<pid>.jsonl``; a worker's records reach the main
+process's file.  With no store directory nothing is written.
 
-One file per process, ``events/<start>-<pid>.jsonl``, never appended to by
-two processes: concurrent appends to a shared file are exactly what does
-not work on Windows.  A spawned worker derives its own path from the store
-directory it is already given, so there is nothing extra to pass it.
-
-The event log is a diagnostic, never a dependency.  Every failure here is
-swallowed: an unwritable directory, a full disk or a serialisation problem
-disables the log for the process and changes nothing else.  Writes are
-buffered and flushed on an interval rather than per record, so a cache hit
-does not cost a syscall; a reader may therefore be a fraction of a second
-behind, which is the right trade.
-
-The file is capped.  A pipeline doing millions of hits stops appending
-detail once it reaches the cap and counts how many records it dropped,
-rather than filling the disk.  Old event files are pruned when a new one is
-opened.
+The event log is a diagnostic: every failure here is swallowed, and an
+unwritable directory, a full disk or a serialisation problem disables the
+log for the process and changes nothing else.  The file is capped: past
+the cap, records are counted rather than written.  The oldest files
+beyond a count are removed when a new one is opened.
 
 The events.  Every record is a JSON object with ``ev``, the event's name,
 and ``t``, the time it was written; its other fields are these, and
@@ -85,7 +71,6 @@ SCHEMA_VERSION = 1
 
 _MAX_BYTES = 32 << 20  # per event file; then detail stops and drops are counted
 _MAX_FILES = 50  # event files retained in a directory
-_MAX_AGE = 7 * 24 * 3600  # seconds
 
 
 class _Writer:
@@ -177,24 +162,11 @@ def _unrepresentable(obj: Any) -> str:
 
 
 def prune(directory: Path) -> None:
-    """Drop event files that are old or surplus. Best effort."""
+    """Drop the oldest event files beyond the count kept. Best effort."""
     try:
-        files = sorted(
-            (p for p in directory.glob("*.jsonl")),
-            key=lambda p: p.stat().st_mtime,
-        )
+        keep = sorted(directory.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
     except OSError:
         return
-    now = time.time()
-    keep: list[Path] = []
-    for p in files:
-        try:
-            if now - p.stat().st_mtime > _MAX_AGE:
-                p.unlink(missing_ok=True)
-            else:
-                keep.append(p)
-        except OSError:
-            pass
     for p in keep[: max(0, len(keep) - _MAX_FILES + 1)]:
         try:
             p.unlink(missing_ok=True)

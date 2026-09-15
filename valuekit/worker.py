@@ -7,13 +7,12 @@ got, and exits; every later process then runs exactly one input against
 that same tree and exits, which is what keeps the isolation `run_all`
 already promises -- a segfault or a timeout costs one input and nothing else.
 
-The check is a separate process for three reasons.  It is the moment a
+The check is a separate process for two reasons.  It is the moment a
 host becomes usable, which the modes need: under ``remote`` this machine
 waits for it, and until then the host has no capacity, so no input waits
-on it.  A missing dependency, a build error or a function that will not
-import is a fact about the *host*, reported once, rather than against
-whichever input
-happened to go there first.
+on it.  And a missing dependency, a build error or a function that will
+not import is a fact about the *host*, reported once, rather than against
+whichever input happened to go there first.
 
     main   -> HELLO   json: python, module, qualname, function_hash, project_hash,
                       extensions, roots

@@ -16,12 +16,10 @@ waiting on two kinds of thing, and a blocking read on a thread is the one
 primitive every platform gives a pipe, which is why there is no ``select``
 here.
 
-A handle has one method, ``finished()``: nothing yet, or a
-:class:`Finished` saying what happened -- a result, an exception, a worker
-that exited without a result, or a connection that closed with the input
-neither done nor failed.  A worker reports a result as the root hash of
-its value, or a failure as the exception's type name, message and
-traceback text; the handle turns that into the ``Finished``.
+A handle's ``finished()`` is None until the task is over, then a
+:class:`Finished`: a value, a failure (an exception's type name, message
+and traceback text; a worker that exited without a result), or a
+connection that closed with the input neither done nor failed.
 
 A :class:`Host` holds one connection to a *host process*
 (:mod:`valuekit.hostprocess`), on this machine or over ssh, which starts a
@@ -127,23 +125,20 @@ class _ChannelWriter:
 
 
 class _Handle:
-    """One worker on a channel, and the framed conversation with it.
+    """One worker on a channel: its messages, parsed as bytes arrive, and
+    the replies to its requests.
 
-    Frames are parsed out of a buffer as bytes arrive.  A worker sends
-    several times before it finishes -- a HELLO message, store traffic, then the
-    result's objects -- so "bytes arrived" does not mean "the result is
-    here", and reading until it is would sit inside a task that has already
-    blown its deadline.
-
-    Lookups are served on the scheduler's thread; a ``@pure_local`` call
-    runs on a pool thread, since it may be a download, and replies when it
-    is done.  ``seen`` names every object either side has sent, so nothing
-    crosses twice.
+    Parsing is incremental because a worker sends many messages before its
+    result, and the scheduler must be able to kill a task at its deadline
+    rather than read until the result.  Store requests are served on the
+    scheduler's thread; a ``@pure_local`` call runs on a pool thread, since
+    it may be a download.  ``seen`` names every object either side has
+    sent, so nothing crosses twice.
     """
 
     __slots__ = (
         "ch", "objects", "seen", "completions", "out", "_host", "_failure",
-        "_buf", "_result", "_eof", "_exit", "_stderr", "_lock",
+        "_buf", "_result", "_eof", "_exit", "_stderr",
     )
 
     def __init__(self, host: Host, ch: int, completions: queue.Queue):
@@ -159,7 +154,6 @@ class _Handle:
         self._eof = False
         self._exit: int | None = None
         self._stderr = b""
-        self._lock = threading.Lock()  # the channel is written from two threads
 
     # -- what arrives ---------------------------------------------------------
 
@@ -237,8 +231,7 @@ class _Handle:
     def _write_message(self, tag: bytes, body: bytes = b"") -> None:
         from . import protocol
 
-        with self._lock:
-            protocol.write_message(self.out, tag, body)
+        protocol.write_message(self.out, tag, body)
 
     def _store(self):
         return self._host._store
@@ -266,9 +259,8 @@ class _Handle:
             except CacheMiss as e:
                 self._write_message(protocol.REPLY, json.dumps({"reason": str(e)}).encode())
             else:
-                with self._lock:
-                    protocol.send_value(self.out, v, self.seen)
-                    protocol.write_message(self.out, protocol.REPLY, b"{}")
+                protocol.send_value(self.out, v, self.seen)
+                protocol.write_message(self.out, protocol.REPLY, b"{}")
         elif tag == protocol.EVENT:
             record = json.loads(body)
             record.setdefault("host", self._host.name)
@@ -297,10 +289,9 @@ class _Handle:
             failed = {"type": type(e).__name__, "message": str(e), "traceback": traceback.format_exc()}
             self._write_message(protocol.REPLY, json.dumps({"failed": failed}).encode())
             return
-        with self._lock:
-            root = protocol.send_value(self.out, value, self.seen)
-            reply = json.dumps({"root": root, "record_hash": h}).encode()
-            protocol.write_message(self.out, protocol.REPLY, reply)
+        root = protocol.send_value(self.out, value, self.seen)
+        reply = json.dumps({"root": root, "record_hash": h}).encode()
+        protocol.write_message(self.out, protocol.REPLY, reply)
 
     # -- the scheduler's view --------------------------------------------------
 
@@ -633,19 +624,18 @@ class Host:
 
         handle = self._open(b"task", self._completions)
         try:
-            with handle._lock:
-                protocol.write_message(handle.out, protocol.HELLO, self._hello)
-                # A worker never sends back an object it received, so a
-                # value it builds from its input (a result, a logged value's
-                # labels) refers to the input's objects: they are kept for
-                # this task and written to the store with everything else.
-                sent: dict[str, bytes] = {}
-                root = protocol.send_value(handle.out, x, handle.seen, sent)
-                handle.objects.update(sent)
-                if self._store is not None:
-                    for h, payload in sent.items():
-                        protocol.store_object(self._store, bytes.fromhex(h) + payload)
-                protocol.write_message(handle.out, protocol.TASK, bytes.fromhex(root))
+            protocol.write_message(handle.out, protocol.HELLO, self._hello)
+            # A worker never sends back an object it received, so a
+            # value it builds from its input (a result, a logged value's
+            # labels) refers to the input's objects: they are kept for
+            # this task and written to the store with everything else.
+            sent: dict[str, bytes] = {}
+            root = protocol.send_value(handle.out, x, handle.seen, sent)
+            handle.objects.update(sent)
+            if self._store is not None:
+                for h, payload in sent.items():
+                    protocol.store_object(self._store, bytes.fromhex(h) + payload)
+            protocol.write_message(handle.out, protocol.TASK, bytes.fromhex(root))
         except SerializationError as e:
             # A value the protocol cannot carry is the caller's problem, not a
             # worker failure: say so against this input rather than letting

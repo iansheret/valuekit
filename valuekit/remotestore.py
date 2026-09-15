@@ -94,12 +94,11 @@ class RemoteStore:
         protocol.write_message(self._tx, protocol.RECORD, body)
         return record_hash(record)
 
-    # -- the main process's side of the run log ------------------------------------
+    # -- the event log and the run's log, written by the main process -------------
 
     def event(self, record: dict) -> None:
         protocol.write_message(self._tx, protocol.EVENT, json.dumps(record).encode())
 
-    # -- the main process's side of the run's log ------------------------------------
 
     def log_line(self, line: dict) -> None:
         protocol.write_message(self._tx, protocol.LOGGED, json.dumps(line).encode())
