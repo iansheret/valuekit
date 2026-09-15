@@ -552,7 +552,13 @@ def fake_extension(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "_fake_ext", mod)
     monkeypatch.setattr(_NativeCallable, "__module__", "_fake_ext")
     monkeypatch.setattr(functionhash, "_markers_here", None)
+    monkeypatch.setattr(functionhash, "_binary_hashes", {})
     return mod, path
+
+
+def _next_process():
+    """What a new process has: no binary hashed yet."""
+    functionhash._binary_hashes.clear()
 
 
 def _using_global(name, obj):
@@ -578,16 +584,26 @@ class TestNativeExtensions:
 
     def test_a_rebuild_invalidates_its_callers(self, fake_extension):
         # The case this exists for: a @pure function calls into C++, the C++
-        # is edited and rebuilt, and the result must not be served from cache.
+        # is edited and rebuilt, and the next process must not serve the
+        # result from cache.
         mod, path = fake_extension
         fn = _using_global("solve", _NativeCallable())
         before = _fp(fn)
         (path.parent / "native.cpp").write_text("int solve(int x) { return x + 1; }\n")
+        _next_process()
         assert _fp(fn) == before  # an edit alone changes nothing: the build is the code that runs
         path.write_bytes(b"compiled bytes, version two")  # the same size
-        t = path.stat().st_mtime_ns + 1_000_000_000
-        os.utime(path, ns=(t, t))  # a rebuild's mtime moves; a coarse clock may not have
+        _next_process()
         assert _fp(fn) != before
+
+    def test_the_binary_a_process_loaded_is_the_one_hashed(self, fake_extension):
+        # An extension module cannot be reloaded: a binary rebuilt while
+        # the process runs is not the code it runs, so its hash stays.
+        mod, path = fake_extension
+        fn = _using_global("solve", _NativeCallable())
+        before = _fp(fn)
+        path.write_bytes(b"compiled bytes, version two")
+        assert _fp(fn) == before
 
     def test_a_walk_records_the_markers_it_met(self, fake_extension):
         mod, path = fake_extension
@@ -595,7 +611,7 @@ class TestNativeExtensions:
         reachable_set(fn)
         assert functionhash.extension_markers()["_fake_ext"] == project._file_hash(str(path))
 
-    def test_the_binary_is_read_once_per_build(self, fake_extension, monkeypatch):
+    def test_the_binary_is_read_once_per_process(self, fake_extension, monkeypatch):
         mod, path = fake_extension
         calls = []
         real = project._file_hash
@@ -605,11 +621,6 @@ class TestNativeExtensions:
         _fp(ns["f"])
         _fp(ns["f"])
         assert len(calls) == 1
-        path.write_bytes(b"compiled bytes, version two")  # the same size
-        t = path.stat().st_mtime_ns + 1_000_000_000
-        os.utime(path, ns=(t, t))  # a rebuild's mtime moves; a coarse clock may not have
-        _fp(ns["f"])
-        assert len(calls) == 2
 
     def test_a_worker_takes_the_markers_from_hello(self, fake_extension, tmp_path, monkeypatch):
         # On a worker an extension's marker is what the main process sent;
@@ -681,8 +692,7 @@ class TestNativeExtensions:
         # itself rather than to anything it defines.
         before = _fp(fn)
         path.write_bytes(b"compiled bytes, version two")  # the same size
-        t = path.stat().st_mtime_ns + 1_000_000_000
-        os.utime(path, ns=(t, t))  # a rebuild's mtime moves; a coarse clock may not have
+        _next_process()
         assert _fp(fn) != before
 
     def test_an_extension_with_no_project_is_its_binary(self, tmp_path):
@@ -691,6 +701,7 @@ class TestNativeExtensions:
         before = _classify("_intree", str(path))[1]
         assert before.startswith("ext:_intree=")
         path.write_bytes(b"compiled bytes, version two -- rebuilt")
+        _next_process()
         assert _classify("_intree", str(path))[1] != before
 
     def test_a_missing_binary_is_not_an_error(self, fake_extension):
@@ -826,8 +837,6 @@ class TestStore:
         assert s.get_records("k") == [(h, t)]
 
     def test_listing_sees_another_stores_write(self, tmp_path):
-        # The listing is cached per store on the directory's mtime, which
-        # any process's write moves.
         a = LocalStore(tmp_path)
         b = LocalStore(tmp_path)
         t1 = {"fn": "f", "deps": {}, "result": "0" * 40}

@@ -55,6 +55,14 @@ that says so.
 
 ### Changed
 
+- Nothing depends on a file's modification time any more. The store lists
+  a function's call-record directory on every lookup instead of caching
+  the listing on the directory's mtime, so a record another process wrote
+  within the same clock tick is seen at once. A native extension's binary
+  is hashed once per process, as the binary the process loaded, instead
+  of being re-read when its size or mtime changed: an extension module
+  cannot be reloaded, so a rebuild is seen by the next process.
+
 - `set_cache_dir` is `set_store_dir`, and `cache_dir=` on `logs()` is
   `store_dir=`. The directory holds everything the project's code
   produced: values, call records and run logs.

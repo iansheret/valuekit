@@ -121,7 +121,7 @@ def _dist_version(top: str) -> str | None:
 # them for the modules it meets (see _extension_hash).
 
 _markers_here: dict[str, str] | None = None  # set on a worker; None on the main process
-_binary_hashes: dict[str, tuple[tuple[int, int], str]] = {}  # path -> ((size, mtime_ns), hash)
+_binary_hashes: dict[str, str] = {}  # path -> hash of the binary this process loaded
 _markers: dict[str, str] = {}  # extension module name -> its marker, every one hashed here
 
 
@@ -167,20 +167,19 @@ def _is_live_extension(filename: str, top: str) -> bool:
 
 
 def _binary_hash(filename: str) -> str:
-    """The content hash of the file at *filename*, memoised on its size and
-    modification time so a build is read once."""
+    """The content hash of the binary at *filename*, read once per process.
+
+    An extension module cannot be reloaded, so the binary this process
+    runs is the one it first loaded, whatever the file holds now.  A
+    rebuilt binary is seen by the next process.
+    """
     from . import project
 
-    try:
-        st = os.stat(filename)
-        key = (st.st_size, st.st_mtime_ns)
-    except OSError:
-        return "?"
-    cached = _binary_hashes.get(filename)
-    if cached is not None and cached[0] == key:
-        return cached[1]
-    h = project._file_hash(filename) or "?"
-    _binary_hashes[filename] = (key, h)
+    h = _binary_hashes.get(filename)
+    if h is None:
+        h = project._file_hash(filename) or "?"
+        if h != "?":
+            _binary_hashes[filename] = h
     return h
 
 

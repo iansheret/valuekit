@@ -430,9 +430,9 @@ def _extract(data: bytes, dest: str) -> str:
         else:
             tar.extractall(dest)  # every member was just checked
         # The tar carries no times.  A file written over an older tree must
-        # read as newer than any build made from the old one, or a build
-        # backend that rebuilds on import finds nothing to do and the worker
-        # runs the old binary on the new source.
+        # read as newer than any build made from the old one: a build system
+        # such as CMake rebuilds a target when a source is newer than its
+        # output, and would otherwise reuse the old output.
         now = time.time()
         for m in tar.getmembers():
             try:

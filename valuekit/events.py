@@ -166,9 +166,10 @@ def _unrepresentable(obj: Any) -> str:
 
 
 def prune(directory: Path) -> None:
-    """Drop the oldest event files beyond the count kept. Best effort."""
+    """Drop the oldest event files beyond the count kept. Best effort.
+    A file's name starts with its creation time, so name order is age order."""
     try:
-        keep = sorted(directory.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+        keep = sorted(directory.glob("*.jsonl"), key=lambda p: p.name)
     except OSError:
         return
     for p in keep[: max(0, len(keep) - _MAX_FILES + 1)]:

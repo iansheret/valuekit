@@ -162,22 +162,6 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
-class _Listing:
-    """What one function's call-record directory held when last read.
-
-    ``entries`` is the ``(hash, record)`` pairs; ``docs`` keeps every parsed
-    document by hash so a re-listing parses only files it has not seen.
-    """
-
-    __slots__ = ("mtime_ns", "entries", "docs", "stale")
-
-    def __init__(self) -> None:
-        self.mtime_ns = -1
-        self.entries: list[tuple[str, dict]] = []
-        self.docs: dict[str, dict] = {}
-        self.stale = True
-
-
 class LocalStore:
     """Content-addressed store in a local directory."""
 
@@ -199,7 +183,11 @@ class LocalStore:
             _atomic_write(fmt, f"{FORMAT_VERSION}\n".encode())
         self.objects.mkdir(exist_ok=True)
         self.records.mkdir(exist_ok=True)
-        self._listings: dict[str, _Listing] = {}
+        # Every call record this store has read or written, by function hash
+        # then record hash.  A record's name is the hash of its content, so a
+        # parsed document is never out of date; a deleted one is not served
+        # because every read checks the file is still there.
+        self._docs: dict[str, dict[str, dict]] = {}
         # The run's log and the event log this process writes, set when
         # the store becomes the current one (``set_store_dir``); a store
         # opened to read, or for a worker's direct access, has neither.
@@ -293,45 +281,29 @@ class LocalStore:
         """``(hash, record)`` pairs for *function_hash*, in no particular
         order.
 
-        The directory is re-read only when its modification time has moved
-        or this store wrote to it, so a hit costs one ``stat``.  Another
-        process's write or removal moves the directory's mtime, so it is
-        seen on the next call.  A filesystem with coarse mtime can leave a
-        listing stale for a moment; the consequence is a spurious miss and a
-        rewrite of an identically named file, never a wrong hit.
+        The directory is listed on every call, so a record another process
+        wrote or removed is seen at once.  A file is parsed the first time
+        this store lists it.
         """
         d = self._record_dir(function_hash)
-        try:
-            mtime_ns = d.stat().st_mtime_ns
-        except OSError:
-            self._listings.pop(function_hash, None)
-            return []
-        listing = self._listings.get(function_hash)
-        if listing is not None and not listing.stale and listing.mtime_ns == mtime_ns:
-            return listing.entries
-        if listing is None:
-            listing = _Listing()
-            self._listings[function_hash] = listing
         try:
             with os.scandir(d) as it:
                 # A .tmp-* is a write in progress; anything else is a leftover.
                 found = [entry.name[:-5] for entry in it if entry.name.endswith(".json")]
         except OSError:
-            self._listings.pop(function_hash, None)
+            self._docs.pop(function_hash, None)
             return []
+        docs = self._docs.setdefault(function_hash, {})
         entries: list[tuple[str, dict]] = []
         for h in found:
-            doc = listing.docs.get(h)
+            doc = docs.get(h)
             if doc is None:
                 doc = self._read_record(d / f"{h}.json", h)
                 if doc is None:
                     continue
-                listing.docs[h] = doc
+                docs[h] = doc
             entries.append((h, doc))
-        listing.entries = entries
-        listing.docs = dict(entries)  # a record deleted since is not served
-        listing.mtime_ns = mtime_ns
-        listing.stale = False
+        self._docs[function_hash] = dict(entries)  # a record deleted since is not served
         return entries
 
     @staticmethod
@@ -351,15 +323,17 @@ class LocalStore:
         return doc if isinstance(doc, dict) else None
 
     def get_record(self, function_hash: str, h: str) -> dict:
-        """One record by hash; CacheMiss if it is gone or corrupt.
-
-        Read through the listing, so a record another process has
-        deleted is missed here from the next call on, like any other."""
-        self.get_records(function_hash)
-        listing = self._listings.get(function_hash)
-        doc = listing.docs.get(h) if listing is not None else None
+        """One record by hash; CacheMiss if it is gone or corrupt."""
+        path = self._record_dir(function_hash) / f"{h}.json"
+        docs = self._docs.setdefault(function_hash, {})
+        doc = docs.get(h)
+        if doc is not None and path.exists():
+            return doc
+        doc = self._read_record(path, h)
         if doc is None:
+            docs.pop(h, None)
             raise CacheMiss(f"record {h} of {function_hash}")
+        docs[h] = doc
         return doc
 
     def put_record(self, function_hash: str, record: dict) -> str:
@@ -368,9 +342,7 @@ class LocalStore:
         path = self._record_dir(function_hash) / f"{h}.json"
         if not path.exists():
             _atomic_write(path, data)
-        listing = self._listings.get(function_hash)
-        if listing is not None:
-            listing.stale = True
+        self._docs.setdefault(function_hash, {})[h] = record
         return h
 
     def clear(self) -> None:
@@ -380,4 +352,4 @@ class LocalStore:
             shutil.rmtree(self.root / name, ignore_errors=True)
         self.objects.mkdir(exist_ok=True)
         self.records.mkdir(exist_ok=True)
-        self._listings.clear()
+        self._docs.clear()
