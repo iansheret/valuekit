@@ -365,9 +365,9 @@ changed is current whatever its age. The store grows until
 
 ## Parallelism
 
-``run_all(fn, inputs)`` runs a module-level ``@pure`` (or ``@pure_local``)
-function over a batch of inputs in parallel and returns their results as
-a list, in input order. An input whose result is already cached is served
+``run_all(fn, inputs)`` runs a module-level function over a batch of
+inputs in parallel and returns their results as a list, in input order.
+An input whose result a ``@pure`` function's cache already holds is served
 without a worker. Each other input runs in its own process, started per
 task by a host process on this machine, with ``max_workers`` running at
 once (default: the ``[local] workers`` line of ``valuekit.local.toml``,
@@ -380,9 +380,10 @@ this machine reads and writes values and call records in the store
 directory itself; every write is a content-named file, so concurrent
 writers cannot drop each other's results.
 
-A function that is not decorated runs on this machine only, with nothing
-cached: it has no function hash for a host to check. Everything else
-about the batch is the same.
+A function that is not decorated runs for every input, on the same
+hosts, with nothing cached; its effects happen on the machine that runs
+it. A ``@pure_local`` function's inputs run in this process, which is
+what the decorator promises. Everything else about the batch is the same.
 
 The first input that produces no result ends the batch: running tasks
 are killed and ``BatchError`` is raised, naming the input, the host it

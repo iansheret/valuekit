@@ -556,8 +556,8 @@ def fake_extension(tmp_path, monkeypatch):
     return mod, path
 
 
-def _next_process():
-    """What a new process has: no binary hashed yet."""
+def _clear_binary_hashes():
+    """Forget every binary hashed so far, as a new process has."""
     functionhash._binary_hashes.clear()
 
 
@@ -590,15 +590,15 @@ class TestNativeExtensions:
         fn = _using_global("solve", _NativeCallable())
         before = _fp(fn)
         (path.parent / "native.cpp").write_text("int solve(int x) { return x + 1; }\n")
-        _next_process()
+        _clear_binary_hashes()
         assert _fp(fn) == before  # an edit alone changes nothing: the build is the code that runs
-        path.write_bytes(b"compiled bytes, version two")  # the same size
-        _next_process()
+        path.write_bytes(b"compiled bytes, version two")
+        _clear_binary_hashes()
         assert _fp(fn) != before
 
-    def test_the_binary_a_process_loaded_is_the_one_hashed(self, fake_extension):
-        # An extension module cannot be reloaded: a binary rebuilt while
-        # the process runs is not the code it runs, so its hash stays.
+    def test_a_rebuild_during_the_process_does_not_change_the_hash(self, fake_extension):
+        # An extension module cannot be reloaded, so the process runs the
+        # binary it loaded, and that is the binary hashed.
         mod, path = fake_extension
         fn = _using_global("solve", _NativeCallable())
         before = _fp(fn)
@@ -691,8 +691,8 @@ class TestNativeExtensions:
         # A module global resolves by name, so the reference is to the module
         # itself rather than to anything it defines.
         before = _fp(fn)
-        path.write_bytes(b"compiled bytes, version two")  # the same size
-        _next_process()
+        path.write_bytes(b"compiled bytes, version two")
+        _clear_binary_hashes()
         assert _fp(fn) != before
 
     def test_an_extension_with_no_project_is_its_binary(self, tmp_path):
@@ -701,7 +701,7 @@ class TestNativeExtensions:
         before = _classify("_intree", str(path))[1]
         assert before.startswith("ext:_intree=")
         path.write_bytes(b"compiled bytes, version two -- rebuilt")
-        _next_process()
+        _clear_binary_hashes()
         assert _classify("_intree", str(path))[1] != before
 
     def test_a_missing_binary_is_not_an_error(self, fake_extension):
@@ -3317,13 +3317,12 @@ class TestScheduling:
         p.write_text('mode = "local"\n')
         assert hosts.mode() == "local"
 
-    def test_an_undecorated_function_runs_here_uncached_and_unrecorded(self, cache, tmp_path, monkeypatch):
+    def test_an_undecorated_function_runs_on_the_hosts_uncached(self, cache, tmp_path, monkeypatch):
         _use_hosts(tmp_path, monkeypatch, cache, h1=2)
         _local_file(tmp_path, 'mode = "remote"\n')
         m, counts = _write_batch_module(tmp_path)
         assert vk.run_all(m.plain, [1, 2], max_workers=2) == [3, 6]
-        assert {e["host"] for _, e in _records(cache, "outcome")} == {"local"}
-        assert not _records(cache, "host")  # no host was tried
+        assert {e["host"] for _, e in _records(cache, "outcome")} == {"h1"}
         assert not any((cache / "records").iterdir())  # nothing cached
         vk.run_all(m.plain, [1, 2], max_workers=2)
         assert sorted(c for c in counts() if c.startswith("P")) == ["P1", "P1", "P2", "P2"]

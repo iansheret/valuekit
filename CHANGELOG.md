@@ -145,10 +145,10 @@ that says so.
   reason a hit read its whole subtree; a hit now loads its result and
   nothing else. The per-function dependency index is gone with it.
 
-- `run_all` with an undecorated function runs on this machine only, with
-  nothing cached, as before. A decorated function's already-cached inputs
-  need no worker, and only a decorated function may run on another
-  machine.
+- `run_all` accepts an undecorated function, which runs for every
+  input on the same hosts as a `@pure` function would, with nothing
+  cached; its effects happen on the machine that runs it. A `@pure`
+  function's already-cached inputs need no worker.
 
 - This machine is a host like any other: a host process started here
   runs one worker per input, and a worker reports a failure as the

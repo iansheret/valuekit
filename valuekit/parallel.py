@@ -4,12 +4,12 @@
 their results in input order, or raises :class:`BatchError` at the first
 input that produces no result.  The user's contract is on :func:`run_all`.
 
-A memoised function (``@pure`` or ``@pure_local``) gets two things an
-undecorated one does not.  An input whose result the cache already holds
-needs no worker, and is served here.  And running somewhere other than
-this machine is safe only for a function whose effects do not matter,
-which is what memoisation already assumes, so only a memoised function
-runs on a host.
+Any importable function may be batched.  A ``@pure`` function's input
+whose result the cache already holds needs no worker, and is served here.
+An undecorated function is run for every input, on whichever host takes
+it, and its effects happen on that machine.  A ``@pure_local`` function's
+inputs run in this process, which its promise requires: a worker forwards
+the call here (:mod:`valuekit.remotestore`).
 
 Each input runs in its own process, started per task by a host process
 (:mod:`valuekit.hostprocess`) on this machine or on a remote host, rather
@@ -121,11 +121,15 @@ _NOT_CACHED = object()
 
 
 def _cached(fn, x) -> Any:
-    """The stored result for *x*, or ``_NOT_CACHED``."""
+    """The stored result for *x*, or ``_NOT_CACHED``: *fn* is not memoised,
+    no record holds, or the record's value is gone."""
+    memo = getattr(fn, "_valuekit", None)
+    if memo is None:
+        return _NOT_CACHED
     try:
-        return fn._valuekit.hit(x)
+        return memo.hit(x)
     except CacheMiss:
-        return _NOT_CACHED  # no record holds, or its value is gone: a worker runs the input
+        return _NOT_CACHED
 
 
 def _refused(reason: str):
@@ -178,7 +182,6 @@ class _Hosts:
 
     def __init__(
         self, fn, store_dir: str | None, store, batch: int, max_workers: int | None = None,
-        remote: bool = True,
     ):
         # Every host puts (handle, payload) here as a worker returns, sends
         # a request, or exits; deliver() passes each to its handle.
@@ -207,11 +210,9 @@ class _Hosts:
         )
         self.local.sync()  # a local host that fails has no capacity; the scheduler runs inputs here
 
-        if store_dir is None or not remote:
+        if store_dir is None:
             # A remote host sends every result to this process's store;
-            # with none configured there is nowhere to put them.  An
-            # undecorated function has no function hash for a host to check
-            # and makes no promise about its effects, so it runs here only.
+            # with none configured there is nowhere to put them.
             return
         if not config.hosts:
             return
@@ -323,13 +324,12 @@ def run_all(
     cache.  A function that expects bad inputs returns a value that says
     so.  To debug the failed input, call ``fn(x)`` on it.
 
-    A ``@pure`` or ``@pure_local`` function's inputs are served from the
-    cache where it holds them, and may run on the local file's hosts.  An
-    undecorated function runs on this machine only, with nothing cached:
-    it has no function hash for a host to check.  Either way the function
-    must be importable by name in a worker.
+    A ``@pure`` function's inputs are served from the cache where it holds
+    them.  An undecorated function runs for every input, with nothing
+    cached, on the same hosts; its effects happen on the machine that runs
+    it.  A ``@pure_local`` function's inputs run in this process.  The
+    function must be importable by name in a worker.
     """
-    decorated = hasattr(fn, "_valuekit")
     inputs = list(inputs)
 
     # Resolved before the breakpoint check below, so that the sequential
@@ -370,7 +370,7 @@ def run_all(
     results: list = [None] * len(inputs)
     pending = deque()
     for i, x in enumerate(inputs):
-        value = _cached(fn, x) if store is not None and decorated else _NOT_CACHED
+        value = _cached(fn, x) if store is not None else _NOT_CACHED
         if value is _NOT_CACHED:
             pending.append((i, x))
         else:
@@ -380,7 +380,7 @@ def run_all(
         events.record(store, "end", id=batch)
         return results
 
-    hosts = _Hosts(fn, store_dir, store, batch, max_workers, remote=decorated)
+    hosts = _Hosts(fn, store_dir, store, batch, max_workers)
 
     running: list[_Task] = []
     busy: dict[str, int] = {}  # host name -> tasks running there
