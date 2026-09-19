@@ -5,7 +5,7 @@ exactly*: two values hash the same only if no Python program could tell
 them apart.  So a list and a tuple of the same items hash differently, two
 dicts hash differently if their iteration order differs, and a writeable
 array differs from a read-only one.  This is what lets a content-addressed
-store hand back, on a hit, exactly what the miss produced.
+store return, on a hit, exactly what the miss produced.
 
 Freezing is separate, and narrower: it is what :class:`ImmutableMap` applies
 to values on entry.  ``@pure`` does not freeze anything, so a type needs a
@@ -18,7 +18,7 @@ a cached return value.
 
 The ImmutableMap handlers are registered in :mod:`valuekit.map` (they need
 the class itself); the function handlers are registered in
-:mod:`valuekit.codehash` (they need the code hasher); plain-data dataclasses
+:mod:`valuekit.functionhash` (they need the function hasher); plain-data dataclasses
 are handled in :mod:`valuekit.plaindata`, which needs no registration at all
 because the type it recognises is a family rather than a class.
 """
@@ -127,9 +127,8 @@ def _new_hasher() -> "hashlib._Hash":
 
 
 def _frame(h: Any, tag: bytes, payload: bytes = b"") -> None:
-    h.update(tag)
-    h.update(len(payload).to_bytes(8, "little"))
-    h.update(payload)
+    """Feed one tagged, length-prefixed field into hasher *h*."""
+    h.update(_blob(tag, payload))
 
 
 # Handlers for type *families*, which singledispatch cannot key on: each is
@@ -168,52 +167,17 @@ def content_hash(v: Any) -> str:
 # singledispatch picks the more specific handler.
 
 
-@hash_update.register
-def _h_none(v: None, h: Any) -> None:
-    _frame(h, b"N")
+def _h_atomic(v: Any, h: Any) -> None:
+    """An atomic value is hashed as its key encoding: one definition of
+    the bytes that identify it, shared with :func:`encode_key`."""
+    h.update(encode_key(v))
 
 
-@hash_update.register
-def _h_bool(v: bool, h: Any) -> None:
-    _frame(h, b"b", b"\x01" if v else b"\x00")
-
-
-@hash_update.register
-def _h_int(v: int, h: Any) -> None:
-    _frame(h, b"i", str(v).encode("ascii"))
-
-
-@hash_update.register
-def _h_float(v: float, h: Any) -> None:
-    _frame(h, b"f", struct.pack("<d", v))
-
-
-@hash_update.register
-def _h_complex(v: complex, h: Any) -> None:
-    _frame(h, b"c", struct.pack("<dd", v.real, v.imag))
-
-
-@hash_update.register
-def _h_str(v: str, h: Any) -> None:
-    _frame(h, b"s", v.encode("utf-8"))
-
-
-@hash_update.register
-def _h_bytes(v: bytes, h: Any) -> None:
-    _frame(h, b"y", v)
-
-
-@hash_update.register
-def _h_range(v: range, h: Any) -> None:
-    _frame(h, b"r", f"{v.start}:{v.stop}:{v.step}".encode("ascii"))
+for _atomic in (type(None), bool, int, float, complex, str, bytes, range, np.generic):
+    hash_update.register(_atomic, _h_atomic)
 
 
 # --- numpy -----------------------------------------------------------------
-
-
-@hash_update.register
-def _h_np_scalar(v: np.generic, h: Any) -> None:
-    _frame(h, b"g", v.dtype.str.encode("ascii") + b"|" + v.tobytes())
 
 
 @hash_update.register
@@ -361,27 +325,29 @@ def _blob(tag: bytes, body: bytes) -> bytes:
 
 
 def encode_key(v: Any) -> bytes:
-    """Canonical self-describing encoding for map keys (atomics + tuples)."""
+    """The bytes that identify an atomic value, a tuple or a frozenset of
+    them: self-describing, so it decodes to an equal value of the base
+    type.  A subclass of an atomic type (an IntEnum, say) encodes as its
+    base type's value, which is also how it is hashed."""
     if v is None:
         return _blob(b"N", b"")
-    t = type(v)
-    if t is bool:
+    if isinstance(v, bool):
         return _blob(b"b", b"\x01" if v else b"\x00")
-    if t is int:
-        return _blob(b"i", str(v).encode("ascii"))
-    if t is float:
+    if isinstance(v, int):
+        return _blob(b"i", str(int(v)).encode("ascii"))
+    if isinstance(v, float):
         return _blob(b"f", struct.pack("<d", v))
-    if t is complex:
+    if isinstance(v, complex):
         return _blob(b"c", struct.pack("<dd", v.real, v.imag))
-    if t is str:
-        return _blob(b"s", v.encode("utf-8"))
-    if t is bytes:
-        return _blob(b"y", v)
-    if t is range:
+    if isinstance(v, str):
+        return _blob(b"s", str(v).encode("utf-8"))
+    if isinstance(v, bytes):
+        return _blob(b"y", bytes(v))
+    if isinstance(v, range):
         return _blob(b"r", f"{v.start}:{v.stop}:{v.step}".encode("ascii"))
-    if t is tuple:
+    if isinstance(v, tuple):
         return _blob(b"t", b"".join(encode_key(x) for x in v))
-    if t is frozenset:
+    if isinstance(v, frozenset):
         return _blob(b"F", b"".join(sorted(encode_key(x) for x in v)))
     if isinstance(v, np.generic):
         return _blob(b"g", _blob(b"s", v.dtype.str.encode("ascii")) + v.tobytes())

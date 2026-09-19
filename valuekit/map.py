@@ -1,7 +1,7 @@
 """ImmutableMap — an immutable mapping for pipeline data.
 
 Values that are already immutable (int, str, float, …) are stored as-is.
-For types it knows how to handle (e.g. numpy arrays) it stores an immutable
+For the types it converts (e.g. numpy arrays) it stores an immutable
 copy. Unknown mutable types are rejected.
 
 There is no in-place mutation: derive new versions with ``|``, and the

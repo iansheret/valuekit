@@ -5,15 +5,15 @@ semantic effect: a missing or corrupt entry is treated as a miss.
 
 Layout::
 
-    <root>/format            # store format version; mismatch → refuse
-    <root>/objects/ab/<hash>.npy   # a read-only ndarray (reloaded mmap)
-    <root>/objects/ab/<hash>.npyw  # a writeable ndarray (reloaded in full)
-    <root>/objects/ab/<hash>.bin   # any other value
-    <root>/traces/<fnkey>.jsonl    # traces for one function, one per line
+    <root>/format                         # store format version; mismatch → refuse
+    <root>/objects/ab/<hash>.npy          # a read-only ndarray (reloaded mmap)
+    <root>/objects/ab/<hash>.npyw         # a writeable ndarray (reloaded in full)
+    <root>/objects/ab/<hash>.bin          # any other value
+    <root>/records/<function hash>/<record hash>.json  # one call record of one function
 
 Values are stored structurally: composite values (tuples, lists, sets,
 frozensets, maps) store the content hashes of their children, each of which
-is its own object.  This deduplicates large arrays across traces and lets
+is its own object.  This deduplicates large arrays across call records and lets
 read-only arrays reload as memory maps, which ``freeze`` then shares without
 copying.
 
@@ -28,76 +28,115 @@ int, float, complex, str, bytes, range, numpy scalars, numpy arrays, tuples,
 lists, sets, frozensets, dicts, ImmutableMaps and plain-data dataclasses
 (recursively of the same).  Anything else raises
 :class:`SerializationError`.  A dataclass entry names its class, but nothing
-is imported on the strength of a stored entry: the class is resolved only
+is imported because a stored entry names it: the class is resolved only
 among modules the process has already loaded, and a class that has changed
 since reads as a miss (see :mod:`valuekit.plaindata`).
 
-Writes are atomic: values go through a temp file and ``os.replace``, and
-traces are appended with a single ``O_APPEND`` write, so any number of
-processes may share a cache directory.  A concurrent duplicate trace line is
-possible and harmless; a torn line from a crash is skipped on read.
+Every write is a temp file and ``os.replace``, and every file is named by
+the hash of its content, call records included.  Two processes writing the same
+entry write the same bytes under the same name, so there is nothing to
+coordinate: no appends, no locks, no read-before-write.  This is what lets
+any number of processes share a store directory, on Windows as well as
+POSIX (Windows appends are not atomic, and Windows refuses to replace a file
+another process has mapped -- both cases reduce to "already there").
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import struct
+import re
+import shutil
 import tempfile
-from collections.abc import Mapping, Sequence
+import time
+import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 
-from .map import ImmutableMap
-from .plaindata import (
-    is_dataclass_instance,
-    plain_data_class,
-    plain_data_state,
-    rebuild_plain_data,
-)
-from .values import (
-    content_hash,
-    custom_reduce,
-    custom_rebuild,
-    encode_key,
-    decode_key,
-    _blob,
-    _read_blob,
-)
+from .codec import SerializationError, decode, encode
+from .values import content_hash
 
-__all__ = ["CacheMiss", "SerializationError", "CacheStore", "LocalStore"]
+__all__ = [
+    "CacheMiss",
+    "SerializationError",
+    "CacheStore",
+    "LocalStore",
+    "record_bytes",
+    "record_hash",
+]
 
-FORMAT_VERSION = 5
+FORMAT_VERSION = 9
 
 
 class CacheMiss(Exception):
-    """A value or trace could not be retrieved; recompute."""
-
-
-class SerializationError(TypeError):
-    """A value cannot be stored. Only the fixed set of storable types may
-    appear in cached return values."""
+    """A value or call record could not be retrieved; recompute."""
 
 
 class CacheStore(Protocol):
-    """The methods a store must implement.
-
-    Kept small so that a shared or remote store (e.g. S3 or Redis) can be
-    added by implementing these methods.
+    """What :mod:`valuekit.pure` asks of a store: values and call records,
+    and the two logs a run writes.  :class:`LocalStore` is a directory;
+    :class:`valuekit.remotestore.RemoteStore` is a worker's view of the
+    main process's store.
     """
 
-    def get_traces(self, fn_key: str) -> list[dict]: ...
-    def put_trace(
-        self, fn_key: str, trace: dict, units: Sequence[str] = ()
-    ) -> None: ...
+    def get_records(self, function_hash: str) -> list[tuple[str, dict]]:
+        """``(record_hash, record)`` pairs, in no particular order."""
+
+    def get_record(self, function_hash: str, h: str) -> dict:
+        """One record by hash; CacheMiss if it is gone or corrupt."""
+
+    def put_record(self, function_hash: str, record: dict) -> str:
+        """Store *record*; return its hash."""
+
     def get_value(self, h: str) -> Any: ...
     def put_value(self, v: Any) -> str: ...
 
+    def log_line(self, line: dict) -> None:
+        """Write one line of the run's log (:mod:`valuekit.runlog`)."""
+
+    def event(self, record: dict) -> None:
+        """Write one record of the event log (:mod:`valuekit.events`)."""
+
 
 # ---------------------------------------------------------------------------
+# call records as content-addressed documents
+# ---------------------------------------------------------------------------
+
+
+def record_bytes(record: dict) -> bytes:
+    """The canonical serialisation of a call record: what is written to disk, and
+    what is hashed to name it."""
+    return json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+
+
+def record_hash(record: dict) -> str:
+    return _hash_bytes(record_bytes(record))
+
+
+def _hash_bytes(data: bytes) -> str:
+    return hashlib.blake2b(data, digest_size=20).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+
+
+_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def dirname_for(name: str) -> str:
+    """A user-chosen name as a directory name: characters outside
+    ``[A-Za-z0-9._-]`` become ``_``.  The record inside keeps the real one."""
+    return _UNSAFE.sub("_", name) or "_"
+
+
+def unique_name() -> str:
+    """A directory name for something written once: sortable by the time
+    it was made, and distinct across processes and within one."""
+    return f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -106,7 +145,15 @@ def _atomic_write(path: Path, data: bytes) -> None:
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except (PermissionError, FileExistsError):
+            # Windows refuses to replace a file another process has open or
+            # mapped.  Every path here is content-addressed, so a target that
+            # exists already holds these bytes: the write has happened.
+            if not path.exists():
+                raise
+            os.unlink(tmp)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -115,27 +162,76 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
+# How long to wait for another process to finish creating the format file
+# before reporting a read of it as an error.
+_FORMAT_WAIT = 5.0
+
+
+def _read_format(path: Path) -> str:
+    """The format version recorded at *path*, or "" if there is no file.
+
+    Another process opening the same new store writes this file, and on
+    Windows a read while it is being replaced fails.  Every writer writes
+    the same version, so a failed read is retried rather than reported.
+    """
+    deadline = time.monotonic() + _FORMAT_WAIT
+    while True:
+        try:
+            return path.read_text().strip()
+        except FileNotFoundError:
+            return ""
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 class LocalStore:
     """Content-addressed store in a local directory."""
 
     def __init__(self, root: str | os.PathLike):
         self.root = Path(root)
         self.objects = self.root / "objects"
-        self.traces = self.root / "traces"
+        self.records = self.root / "records"
         self.root.mkdir(parents=True, exist_ok=True)
         fmt = self.root / "format"
-        if fmt.exists():
-            found = fmt.read_text().strip()
+        found = _read_format(fmt)
+        if found:
             if found != str(FORMAT_VERSION):
                 raise RuntimeError(
                     f"Cache at {self.root} has format {found}, this valuekit "
                     f"writes format {FORMAT_VERSION}. Delete the directory or "
-                    "point set_cache_dir() elsewhere."
+                    "point set_store_dir() elsewhere."
                 )
         else:
             _atomic_write(fmt, f"{FORMAT_VERSION}\n".encode())
         self.objects.mkdir(exist_ok=True)
-        self.traces.mkdir(exist_ok=True)
+        self.records.mkdir(exist_ok=True)
+        # Every call record this store has read or written, by function hash
+        # then record hash.  A record's name is the hash of its content, so a
+        # parsed document is never out of date; a deleted one is not served
+        # because every read checks the file is still there.
+        self._docs: dict[str, dict[str, dict]] = {}
+        # The run's log and the event log this process writes, set when
+        # the store becomes the current one (``set_store_dir``); a store
+        # opened to read, or for a worker's direct access, has neither.
+        self.run = None
+        self.events = None
+
+    def log_line(self, line: dict) -> None:
+        if self.run is not None:
+            self.run.write(line)
+
+    def event(self, record: dict) -> None:
+        if self.events is not None:
+            self.events.write(record)
+
+    def close(self) -> None:
+        """Close the two logs; values and records need no closing."""
+        for log in (self.run, self.events):
+            if log is not None:
+                log.close()
+        self.run = self.events = None
 
     # -- object paths -----------------------------------------------------
 
@@ -167,70 +263,19 @@ class LocalStore:
         return h
 
     def _encode(self, v: Any) -> bytes:
-        t = type(v)
-        if t is tuple:
-            hs = [bytes.fromhex(self.put_value(x)) for x in v]
-            return _blob(b"T", b"".join(hs))
-        if t is list:
-            hs = [bytes.fromhex(self.put_value(x)) for x in v]
-            return _blob(b"L", b"".join(hs))
-        if t is frozenset:
-            hs = sorted(bytes.fromhex(self.put_value(x)) for x in v)
-            return _blob(b"F", b"".join(hs))
-        if t is set:
-            hs = sorted(bytes.fromhex(self.put_value(x)) for x in v)
-            return _blob(b"S", b"".join(hs))
-        if isinstance(v, ImmutableMap):
-            pairs = sorted(
-                (bytes.fromhex(self.put_value(k)), bytes.fromhex(self.put_value(val)))
-                for k, val in v.items()
-            )
-            return _blob(b"M", b"".join(k + val for k, val in pairs))
-        if isinstance(v, Mapping):
-            # Insertion order is preserved, matching how a plain mapping is
-            # hashed: it is observable, so it is part of the value.
-            pairs = [
-                (bytes.fromhex(self.put_value(k)), bytes.fromhex(self.put_value(val)))
-                for k, val in v.items()
-            ]
-            return _blob(b"D", b"".join(k + val for k, val in pairs))
-        reduced = custom_reduce(v)
-        if reduced is not None:
-            name, red = reduced
-            h = bytes.fromhex(self.put_value(red))
-            return _blob(b"C", _blob(b"s", name.encode("utf-8")) + h)
-        if is_dataclass_instance(v):
-            # A plain-data dataclass stores its identity beside its field
-            # values, so a class that has changed since is refused on the way
-            # back out rather than rebuilt into something it no longer means.
-            name, field_names, params_key, values = plain_data_state(v)
-            try:
-                plain_data_class(name)
-            except ValueError as e:
-                raise SerializationError(
-                    f"Cannot cache a {t.__name__!r}: {e}, so a stored entry "
-                    "could never be rebuilt. Define it at module level, or "
-                    "register it with valuekit.register_type()."
-                ) from None
-            h = bytes.fromhex(self.put_value(values))
-            return _blob(
-                b"P",
-                _blob(b"s", name.encode("utf-8"))
-                + _blob(b"s", ",".join(field_names).encode("utf-8"))
-                + _blob(b"s", params_key.encode("utf-8"))
-                + h,
-            )
-        try:
-            return _blob(b"I", encode_key(v))  # atomics + np scalars
-        except Exception:
-            raise SerializationError(
-                f"Cannot cache a value of type {t.__name__!r}. Cached return "
-                "values are limited to: None, bool, int, float, complex, str, "
-                "bytes, range, numpy scalars/arrays, tuples, lists, sets, "
-                "frozensets, dicts, ImmutableMaps and plain-data dataclasses "
-                "of the same -- or a type registered with a "
-                "reduce_fn/rebuild_fn via valuekit.register_type()."
-            ) from None
+        return encode(v, self.put_value)
+
+    def put_object(self, h: str, ext: str, data: bytes) -> None:
+        """Store one already-encoded object under its hash.
+
+        *ext* is ``.npy``, ``.npyw`` or ``.bin`` and *data* is exactly what
+        :meth:`put_value` would have written: a peer's object messages carry
+        the same bytes, so they go in without being decoded.
+        """
+        if ext not in (".npy", ".npyw", ".bin"):
+            raise ValueError(f"not an object kind: {ext!r}")
+        if self._find(h) is None:
+            _atomic_write(self._obj(h, ext), data)
 
     def get_value(self, h: str) -> Any:
         path = self._find(h)
@@ -249,116 +294,86 @@ class LocalStore:
             raise CacheMiss(f"{h}: {e}") from e
 
     def _decode(self, data: bytes) -> Any:
-        tag, body, pos = _read_blob(data, 0)
-        if pos != len(data):
-            raise ValueError("trailing bytes in stored value")
-        if tag == b"I":
-            return decode_key(body)
-        if tag == b"C":
-            _, name, p = _read_blob(body, 0)
-            reduced = self.get_value(body[p:].hex())
-            return custom_rebuild(name.decode("utf-8"), reduced)
-        if tag == b"P":
-            _, name, p = _read_blob(body, 0)
-            _, names, p = _read_blob(body, p)
-            _, params_key, p = _read_blob(body, p)
-            joined = names.decode("utf-8")
-            return rebuild_plain_data(
-                name.decode("utf-8"),
-                tuple(joined.split(",")) if joined else (),
-                params_key.decode("utf-8"),
-                self.get_value(body[p:].hex()),
-            )
-        n = 20  # raw digest size
-        hs = [body[i : i + n].hex() for i in range(0, len(body), n)]
-        if tag == b"T":
-            return tuple(self.get_value(x) for x in hs)
-        if tag == b"L":
-            return [self.get_value(x) for x in hs]
-        if tag == b"F":
-            return frozenset(self.get_value(x) for x in hs)
-        if tag == b"S":
-            return {self.get_value(x) for x in hs}
-        if tag in (b"M", b"D"):
-            d = {}
-            for i in range(0, len(hs), 2):
-                d[self.get_value(hs[i])] = self.get_value(hs[i + 1])
-            return ImmutableMap(d) if tag == b"M" else d
-        raise ValueError(f"unknown value tag {tag!r}")
+        return decode(data, self.get_value)
 
-    # -- traces ---------------------------------------------------------------
+    # -- call records ---------------------------------------------------------------
 
-    def _trace_path(self, fn_key: str) -> Path:
-        return self.traces / f"{fn_key}.jsonl"
+    def _record_dir(self, function_hash: str) -> Path:
+        return self.records / function_hash
 
-    def get_traces(self, fn_key: str) -> list[dict]:
+    def get_records(self, function_hash: str) -> list[tuple[str, dict]]:
+        """``(hash, record)`` pairs for *function_hash*, in no particular
+        order.
+
+        The directory is listed on every call, so a record another process
+        wrote or removed is seen at once.  A file is parsed the first time
+        this store lists it.
+        """
+        d = self._record_dir(function_hash)
         try:
-            text = self._trace_path(fn_key).read_text()
+            with os.scandir(d) as it:
+                # A .tmp-* is a write in progress; anything else is a leftover.
+                found = [entry.name[:-5] for entry in it if entry.name.endswith(".json")]
         except OSError:
+            self._docs.pop(function_hash, None)
             return []
-        out: list[dict] = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                t = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # torn or corrupt line: skip (a miss at worst)
-            if isinstance(t, dict) and t not in out:
-                out.append(t)
-        return out
+        docs = self._docs.setdefault(function_hash, {})
+        entries: list[tuple[str, dict]] = []
+        for h in found:
+            doc = docs.get(h)
+            if doc is None:
+                doc = self._read_record(d / f"{h}.json", h)
+                if doc is None:
+                    continue
+                docs[h] = doc
+            entries.append((h, doc))
+        self._docs[function_hash] = dict(entries)  # a record deleted since is not served
+        return entries
 
-    def put_trace(self, fn_key: str, trace: dict, units: Sequence[str] = ()) -> None:
-        deps = self.traces / f"{fn_key}.deps"
-        if units and not deps.exists():
-            _atomic_write(deps, "\n".join(units).encode())
-        if trace in self.get_traces(fn_key):
-            return
-        # One O_APPEND write per trace: atomic under concurrency, so parallel
-        # workers cannot drop each other's traces.  A duplicate line from a
-        # write race is possible and harmless (get_traces de-duplicates).
-        data = (json.dumps(trace) + "\n").encode()
-        path = self._trace_path(fn_key)
-        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+    @staticmethod
+    def _read_record(path: Path, h: str) -> dict | None:
+        """The document at *path*, or None if it is not the call record its name
+        claims (a torn or corrupt file: a miss at worst)."""
         try:
-            os.write(fd, data)
-        finally:
-            os.close(fd)
-
-    def _drop(self, trace_path: Path) -> None:
-        try:
-            trace_path.unlink(missing_ok=True)
-            trace_path.with_suffix(".deps").unlink(missing_ok=True)
+            raw = path.read_bytes()
         except OSError:
-            pass
+            return None
+        if _hash_bytes(raw) != h:
+            return None
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            return None
+        return doc if isinstance(doc, dict) else None
 
-    def drop_dependents(self, unit_digests: set[str], value_hash: str | None) -> None:
-        """Delete the traces of every function whose recorded closure
-        contains any of *unit_digests*, plus any trace file that mentions
-        *value_hash* (the function appearing as an argument). Stored values
-        are left in place."""
-        for deps in list(self.traces.glob("*.deps")):
-            try:
-                recorded = set(deps.read_text().split())
-            except OSError:
-                recorded = set()
-            if recorded & unit_digests:
-                self._drop(deps.with_suffix(".jsonl"))
-        if value_hash:
-            for tf in list(self.traces.glob("*.jsonl")):
-                try:
-                    if value_hash in tf.read_text():
-                        self._drop(tf)
-                except OSError:
-                    pass
+    def get_record(self, function_hash: str, h: str) -> dict:
+        """One record by hash; CacheMiss if it is gone or corrupt."""
+        path = self._record_dir(function_hash) / f"{h}.json"
+        docs = self._docs.setdefault(function_hash, {})
+        doc = docs.get(h)
+        if doc is not None and path.exists():
+            return doc
+        doc = self._read_record(path, h)
+        if doc is None:
+            docs.pop(h, None)
+            raise CacheMiss(f"record {h} of {function_hash}")
+        docs[h] = doc
+        return doc
 
-    # -- maintenance -----------------------------------------------------------
+    def put_record(self, function_hash: str, record: dict) -> str:
+        data = record_bytes(record)
+        h = _hash_bytes(data)
+        path = self._record_dir(function_hash) / f"{h}.json"
+        if not path.exists():
+            _atomic_write(path, data)
+        self._docs.setdefault(function_hash, {})[h] = record
+        return h
 
     def clear(self) -> None:
-        """Delete all cached objects and traces (always safe)."""
-        import shutil
-
-        for sub in (self.objects, self.traces):
-            shutil.rmtree(sub, ignore_errors=True)
-            sub.mkdir(exist_ok=True)
+        """Delete everything computed or logged: the values, call records
+        and run logs.  The event log and host source trees stay."""
+        for name in ("objects", "records", "logs"):
+            shutil.rmtree(self.root / name, ignore_errors=True)
+        self.objects.mkdir(exist_ok=True)
+        self.records.mkdir(exist_ok=True)
+        self._docs.clear()

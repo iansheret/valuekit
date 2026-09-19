@@ -11,7 +11,7 @@ through the data rather than by name.
 Excluding methods is what makes that identity complete.  A method reached
 through an argument -- ``obs.magnitude()`` -- is an attribute name, so it
 resolves to nothing at module scope and never enters the calling function's
-fingerprint; edit it and a stale result is served.  A class defining one is
+function_hash; edit it and a stale result is served.  A class defining one is
 rejected, and the message points at ``register_type``, where the user takes
 on hashing it themselves.
 
@@ -35,10 +35,8 @@ import dataclasses
 import inspect
 import reprlib
 import sys
-import threading
 import types
 import weakref
-from contextlib import contextmanager
 from functools import cached_property
 from typing import Any
 
@@ -104,7 +102,6 @@ _GENERATED_NAMES = frozenset(
 _ANNOTATION_NAMES = frozenset({"__annotate__", "__annotate_func__"})
 
 _spec_cache: "weakref.WeakKeyDictionary[type, Any]" = weakref.WeakKeyDictionary()
-_active = threading.local()
 
 
 def is_dataclass_instance(v: Any) -> bool:
@@ -156,7 +153,7 @@ def _build_spec(cls: type) -> tuple[str, tuple[str, ...], str]:
         raise _reject(cls, "takes constructor arguments it does not store")
 
     # Reject behaviour attached anywhere in the class or its bases: it would
-    # be invisible to the fingerprint of a function reaching it through an
+    # be invisible to the function hash of a function reaching it through an
     # argument.  A field's default sits in the class namespace under the
     # field's own name, and is a value however callable it happens to be.
     ignored = set(field_names) | _ANNOTATION_NAMES
@@ -224,34 +221,14 @@ def plain_data_state(v: Any) -> tuple[str, tuple[str, ...], str, tuple]:
 # ---------------------------------------------------------------------------
 
 
-@contextmanager
-def _guard_cycle(v: Any):
-    """Refuse a value that contains itself, which would otherwise recurse
-    until the stack ran out."""
-    ids = getattr(_active, "ids", None)
-    if ids is None:
-        ids = _active.ids = set()
-    if id(v) in ids:
-        raise TypeError(
-            f"Cannot hash a {type(v).__name__!r}: it contains itself, and a "
-            "content hash has to be finite."
-        )
-    ids.add(id(v))
-    try:
-        yield
-    finally:
-        ids.discard(id(v))
-
-
 def _hash_dataclass(v: Any, h: Any) -> bool:
     """Feed a plain-data dataclass into hasher *h*: identity, then fields."""
     if not is_dataclass_instance(v):
         return False
     name, field_names, params_key, values = plain_data_state(v)
-    with _guard_cycle(v):
-        _frame(h, b"P", f"{name}|{','.join(field_names)}|{params_key}".encode())
-        for value in values:
-            hash_update(value, h)
+    _frame(h, b"P", f"{name}|{','.join(field_names)}|{params_key}".encode())
+    for value in values:
+        hash_update(value, h)
     return True
 
 
@@ -267,7 +244,7 @@ def plain_data_class(name: str) -> type:
     """Resolve ``"module:qualname"`` to a class already imported in this
     process, raising ValueError if it cannot be reached.
 
-    Nothing is imported on the strength of a stored entry: a module the
+    Nothing is imported because a stored entry names it: a module the
     process has not loaded itself reads as a miss.
     """
     module_name, _, qualname = name.partition(":")

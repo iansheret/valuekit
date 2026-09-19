@@ -1,6 +1,6 @@
-"""Recursive code hashing.
+"""The function hash: a hash of everything a function reaches by name.
 
-A @pure function's identity is a content hash of everything **reachable by
+A @pure function's function hash is a content hash of everything **reachable by
 name** from its code: its own bytecode and constants, plus — recursively
 through user code — every function, class, module, and immutable constant
 its names resolve to.  The walk stops at boundaries:
@@ -9,9 +9,9 @@ its names resolve to.  The walk stops at boundaries:
   package invalidates; edits inside site-packages are invisible);
 * native extensions whose version cannot describe them -- anything installed
   from a local directory, editable or not, and so rebuilt in place --
-  contribute a content hash of the built binary;
+  contribute the hash of their binary on the main process;
 * the standard library contributes ``std:<module>`` (the Python version is
-  already part of the global salt);
+  a marker in the hash);
 * user modules referenced *as modules* (``mymod.helper()``) contribute a hash
   of the module's source file, and a package's submodules are followed
   through attribute access (``mypkg.sub.f()`` depends on sub.py, not only on
@@ -22,15 +22,18 @@ its names resolve to.  The walk stops at boundaries:
   writeable arrays) are deliberately untracked and silent: @pure is the
   caller's promise that they never change or never matter.
 
-Names are resolved when the fingerprint is computed — at a @pure function's
+Names are resolved when the function hash is computed — at a @pure function's
 first call, once its module is fully loaded — so definition order does not
 matter and mutual recursion works.  The decorated function's own code
 object is captured at decoration time, before a debugger patches its
 bytecode.
 
-The same walk collects (filename, first_line, last_line) *spans* for every
-user code object in the closure; the debugger hook intersects live
-breakpoints against these to decide when a cache hit must be bypassed.
+The walk's product is the function's *reachable set*: its hash is the
+function hash that names the function's call records, and its spans (filename,
+first line, last line, one per user code object reached) are what the
+debugger hook intersects live breakpoints against to decide when a cache
+hit must be bypassed.  The Python major and minor version is a marker in
+the hash, since bytecode differs between versions on identical source.
 """
 
 from __future__ import annotations
@@ -46,37 +49,24 @@ import numpy as np
 
 from .values import _frame, _new_hasher, digest, freeze, hash_update
 
-__all__ = ["function_fingerprint"]
+__all__ = ["reachable_set", "ReachableSet", "PYTHON"]
 
 _MISSING = object()
 
-
-def _unit_digest(code: types.CodeType) -> str:
-    """Content digest of a single code object — the identity of one function
-    body, independent of its name, file, or line number.  Used by the
-    dependency index that makes clear_cache(fn) reach fn's callers."""
-    h = _new_hasher()
-    _frame(h, b"U", code.co_code)
-    _frame(h, b"n", ",".join(code.co_names).encode())
-    for c in code.co_consts:
-        if not isinstance(c, types.CodeType):
-            _frame(h, b"c", repr(c).encode("utf-8", "replace"))
-    return h.hexdigest()
+# The running interpreter's major and minor version: a marker in every code
+# hash, and what main process and host compare before comparing hashes.
+PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
-def _module_unit(mod: types.ModuleType) -> str | None:
-    """Content digest of a user module's source file, or None."""
-    fname = getattr(mod, "__file__", None)
-    if not fname:
-        return None
-    try:
-        with open(fname, "rb") as f:
-            src = f.read()
-    except OSError:
-        return None
-    h = _new_hasher()
-    _frame(h, b"M", src)
-    return h.hexdigest()
+class ReachableSet:
+    """Everything reachable by name from a function's code: its hash, the
+    source spans of the user code objects in it."""
+
+    __slots__ = ("hash", "spans")
+
+    def __init__(self, hash: str, spans: list[tuple[str, int, int]]):
+        self.hash = hash
+        self.spans = spans
 
 
 # ---------------------------------------------------------------------------
@@ -123,82 +113,119 @@ def _dist_version(top: str) -> str | None:
 # native extensions
 # ---------------------------------------------------------------------------
 #
-# A compiled extension has no source to walk and no code object to hash, so
-# the binary is its identity.  Hashing it is only necessary where the version
-# marker cannot stand in: a distribution installed from a released artefact
-# changes only through a reinstall, which moves its version, while one
-# installed from a local directory -- editable or not -- is rebuilt in place
-# under the same version, and so would go unnoticed.
-#
-# The binary is also a stricter dependency than the sources it was built
-# from: it carries the compiler, its flags, and any library linked
-# statically into the result, none of which the sources mention.  And it is
-# the code that actually runs, so editing a source file without rebuilding
-# correctly changes nothing.
+# A compiled extension has no source to walk.  From a released
+# distribution, its version is its marker (see _dist_dir); built from a
+# local directory, its binary's hash is (see _binary_hash).  A worker on
+# another machine has a different binary and never hashes it: the main
+# process sends every marker it has computed, and the worker substitutes
+# them for the modules it meets (see _extension_hash).
 
-_ext_digests: dict[tuple, str] = {}
+_markers_here: dict[str, str] | None = None  # set on a worker; None on the main process
+_binary_hashes: dict[str, str] = {}  # path -> hash of the binary this process loaded
+_markers: dict[str, str] = {}  # extension module name -> its marker, every one hashed here
+
+
+def extension_markers() -> dict[str, str]:
+    """The markers of every native extension this process has hashed, by
+    module name: what a worker is given in place of hashing its own."""
+    return dict(_markers)
 
 
 def _is_extension_file(filename: str) -> bool:
     return filename.endswith(tuple(EXTENSION_SUFFIXES))
 
 
-def _is_dist_local(dist: Any) -> bool:
-    """Report whether *dist* was installed from a directory on this machine,
-    so that its version says nothing about its current contents."""
+def _dist_dir(dist: Any) -> str | None:
+    """The directory *dist* was installed from, or None if it was not.
+
+    Such an install -- editable or not -- is rebuilt in place under the same
+    version, so its version says nothing about its current contents.
+    """
     try:
         text = dist.read_text("direct_url.json")
+        info = json.loads(text) if text else {}
     except Exception:
-        return False
+        return None
+    if "dir_info" not in info:
+        return None
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+
     try:
-        return bool(text) and "dir_info" in json.loads(text)
-    except ValueError:
-        return False
+        return os.path.realpath(url2pathname(urlparse(info["url"]).path))
+    except Exception:
+        return None
 
 
 def _is_live_extension(filename: str, top: str) -> bool:
-    """Report whether a file is an extension whose version cannot stand for
-    its contents, and so has to be hashed."""
+    """Report whether a file is an extension whose version does not identify
+    its contents."""
     if not _is_extension_file(filename):
         return False
     dist = _distribution(top)
-    return dist is None or _is_dist_local(dist)
+    return dist is None or _dist_dir(dist) is not None
 
 
-def _extension_digest(filename: str) -> str | None:
-    """Content digest of a compiled extension, or None if it cannot be read.
+def _binary_hash(filename: str) -> str:
+    """The content hash of the binary at *filename*, read once per process.
 
-    Memoised on the file's identity, so a fingerprint pays for a given build
-    once per process.
+    An extension module cannot be reloaded, so the binary this process
+    runs is the one it first loaded, whatever the file holds now.  A
+    rebuilt binary is seen by the next process.
     """
-    try:
-        stat = os.stat(filename)
-    except OSError:
-        return None
-    key = (filename, stat.st_mtime_ns, stat.st_size)
-    if key not in _ext_digests:
-        h = _new_hasher()
-        try:
-            with open(filename, "rb") as f:
-                for block in iter(lambda: f.read(1 << 20), b""):
-                    h.update(block)
-        except OSError:
-            return None
-        _ext_digests[key] = h.hexdigest()
-    return _ext_digests[key]
+    from . import project
+
+    h = _binary_hashes.get(filename)
+    if h is None:
+        h = project._file_hash(filename) or "?"
+        if h != "?":
+            _binary_hashes[filename] = h
+    return h
+
+
+def _extension_hash(module_name: str | None, filename: str) -> str:
+    """The marker for the live extension *module_name* at *filename*: on the
+    main process its binary's hash; on a worker the marker the main process
+    sent for it, or a value no marker can equal."""
+    name = module_name or ""
+    if _markers_here is not None:
+        return _markers_here.get(name, "?not-reached-by-the-main-process")
+    h = _binary_hash(filename)
+    _markers[name] = h
+    return h
 
 
 def _extension_marker(module_name: str | None) -> str | None:
     """Return the marker for *module_name* if it names a native extension.
 
     Objects a compiled module defines -- a nanobind function, a Cython class
-    -- carry no Python code, so the module they came from stands for them.
+    -- carry no Python code, so the module they came from is their marker.
     """
     mod = sys.modules.get(module_name or "")
     filename = getattr(mod, "__file__", None)
     if not filename or not _is_extension_file(filename):
         return None
     return _classify(module_name, filename)[1]
+
+
+def _is_installed(filename: str, top: str) -> bool:
+    """Whether a module file belongs to an installed package rather than to
+    the user's project.
+
+    By its path (the interpreter's own directories, as sysconfig and
+    site report them) or by what claims it (a released distribution, wherever
+    it was put).  Not by a ``site-packages`` substring: that misses ``pip
+    --target`` and vendored installs, and matches any project that happens to
+    live under a directory of that name.  A distribution installed from a
+    local directory claims nothing here: its files are the user's, edited in
+    place under a version that never moves.
+    """
+    from .project import is_environment
+
+    if is_environment(filename):
+        return True
+    dist = _distribution(top)
+    return dist is not None and _dist_dir(dist) is None
 
 
 def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
@@ -208,18 +235,22 @@ def _classify(module_name: str | None, filename: str | None) -> tuple[str, str]:
         return _STD, "std:builtins"
     if top == "__main__":
         return _USER, "__main__"
+    if top == "valuekit":
+        # This library is never user code, wherever it is installed from: a
+        # user function naming ``log`` or ``ImmutableMap`` must not hash
+        # their module-level state.  The store's format version, not a
+        # marker here, says when a valuekit change invalidates caches.
+        return _PKG, "pkg:valuekit"
     if top and top in sys.stdlib_module_names:
         return _STD, f"std:{top}"
     if filename is None and top:
         mod = sys.modules.get(module_name or "")
         filename = getattr(mod, "__file__", None)
     if filename and _is_live_extension(filename, top):
-        # An extension rebuilt in place under a fixed version: only its
-        # contents identify it.
-        ext_digest = _extension_digest(filename)
-        if ext_digest is not None:
-            return _PKG, f"ext:{module_name}={ext_digest}"
-    if filename and ("site-packages" in filename or "dist-packages" in filename):
+        # An extension rebuilt in place under a fixed version: its binary,
+        # or on a worker the main process's, is its marker.
+        return _PKG, f"ext:{module_name}={_extension_hash(module_name, filename)}"
+    if filename and _is_installed(filename, top):
         ver = _dist_version(top)
         return _PKG, f"pkg:{top}=={ver or '?'}"
     if filename is None:
@@ -264,7 +295,6 @@ class _Walker:
     def __init__(self) -> None:
         self.h = _new_hasher()
         self.spans: list[tuple[str, int, int]] = []
-        self.units: set[str] = set()  # closure membership, for clear_cache(fn)
         self.seen: set[int] = set()  # id() of code objects / classes / modules
 
     # -- helpers -----------------------------------------------------------
@@ -285,9 +315,9 @@ class _Walker:
             return False
 
     def _add_value(self, label: str, v: Any) -> None:
-        """Content-hash a plain value, falling back to the binary of the
+        """Content-hash a plain value, falling back to the marker of the
         extension that defines it: a nanobind function or a Cython class has
-        no other identity."""
+        no other marker."""
         if self._try_digest(label, v):
             return
         marker = _extension_marker(getattr(v, "__module__", None))
@@ -317,7 +347,7 @@ class _Walker:
         # A @pure wrapper: walk the wrapped function like any other user
         # code.  Cycles (including mutual recursion between @pure functions)
         # are handled by the ordinary code-object seen-set.
-        if getattr(fn, "_valuekit_pure", False):
+        if hasattr(fn, "_valuekit"):
             fn = fn.__wrapped__
         if code is None:
             code = getattr(fn, "__code__", None)
@@ -327,8 +357,8 @@ class _Walker:
         if id(code) in self.seen:
             self._mark("cycle")
             return
-        # Runtime state that parameterises the function but lives outside
-        # its bytecode.  A module arriving this way is attribute-accessed in
+        # Runtime state that parameterises the function but is outside
+        # its bytecode.  A module reached this way is attribute-accessed in
         # the body, so the body's names are what resolve its submodules.
         names = code.co_names
         for i, d in enumerate(fn.__defaults__ or ()):
@@ -348,7 +378,6 @@ class _Walker:
             return
         self.seen.add(id(code))
         self.spans.append((code.co_filename, code.co_firstlineno, _code_end_line(code)))
-        self.units.add(_unit_digest(code))
 
         _frame(self.h, b"C", code.co_code)
         self._mark("names:" + ",".join(code.co_names))
@@ -381,7 +410,7 @@ class _Walker:
 
     def _add_global(self, name: str, obj: Any, co_names: tuple = ()) -> None:
         if isinstance(obj, types.FunctionType):
-            if getattr(obj, "_valuekit_pure", False):
+            if hasattr(obj, "_valuekit"):
                 self._mark(f"fn:{name}")
                 self.add_function(obj)
                 return
@@ -427,9 +456,6 @@ class _Walker:
                 src = f.read()
             _frame(self.h, b"m", name.encode() + b"=" + src)
             self.spans.append((fname, 1, 1_000_000_000))  # whole-file span
-            u = _module_unit(mod)
-            if u:
-                self.units.add(u)
         except Exception:
             self._mark(f"opaque-module:{name}")
 
@@ -447,7 +473,7 @@ class _Walker:
             if not isinstance(sub, types.ModuleType):
                 continue
             # Classify each submodule in its own right: a package may contain
-            # a compiled extension, which is identified by its binary rather
+            # a compiled extension, which is identified by its marker rather
             # than read as source.
             kind, marker = _classify(sub.__name__, getattr(sub, "__file__", None))
             if kind == _USER:
@@ -471,31 +497,25 @@ class _Walker:
                         self.add_function(f)
 
 
-def function_fingerprint(
-    fn: Callable,
-    *,
-    code: types.CodeType | None = None,
-) -> tuple[str, list[tuple[str, int, int]], list[str]]:
-    """Hash *fn* and everything reachable by name from its user code.
+def reachable_set(fn: Callable, *, code: types.CodeType | None = None) -> ReachableSet:
+    """Walk everything reachable by name from *fn*'s user code.
 
-    Returns ``(hex_hash, code_spans, unit_digests)``: the units name every
-    code object (and user-module source) in the walked closure, and feed the
-    on-disk dependency index that lets clear_cache(fn) reach fn's callers.
     *code* optionally overrides the function's own code object (used by
     @pure, which captures it at decoration time, before any debugger patches
     bytecode).
     """
     w = _Walker()
+    w._mark(f"python:{PYTHON}")
     w.add_function(fn, code=code)  # type: ignore[arg-type]
-    return w.h.hexdigest(), w.spans, sorted(w.units)
+    return ReachableSet(w.h.hexdigest(), w.spans)
 
 
 # ---------------------------------------------------------------------------
 # Registry wiring: functions as *values*
 # ---------------------------------------------------------------------------
 #
-# A function passed as an argument to a @pure function is hashed by its code
-# fingerprint (including defaults and captured closure values), so lambdas
+# A function passed as an argument to a @pure function is hashed by its
+# function hash (including defaults and captured closure values), so lambdas
 # work as parameters. Functions are treated as immutable for freezing
 # purposes. They have no serialiser: a function may be an input, but cannot
 # appear inside a cached return value.
@@ -506,8 +526,7 @@ freeze.register(types.BuiltinFunctionType, lambda v: v)
 
 @hash_update.register
 def _h_function(v: types.FunctionType, h: Any) -> None:
-    fp, _, _ = function_fingerprint(v)
-    _frame(h, b"L", fp.encode("ascii"))
+    _frame(h, b"L", reachable_set(v).hash.encode("ascii"))
 
 
 @hash_update.register
