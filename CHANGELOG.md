@@ -238,7 +238,7 @@ that says so.
 - A worker's environment is an allowlist of what a process needs to start,
   plus `VALUEKIT_*`. Nothing else of the main process's crosses.
 
-## 0.3.1 — 2026-08-27
+## 0.3.1 — 2026-08-31
 
 ### Fixed
 
