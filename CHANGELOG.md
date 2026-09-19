@@ -58,6 +58,11 @@ that says so.
 
 ### Changed
 
+- Opening a store no longer fails when another process is creating the
+  same one. The format file is read with a retry: on Windows a read
+  while another process replaces that file is refused, and every writer
+  writes the same version.
+
 - Nothing depends on a file's modification time any more. The store lists
   a function's call-record directory on every lookup instead of caching
   the listing on the directory's mtime, so a record another process wrote

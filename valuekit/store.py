@@ -162,6 +162,30 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
+# How long to wait for another process to finish creating the format file
+# before reporting a read of it as an error.
+_FORMAT_WAIT = 5.0
+
+
+def _read_format(path: Path) -> str:
+    """The format version recorded at *path*, or "" if there is no file.
+
+    Another process opening the same new store writes this file, and on
+    Windows a read while it is being replaced fails.  Every writer writes
+    the same version, so a failed read is retried rather than reported.
+    """
+    deadline = time.monotonic() + _FORMAT_WAIT
+    while True:
+        try:
+            return path.read_text().strip()
+        except FileNotFoundError:
+            return ""
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 class LocalStore:
     """Content-addressed store in a local directory."""
 
@@ -171,8 +195,8 @@ class LocalStore:
         self.records = self.root / "records"
         self.root.mkdir(parents=True, exist_ok=True)
         fmt = self.root / "format"
-        if fmt.exists():
-            found = fmt.read_text().strip()
+        found = _read_format(fmt)
+        if found:
             if found != str(FORMAT_VERSION):
                 raise RuntimeError(
                     f"Cache at {self.root} has format {found}, this valuekit "

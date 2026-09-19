@@ -865,6 +865,26 @@ class TestStore:
         assert target.read_bytes() == b"same"
         assert not list(tmp_path.glob(".tmp-*"))
 
+    def test_opening_a_store_waits_for_a_concurrent_writer(self, tmp_path, monkeypatch):
+        # Another process opening the same new store writes the format file,
+        # and on Windows a read while it is being replaced fails. Every
+        # writer writes the same version, so the read is retried.
+        from valuekit import store as store_mod
+
+        (tmp_path / "format").write_text(f"{store_mod.FORMAT_VERSION}\n")
+        real = _Path.read_text
+        refusals = []
+
+        def refusing(self, *args, **kwargs):
+            if self.name == "format" and not refusals:
+                refusals.append(self)
+                raise PermissionError("Access is denied")
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(_Path, "read_text", refusing)
+        LocalStore(tmp_path)  # opened rather than refused
+        assert refusals
+
     def test_immutable_map_pickles(self, tmp_path):
         import pickle
 
